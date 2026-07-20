@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ac_cli::build_host;
+use ac_cli::{HostOptions, build_host};
 use ac_provider_openrouter::OpenRouter;
 use ac_runtime::AgentEvent;
 use ac_types::{StopReason, TokenUsage};
@@ -16,11 +16,13 @@ struct Args {
     model: String,
     dir: PathBuf,
     prompt: String,
+    web_search: bool,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut model = "anthropic/claude-haiku-4.5".to_string();
     let mut dir: Option<PathBuf> = None;
+    let mut web_search = false;
     let mut rest: Vec<String> = Vec::new();
 
     let mut it = std::env::args().skip(1);
@@ -37,13 +39,14 @@ fn parse_args() -> anyhow::Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--dir needs a value"))?;
                 dir = Some(PathBuf::from(v));
             }
+            "--web-search" => web_search = true,
             _ => rest.push(arg),
         }
     }
 
     let prompt = rest.join(" ");
     if prompt.trim().is_empty() {
-        anyhow::bail!("usage: ac [--model <id>] [--dir <path>] <prompt...>");
+        anyhow::bail!("usage: ac [--model <id>] [--dir <path>] [--web-search] <prompt...>");
     }
 
     let dir = match dir {
@@ -51,7 +54,12 @@ fn parse_args() -> anyhow::Result<Args> {
         None => std::env::current_dir()?,
     };
 
-    Ok(Args { model, dir, prompt })
+    Ok(Args {
+        model,
+        dir,
+        prompt,
+        web_search,
+    })
 }
 
 #[tokio::main]
@@ -62,7 +70,10 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("OPENROUTER_API_KEY is not set"))?;
 
     let provider = Arc::new(OpenRouter::new(api_key));
-    let host = build_host(provider, &args.dir, args.model)?;
+    let options = HostOptions {
+        web_search: args.web_search,
+    };
+    let host = build_host(provider, &args.dir, args.model, options)?;
     let mut session = host.session;
 
     // Ctrl-C cancels the loop and any running shell via the shared token.
@@ -114,6 +125,10 @@ fn render(event: AgentEvent, usage: &mut Option<TokenUsage>) {
         } => {
             let tag = if is_error { "ERR" } else { "ok" };
             eprintln!("\x1b[2m  ↳ {tag} ({} bytes)\x1b[0m", output.len());
+        }
+        AgentEvent::Citation { url, title } => {
+            let label = title.unwrap_or_default();
+            eprintln!("\x1b[2m  🔎 {label} {url}\x1b[0m");
         }
         AgentEvent::Usage(u) => *usage = Some(u),
         AgentEvent::TurnComplete { .. } => {}

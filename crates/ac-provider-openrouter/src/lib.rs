@@ -3,9 +3,9 @@
 //! unified [`CompletionEvent`] enum. Owns the parts a generic SDK gets wrong:
 //! Anthropic `cache_control` breakpoints, usage accounting, error taxonomy.
 
-use ac_provider::{CompletionRequest, EventStream, Provider, ToolChoice};
+use ac_provider::{CompletionRequest, EventStream, Provider, ServerTool, ToolChoice};
 use ac_types::{
-    CompletionError, CompletionEvent, ContentPart, Role, StopReason, TokenUsage, ToolUse,
+    Citation, CompletionError, CompletionEvent, ContentPart, Role, StopReason, TokenUsage, ToolUse,
 };
 use async_stream::try_stream;
 use eventsource_stream::Eventsource;
@@ -40,6 +40,10 @@ impl OpenRouter {
 impl Provider for OpenRouter {
     fn name(&self) -> &str {
         "openrouter"
+    }
+
+    fn supports_server_tool(&self, tool: &ServerTool) -> bool {
+        matches!(tool, ServerTool::WebSearch { .. })
     }
 
     fn stream_completion(
@@ -112,6 +116,20 @@ fn build_body(request: &CompletionRequest) -> Value {
             ToolChoice::Required => json!("required"),
             ToolChoice::Force(name) => json!({ "type": "function", "function": { "name": name } }),
         };
+    }
+    // Server-side web search rides OpenRouter's `web` plugin. The model decides
+    // 0..N searches; results come back as url_citation annotations (see
+    // map_events). ServerTool variants OpenRouter can't do fall through ignored.
+    for tool in &request.server_tools {
+        match tool {
+            ServerTool::WebSearch { max_results } => {
+                let mut plugin = json!({ "id": "web" });
+                if let Some(n) = max_results {
+                    plugin["max_results"] = json!(n);
+                }
+                body["plugins"] = json!([plugin]);
+            }
+        }
     }
     if let Some(max_tokens) = request.max_tokens {
         body["max_tokens"] = json!(max_tokens);
@@ -227,6 +245,14 @@ where
                 {
                     yield CompletionEvent::Thinking { text: reasoning, signature: None };
                 }
+                for annotation in choice.delta.annotations {
+                    if let Some(citation) = annotation.url_citation {
+                        yield CompletionEvent::Citation(Citation {
+                            url: citation.url,
+                            title: citation.title,
+                        });
+                    }
+                }
                 for tool_call in choice.delta.tool_calls {
                     if pending.len() <= tool_call.index {
                         pending.resize_with(tool_call.index + 1, PendingToolCall::default);
@@ -296,6 +322,20 @@ struct DeltaChunk {
     reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCallChunk>,
+    /// Web-search citations OpenRouter attaches to the message as it streams.
+    #[serde(default)]
+    annotations: Vec<AnnotationChunk>,
+}
+
+#[derive(Deserialize)]
+struct AnnotationChunk {
+    url_citation: Option<UrlCitationChunk>,
+}
+
+#[derive(Deserialize)]
+struct UrlCitationChunk {
+    url: String,
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -382,5 +422,58 @@ mod tests {
         let messages = build_messages(&request);
         assert_eq!(messages[0]["role"], json!("tool"));
         assert_eq!(messages[0]["tool_call_id"], json!("call_1"));
+    }
+
+    // --- provider-server-tools seam (web search) ---
+    // Encode side: requesting the WebSearch server tool must add OpenRouter's
+    // `web` plugin, and nothing when it isn't requested.
+    #[test]
+    fn web_search_server_tool_encodes_web_plugin() {
+        let mut request = CompletionRequest::new("test/model");
+        assert!(build_body(&request).get("plugins").is_none());
+
+        request.server_tools.push(ServerTool::WebSearch {
+            max_results: Some(3),
+        });
+        let body = build_body(&request);
+        assert_eq!(body["plugins"][0]["id"], json!("web"));
+        assert_eq!(body["plugins"][0]["max_results"], json!(3));
+    }
+
+    #[test]
+    fn openrouter_advertises_web_search_support() {
+        let provider = OpenRouter::new("key");
+        assert!(provider.supports_server_tool(&ServerTool::WebSearch { max_results: None }));
+    }
+
+    // Decode side: a `url_citation` annotation in the SSE stream must surface as
+    // a Citation event — the observable artifact of a server-side search.
+    #[tokio::test]
+    async fn url_citation_annotation_maps_to_citation_event() {
+        fn frame(data: &str) -> eventsource_stream::Event {
+            eventsource_stream::Event {
+                data: data.into(),
+                ..Default::default()
+            }
+        }
+        let frames = vec![
+            Ok::<_, std::convert::Infallible>(frame(
+                r#"{"choices":[{"delta":{"annotations":[{"type":"url_citation","url_citation":{"url":"https://example.com/a","title":"Example A"}}]}}]}"#,
+            )),
+            Ok(frame(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            )),
+        ];
+
+        let mut stream = map_events(futures::stream::iter(frames));
+        let mut citations = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(CompletionEvent::Citation(c)) = item {
+                citations.push(c);
+            }
+        }
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].url, "https://example.com/a");
+        assert_eq!(citations[0].title.as_deref(), Some("Example A"));
     }
 }

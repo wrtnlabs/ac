@@ -14,8 +14,20 @@ pub enum CompletionEvent {
         signature: Option<String>,
     },
     ToolUse(ToolUse),
+    /// A source citation surfaced by a provider-executed server tool (e.g. web
+    /// search). These arrive inline as annotations, not as tool results — there
+    /// is no local execution and nothing to feed back — so they ride their own
+    /// event rather than the tool-call path.
+    Citation(Citation),
     UsageUpdate(TokenUsage),
     Stop(StopReason),
+}
+
+/// A cited source (URL + optional title) returned by a server-side tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Citation {
+    pub url: String,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

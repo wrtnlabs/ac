@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ac_provider::{CompletionRequest, Provider};
+use ac_provider::{CompletionRequest, Provider, ServerTool};
 use ac_tool::{ToolCtx, ToolRegistry};
 use ac_types::{
     CompletionEvent, ContentPart, Message, Role, StopReason, TokenUsage, ToolResult, ToolUse,
@@ -17,6 +17,10 @@ pub struct AgentConfig {
     pub model: String,
     pub system: Option<String>,
     pub max_iterations: usize,
+    /// Provider-executed server tools to request every round-trip (e.g. web
+    /// search). Provider-agnostic intent — a provider that can't do one ignores
+    /// it. These are NOT local tools and never touch the registry.
+    pub server_tools: Vec<ServerTool>,
     /// Max time to wait for the next stream event before giving up on a stalled
     /// provider. `None` disables the guard. Defaults to 5 minutes.
     pub idle_timeout: Option<Duration>,
@@ -28,6 +32,7 @@ impl Default for AgentConfig {
             model: String::new(),
             system: None,
             max_iterations: 16,
+            server_tools: Vec::new(),
             idle_timeout: Some(Duration::from_secs(300)),
         }
     }
@@ -48,6 +53,11 @@ pub enum AgentEvent {
         name: String,
         output: String,
         is_error: bool,
+    },
+    /// A source cited by a provider-executed server tool (e.g. web search).
+    Citation {
+        url: String,
+        title: Option<String>,
     },
     Usage(TokenUsage),
     TurnComplete {
@@ -135,6 +145,7 @@ impl Session {
             req.cache_system = self.config.system.is_some();
             req.messages = self.messages.clone();
             req.tools = self.registry.specs();
+            req.server_tools = self.config.server_tools.clone();
 
             if let Some(hook) = &self.hook {
                 hook.prepare(iteration, &mut req);
@@ -180,6 +191,12 @@ impl Session {
                     }
                     CompletionEvent::ToolUse(tu) => {
                         tool_uses.push(tu);
+                    }
+                    CompletionEvent::Citation(c) => {
+                        let _ = sink.send(AgentEvent::Citation {
+                            url: c.url,
+                            title: c.title,
+                        });
                     }
                     CompletionEvent::UsageUpdate(u) => {
                         let _ = sink.send(AgentEvent::Usage(u));

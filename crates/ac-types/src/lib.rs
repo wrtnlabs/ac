@@ -9,5 +9,5 @@ mod tool;
 
 pub use content::{ContentPart, Message, Role, ToolResult, ToolUse};
 pub use error::CompletionError;
-pub use event::{CompletionEvent, StopReason, TokenUsage};
+pub use event::{Citation, CompletionEvent, StopReason, TokenUsage};
 pub use tool::ToolSpec;

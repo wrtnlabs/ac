@@ -19,8 +19,13 @@ use serde_json::json;
 /// provider is swapped for the scripted mock.
 fn built_session(provider: MockProvider, dir: &std::path::Path) -> (Session, MockProvider) {
     let handle = provider.clone();
-    let host =
-        ac_cli::build_host(Arc::new(provider), dir, "mock/model".to_string()).expect("build_host");
+    let host = ac_cli::build_host(
+        Arc::new(provider),
+        dir,
+        "mock/model".to_string(),
+        ac_cli::HostOptions::default(),
+    )
+    .expect("build_host");
     (host.session, handle)
 }
 

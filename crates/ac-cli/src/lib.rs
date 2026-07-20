@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ac_provider::Provider;
+use ac_provider::{Provider, ServerTool};
 use ac_runtime::{AgentConfig, Session};
 use ac_tool::{SubtreePolicy, ToolCtx, ToolRegistry};
 
@@ -40,22 +40,40 @@ pub struct GenericHost {
     pub ctx: Arc<ToolCtx>,
 }
 
+/// Options for [`build_host`] beyond the required provider/dir/model.
+#[derive(Debug, Clone, Default)]
+pub struct HostOptions {
+    /// Request the provider's server-side web search each turn. The host opts
+    /// in; whether it actually runs depends on the provider (a provider that
+    /// can't do it ignores the request). Web search is NOT a built-in tool.
+    pub web_search: bool,
+}
+
 /// Assemble the generic host over a chosen provider and sandbox directory. The
 /// single wiring path — binary and tests both call it.
 pub fn build_host(
     provider: Arc<dyn Provider>,
     dir: &Path,
     model: String,
+    options: HostOptions,
 ) -> anyhow::Result<GenericHost> {
     let policy = SubtreePolicy::new(dir)
         .map_err(|e| anyhow::anyhow!("cannot use directory {}: {e}", dir.display()))?;
     let ctx = Arc::new(ToolCtx::new(Arc::new(policy)));
     let registry = Arc::new(generic_registry());
 
+    let mut server_tools = Vec::new();
+    if options.web_search {
+        server_tools.push(ServerTool::WebSearch {
+            max_results: Some(5),
+        });
+    }
+
     let config = AgentConfig {
         model,
         system: Some(SYSTEM_PROMPT.to_string()),
         max_iterations: MAX_ITERATIONS,
+        server_tools,
         ..Default::default()
     };
 
