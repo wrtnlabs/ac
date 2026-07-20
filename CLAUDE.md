@@ -35,7 +35,12 @@ ac-skills                  LIVE: agentskills.io SKILL.md support — hand-rolled
 ac-mcp                     LIVE: rmcp 2.x adapter — McpConnection discovers server tools and registers
                            them as RawTool entries in the same registry as built-ins; errors-as-data,
                            cancel-raced calls, annotations untrusted by default — phase 3
-ac-sandbox                 seatbelt (macOS) / landlock+seccompiler (Linux) mechanism; policy injected — phase 3
+ac-sandbox                 LIVE (v1): kernel-enforced OS sandbox for the shell tool via the
+                           SandboxLauncher seam — macOS Seatbelt (sandbox-exec) / Linux landlock +
+                           seccompiler + setrlimit, self-applied in pre_exec (no bwrap/userns).
+                           Filesystem containment + syscall restriction + resource caps + network
+                           on/off; fail-closed strict|degraded|off envelope; native Windows honestly
+                           off. Domain-egress allowlist is the deferred v2. See docs/ac-sandbox.md
 ac-store                   LIVE: rusqlite session+message store — opaque or caller-adopted ids,
                            host-owned meta JSON, seq-ordered message log (seq-CAS append);
                            pairs with Session::resume for reload recovery
@@ -80,7 +85,7 @@ The AI SDK is two halves and only one overlaps AC: its *server/provider* half (`
 
 ## Known deferred gaps (own them when the phase lands)
 
-- **No OS process sandbox yet:** `shell` is cwd-contained and reaps its process group, but the command can read/write anything the host user can and reach any network. The plan to close this is **[docs/ac-sandbox.md](docs/ac-sandbox.md)** (proposed 2026-07-21) — a kernel-enforced, fail-closed sandbox: v1 = macOS Seatbelt / Linux `landlock`+`seccompiler`+`setrlimit` (filesystem + syscall + resource caps + network on/off), injected via a `SandboxLauncher` seam on `ToolCtx`; native Windows is honestly `off`+banner. **The one rule: only ship `actual` (kernel-enforced) mechanisms; where we can't, be loudly `off` — never emit an advisory approximation and call it a sandbox.** v1 deliberately dodges the bubblewrap/user-namespace distro trap by self-applying landlock+seccomp in `pre_exec` (no netns, no setuid helper).
+- **OS process sandbox — v1 LIVE (`ac-sandbox`), see [docs/ac-sandbox.md](docs/ac-sandbox.md).** The `shell` tool's command is kernel-contained when the host installs a `SandboxLauncher` on `ToolCtx` (the `ac` binary does by default): macOS Seatbelt / Linux `landlock`+`seccompiler`+`setrlimit` — filesystem containment + syscall restriction + resource caps + network on/off, self-applied in `pre_exec` (no bwrap/userns, dodging the distro trap). Fail-closed with a `strict|degraded|off` mode on the shell result envelope; native Windows is honestly `off`. **The one rule: only ship `actual` (kernel-enforced) mechanisms; where we can't, be loudly `off` — never an advisory approximation called a sandbox.** Anti-pattern to flag: a `shell`-like tool that spawns a child WITHOUT routing through `ctx.sandbox` when one is installed (it silently drops isolation), or a launcher that falls back to an unsandboxed spawn instead of erroring under a fail-closed policy.
 - **Egress / SSRF (deferred to `ac-sandbox` v2):** `fetch` and `shell` reach any network the host process can (e.g. `http://169.254.169.254` metadata, loopback). v1's network containment is binary on/off (off = no reachable socket, kernel-enforced); a **domain allowlist** is only honest as the full kernel-block-then-proxy design (sever egress at the kernel, funnel through a host proxy that owns DNS, canonicalize hosts before match) — that is a v2 phase, not ad-hoc IP checks in the tools. See docs/ac-sandbox.md.
 - **Truncated-stream detection:** the loop treats a stream that ends without an explicit `Stop` as a clean `EndTurn`. Acceptable while the provider contract guarantees `Stop`; revisit if a provider can end early.
 - **Same-session concurrency across connections is detected, not prevented:** two ACP connections (e.g. two browser tabs) can `session/load` the same stored session; a concurrent writer surfaces as a seq-CAS conflict (`StoreError::SeqConflict` → prompt error telling the client to reload) rather than a silent history fork. Prevention needs process-wide shared session state (an `AcpOptions` seam) — do it when a real host needs it.

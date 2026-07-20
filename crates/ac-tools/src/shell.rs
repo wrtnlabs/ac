@@ -1,18 +1,22 @@
 //! The `shell` tool: run a command via `sh -c` inside the workspace.
 //!
-//! Containment here is the working directory only — there is no OS-level
-//! sandbox in this phase (that arrives with `ac-sandbox` later). The cwd is
-//! resolved through the host [`PathPolicy`], so a command cannot be launched
-//! from outside the permitted root, but the command itself can reach anywhere
-//! the host process can. Hosts that need stronger isolation must not register
-//! this tool yet.
+//! Two layers of containment compose. The cwd is always resolved through the
+//! host [`PathPolicy`], so a command cannot be launched from outside the
+//! permitted root. Beyond that, if the host installed a [`SandboxLauncher`] on
+//! the [`ToolCtx`], the command is wrapped into a kernel-contained one and the
+//! achieved [`SandboxMode`] rides the result envelope; the launcher fails
+//! closed, so a policy it cannot enforce refuses the command rather than
+//! running it weakly. If NO launcher is installed the command runs
+//! unsandboxed — it can reach anything the host process can — and the envelope
+//! says so (`sandbox.mode == "off"`). A host that needs isolation installs a
+//! launcher (see the `ac-sandbox` crate).
 
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ac_tool::{Capability, Tool, ToolCtx, ToolOutput};
+use ac_tool::{Capability, CommandSpec, SandboxMode, Tool, ToolCtx, ToolOutput};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
@@ -69,9 +73,9 @@ impl Tool for Shell {
          workspace root and must resolve inside it. Output is capped (~32 KiB \
          per stream); the command and anything it forks are killed after 120s, \
          on cancel, or when the call returns (no lingering background \
-         processes). NOTE: there is no OS sandbox yet — containment is the \
-         working directory only, so the command can read/write anywhere the \
-         host process can."
+         processes). When the host has installed an OS sandbox the command is \
+         kernel-contained and the result reports 'sandbox.mode'; otherwise it \
+         runs with the host's own privileges ('sandbox.mode':'off')."
             .into()
     }
 
@@ -91,11 +95,30 @@ impl Tool for Shell {
                 Err(e) => return ToolOutput::error(e.to_string()),
             };
 
-            let mut command = tokio::process::Command::new("sh");
+            // Build the command through the OS-sandbox seam when a launcher is
+            // installed; otherwise run it unsandboxed and mark the envelope. A
+            // launcher that cannot enforce its policy fails closed — we never
+            // fall back to an unsandboxed spawn behind the caller's back.
+            let (mut command, sandbox_mode) = match &ctx.sandbox {
+                Some(launcher) => {
+                    let spec =
+                        CommandSpec::new("sh", ["-c", input.command.as_str()], resolved.clone());
+                    match launcher.prepare(&spec) {
+                        Ok(prepared) => (prepared.command, prepared.mode),
+                        Err(e) => {
+                            return ToolOutput::error(format!(
+                                "sandbox refused to run the command: {e}"
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    let mut c = tokio::process::Command::new("sh");
+                    c.arg("-c").arg(&input.command).current_dir(&resolved);
+                    (c, SandboxMode::Off)
+                }
+            };
             command
-                .arg("-c")
-                .arg(&input.command)
-                .current_dir(&resolved)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -152,6 +175,7 @@ impl Tool for Shell {
                 "exit_code": exit_code,
                 "stdout_tail": stdout_tail,
                 "stderr_tail": stderr_tail,
+                "sandbox": { "mode": sandbox_mode.as_str() },
             });
             if truncated {
                 result["truncated"] = serde_json::Value::Bool(true);

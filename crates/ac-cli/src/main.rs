@@ -19,6 +19,8 @@ struct Args {
     web_search: bool,
     skills: Option<PathBuf>,
     require_skill: Option<String>,
+    sandbox: bool,
+    sandbox_network: bool,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -27,6 +29,11 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut web_search = false;
     let mut skills: Option<PathBuf> = None;
     let mut require_skill: Option<String> = None;
+    // The binary sandboxes the shell tool by default (kernel FS containment +
+    // resource caps), with network on so ordinary tooling works. `--no-sandbox`
+    // opts out; `--sandbox-no-network` keeps the sandbox but cuts egress.
+    let mut sandbox = true;
+    let mut sandbox_network = true;
     let mut rest: Vec<String> = Vec::new();
 
     let mut it = std::env::args().skip(1);
@@ -44,6 +51,8 @@ fn parse_args() -> anyhow::Result<Args> {
                 dir = Some(PathBuf::from(v));
             }
             "--web-search" => web_search = true,
+            "--no-sandbox" => sandbox = false,
+            "--sandbox-no-network" => sandbox_network = false,
             "--skills" => {
                 let v = it
                     .next()
@@ -63,7 +72,8 @@ fn parse_args() -> anyhow::Result<Args> {
     let prompt = rest.join(" ");
     if prompt.trim().is_empty() {
         anyhow::bail!(
-            "usage: ac [--model <id>] [--dir <path>] [--web-search] [--skills <dir>] [--require-skill <name>] <prompt...>"
+            "usage: ac [--model <id>] [--dir <path>] [--web-search] [--skills <dir>] \
+             [--require-skill <name>] [--no-sandbox] [--sandbox-no-network] <prompt...>"
         );
     }
 
@@ -79,6 +89,8 @@ fn parse_args() -> anyhow::Result<Args> {
         web_search,
         skills,
         require_skill,
+        sandbox,
+        sandbox_network,
     })
 }
 
@@ -90,10 +102,18 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("OPENROUTER_API_KEY is not set"))?;
 
     let provider = Arc::new(OpenRouter::new(api_key));
+    if args.sandbox {
+        let net = if args.sandbox_network { "on" } else { "off" };
+        eprintln!("\x1b[2m· sandbox: on (network {net})\x1b[0m");
+    } else {
+        eprintln!("\x1b[2m· sandbox: off — shell runs with your privileges\x1b[0m");
+    }
     let options = HostOptions {
         web_search: args.web_search,
         skills_root: args.skills,
         require_skill: args.require_skill,
+        sandbox: args.sandbox,
+        sandbox_network: args.sandbox_network,
     };
     let host = build_host(provider, &args.dir, args.model, options)?;
     let mut session = host.session;

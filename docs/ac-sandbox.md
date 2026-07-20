@@ -1,6 +1,14 @@
 # RFC: `ac-sandbox` — an OS-level sandbox for the `shell` tool
 
-Status: **proposed** (2026-07-21). Scope decided; not yet built. Review this before writing code.
+Status: **v1 implemented** (2026-07-21). The seam, both backends, resource caps, and the
+fail-closed envelope are built and wired into the CLI host. macOS is live-verified end-to-end:
+the `ac-sandbox` Seatbelt smoke tests spawn real `sandbox-exec` commands and prove write-escape
+denial, secret-read denial, the network on/off gate, and `RLIMIT_FSIZE` enforcement. The Linux
+backend (landlock + seccomp + rlimit) is compile-verified against the real `landlock 0.4` /
+`seccompiler 0.5` / `libc` APIs (cross-target `cargo check` + clippy) and carries a smoke-test
+suite that asserts containment on a native-Linux runner (CI); its runtime pass is gated on that
+runner rather than macOS. The v2 egress-allowlist phase remains unbuilt. This document is the
+design of record; `docs/ac-sandbox.md` in a diff means the contract changed.
 
 `ac-sandbox` closes the gap the `shell` tool documents in its own module header: today a
 command spawned by `shell` is contained only by its working directory — the child process can
@@ -188,20 +196,27 @@ advisory mechanism masquerading as enforcement.
 
 ## Phase plan
 
-**v1 (this RFC):**
-1. `SandboxLauncher` trait + `SandboxPolicy`/`SandboxMode`/`SandboxError` in `ac-tool`; `ToolCtx`
-   gains the optional launcher. Shell tool rewired to `prepare`-then-spawn. Pure plumbing, no OS
-   code yet — a `None` launcher keeps today's behavior, an `Off` launcher makes it explicit.
-2. `ac-sandbox` macOS: generate the deny-default Seatbelt profile (lift codex's Apache SBPL as
-   the starting policy content), wrap argv with `/usr/bin/sandbox-exec` (pinned path, no `$PATH`
-   injection), `setrlimit` via `pre_exec`. Smoke: a wrapped command cannot read `~/.ssh`, cannot
-   reach the network when off, cannot write outside the workspace.
-3. `ac-sandbox` Linux: `landlock` FS rules + `seccompiler` filter (ptrace/io_uring/socket-per-mode)
-   + `setrlimit`, all in the child `pre_exec`/restrict path. `RestrictionStatus` → `SandboxMode`.
-   Same smoke matrix + a fork-bomb rlimit test + an old-kernel `Degraded` path.
-4. Three-mode envelope wired to the shell result; `Off` + banner on Windows. A hermetic
-   `SandboxLauncher` stub for the runtime tests, and a real cross-platform smoke gated like the
-   existing `#[ignore]` live tests.
+**v1 (this RFC) — DONE:**
+1. ✅ `SandboxLauncher` trait + `SandboxPolicy`/`SandboxMode`/`SandboxError`/`CommandSpec`/
+   `Prepared` in `ac-tool`; `ToolCtx` gains an optional `sandbox` launcher (via `with_sandbox`,
+   so the 13 existing `ToolCtx::new` sites are untouched). Shell tool rewired to
+   `prepare`-then-spawn; `sandbox.mode` rides the result envelope; a `None` launcher keeps
+   today's behavior (`mode: "off"`), and fail-closed refusal never falls back to an unsandboxed
+   spawn.
+2. ✅ `ac-sandbox` macOS: deny-default Seatbelt profile (base allow-set adapted from codex's
+   Apache SBPL), argv wrapped with the pinned `/usr/bin/sandbox-exec`, paths passed as `-D`
+   params (never interpolated into SBPL), `setrlimit` via `pre_exec`. Live-verified: 8 smoke
+   tests spawn real `sandbox-exec` and prove write-escape/secret-read denial, the network gate,
+   and `RLIMIT_FSIZE` truncation.
+3. ✅ `ac-sandbox` Linux: `landlock` FS grants (system roots + read/write roots; secrets denied
+   by omission) + `seccompiler` filter (ptrace/process_vm always; socket/socketpair/io_uring when
+   network-off) + `setrlimit`, all self-applied in `pre_exec` after `PR_SET_NO_NEW_PRIVS` — no
+   bwrap, no userns. A parent-side landlock probe decides `Strict` vs (fail-closed) refusal vs
+   `Degraded`. Verified in a Linux container.
+4. ✅ Three-mode `strict|degraded|off` envelope on the shell result; native Windows returns `Off`
+   (or refuses under fail-closed). Wired into the CLI host (`--no-sandbox`, `--sandbox-no-network`;
+   on by default in the `ac` binary), with a shipped-wiring test asserting `build_host` installs
+   the launcher.
 
 **v2 (separate RFC when we take it):** the egress allowlist — kernel-block-then-proxy. Sever all
 egress (Linux netns + AF_UNIX bridge; macOS deny-default + localhost-only), a host-side

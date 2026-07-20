@@ -13,8 +13,24 @@ use std::sync::Arc;
 use ac_provider::{CompletionRequest, Provider, ServerTool, ToolChoice};
 use ac_runtime::{AgentConfig, Session, StepHook};
 use ac_skills::{LoadSkillTool, SkillLayer, SkillsResolver};
-use ac_tool::{SubtreePolicy, ToolCtx, ToolRegistry};
+use ac_tool::{NetworkMode, PathPolicy, SandboxPolicy, SubtreePolicy, ToolCtx, ToolRegistry};
 use ac_types::{ContentPart, Role};
+
+/// Build the OS-sandbox policy for the generic host: writes contained to the
+/// workspace, reads to the workspace, the mandatory secret set denied, and
+/// network per the flag. Writes are deliberately workspace-only in v1 (not the
+/// whole system temp dir — that would let any command scribble across
+/// `$TMPDIR`); a host that needs a scratch dir adds it to `write_roots`
+/// explicitly.
+fn build_sandbox_policy(workspace: &Path, network: bool) -> SandboxPolicy {
+    let mut policy = SandboxPolicy::workspace(workspace);
+    policy.network = if network {
+        NetworkMode::On
+    } else {
+        NetworkMode::Off
+    };
+    policy
+}
 
 /// A generic filesystem/coding agent persona. No host- or app-domain content —
 /// this is the baseline for any workspace.
@@ -59,6 +75,16 @@ pub struct HostOptions {
     /// conversation shows *this* skill was loaded successfully. Requires
     /// `skills_root`.
     pub require_skill: Option<String>,
+    /// Install an OS sandbox for the `shell` tool (kernel-enforced filesystem
+    /// containment + resource caps). Off by default at the library level so
+    /// tests are unaffected; the `ac` binary turns it on. Writes are contained
+    /// to the workspace (plus the system temp dir); the mandatory secret set is
+    /// denied.
+    pub sandbox: bool,
+    /// When sandboxed, allow the command network access. Off means a real
+    /// kernel guarantee of no egress (the strong exfil gate); on keeps
+    /// network-using commands (git, package managers) working.
+    pub sandbox_network: bool,
 }
 
 /// Forces `load_skill` as the tool choice until the request's own message
@@ -108,7 +134,13 @@ pub fn build_host(
 ) -> anyhow::Result<GenericHost> {
     let policy = SubtreePolicy::new(dir)
         .map_err(|e| anyhow::anyhow!("cannot use directory {}: {e}", dir.display()))?;
-    let ctx = Arc::new(ToolCtx::new(Arc::new(policy)));
+    let canonical = policy.root();
+    let mut tool_ctx = ToolCtx::new(Arc::new(policy));
+    if options.sandbox {
+        let sandbox_policy = build_sandbox_policy(&canonical, options.sandbox_network);
+        tool_ctx = tool_ctx.with_sandbox(Arc::new(ac_sandbox::OsSandbox::new(sandbox_policy)));
+    }
+    let ctx = Arc::new(tool_ctx);
     let mut registry = generic_registry();
 
     let mut system = SYSTEM_PROMPT.to_string();

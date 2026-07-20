@@ -429,3 +429,105 @@ fn build_host_rejects_a_missing_required_skill() {
     .expect("require_skill without a skills root must fail the build");
     assert!(err.to_string().contains("skills root"));
 }
+
+/// The shipped host installs an OS-sandbox launcher on the tool ctx when
+/// `HostOptions.sandbox` is set, and leaves it absent otherwise. This is the
+/// wiring proof; the kernel-enforcement proof lives in `ac-sandbox`'s
+/// platform smoke tests.
+#[test]
+fn shipped_host_installs_a_sandbox_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let plain = ac_cli::build_host(
+        Arc::new(MockProvider::new(vec![])),
+        dir.path(),
+        "mock/model".to_string(),
+        ac_cli::HostOptions::default(),
+    )
+    .expect("build_host");
+    assert!(
+        plain.ctx.sandbox.is_none(),
+        "no sandbox unless the host asks for one"
+    );
+
+    let sandboxed = ac_cli::build_host(
+        Arc::new(MockProvider::new(vec![])),
+        dir.path(),
+        "mock/model".to_string(),
+        ac_cli::HostOptions {
+            sandbox: true,
+            sandbox_network: false,
+            ..Default::default()
+        },
+    )
+    .expect("build_host");
+    let launcher = sandboxed
+        .ctx
+        .sandbox
+        .as_ref()
+        .expect("a launcher must be installed");
+    // On macOS/Linux the launcher advertises strict; on other platforms it is
+    // honestly off.
+    let mode = launcher.mode();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    assert_eq!(mode, ac_tool::SandboxMode::Strict);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    assert_eq!(mode, ac_tool::SandboxMode::Off);
+}
+
+/// The FULL shipped path with the sandbox on: a scripted model runs a `shell`
+/// command that tries to write outside the workspace. The command is denied by
+/// the kernel sandbox and the tool result reports `strict` mode — proving
+/// build_host → registry → shell tool → ctx.sandbox → sandbox-exec is wired
+/// end-to-end, not just that a launcher is present. macOS-gated because it
+/// asserts real Seatbelt enforcement.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn shipped_sandbox_contains_a_real_shell_write_escape() {
+    let ws = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let escape = outside.path().canonicalize().unwrap().join("pwned.txt");
+
+    let provider = MockProvider::new(vec![
+        vec![
+            tool_use(
+                "call-escape",
+                "shell",
+                json!({ "command": format!("echo pwned > {}", escape.display()) }),
+            ),
+            stop_tool_use(),
+        ],
+        vec![text("done"), stop_end()],
+    ]);
+
+    let host = ac_cli::build_host(
+        Arc::new(provider),
+        ws.path(),
+        "mock/model".to_string(),
+        ac_cli::HostOptions {
+            sandbox: true,
+            sandbox_network: false,
+            ..Default::default()
+        },
+    )
+    .expect("build_host");
+
+    let (_result, events) = run(host.session, "escape the sandbox").await;
+
+    let shell_result = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolResult { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .expect("a shell tool result");
+
+    assert!(
+        shell_result.contains("\"mode\":\"strict\""),
+        "the shell result must report strict sandbox mode; got {shell_result}"
+    );
+    assert!(
+        !escape.exists(),
+        "the escaping write must have been denied by the kernel sandbox"
+    );
+}

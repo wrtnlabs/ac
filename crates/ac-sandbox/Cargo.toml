@@ -6,3 +6,16 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+ac-tool = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

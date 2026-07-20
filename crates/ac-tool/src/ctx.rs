@@ -7,10 +7,16 @@ use std::time::SystemTime;
 use tokio_util::sync::CancellationToken;
 
 use crate::policy::PathPolicy;
+use crate::sandbox::SandboxLauncher;
 
 /// What every tool receives. One ToolCtx per run; tools share it.
 pub struct ToolCtx {
     pub policy: Arc<dyn PathPolicy>,
+    /// The OS-sandbox seam. `None` means no launcher is installed — a tool
+    /// that runs external processes must then decide for itself whether to run
+    /// unsandboxed (and say so) or refuse. Install one with
+    /// [`with_sandbox`](ToolCtx::with_sandbox).
+    pub sandbox: Option<Arc<dyn SandboxLauncher>>,
     pub extensions: Extensions,
     pub file_times: FileTimes,
     pub locks: PathLocks,
@@ -21,11 +27,19 @@ impl ToolCtx {
     pub fn new(policy: Arc<dyn PathPolicy>) -> Self {
         Self {
             policy,
+            sandbox: None,
             extensions: Extensions::default(),
             file_times: FileTimes::default(),
             locks: PathLocks::default(),
             cancel: CancellationToken::new(),
         }
+    }
+
+    /// Install an OS-sandbox launcher (builder-style, before the ctx is shared
+    /// behind an `Arc`).
+    pub fn with_sandbox(mut self, sandbox: Arc<dyn SandboxLauncher>) -> Self {
+        self.sandbox = Some(sandbox);
+        self
     }
 }
 
