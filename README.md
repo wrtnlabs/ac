@@ -17,3 +17,7 @@ OPENROUTER_API_KEY=... cargo run -p ac-cli -- [--model <id>] [--dir <path>] "you
 ```
 
 Status: the end-to-end agent loop works. `ac` is a generic filesystem agent — the OpenRouter provider wired to the built-in tool registry (`read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `shell`, `fetch`) over the `ac-runtime` loop, all writes contained by a path policy. Proven offline in `crates/ac-cli/tests/e2e.rs`, which exercises the whole stack (real tools, real loop, real temp dir) via a scripted mock provider and asserts both the on-disk ground truth and the policy safety invariant.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).

@@ -3,6 +3,7 @@ name = "ac-runtime"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [dependencies]
 ac-provider = { workspace = true }

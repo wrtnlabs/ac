@@ -3,6 +3,7 @@ name = "ac-ai-sdk"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # lib = the reusable, transport-free protocol adapter (AgentEvent <-> the
 # Vercel AI SDK UI Message Stream Protocol). bin = a demo HTTP host that serves

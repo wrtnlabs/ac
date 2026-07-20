@@ -2,6 +2,7 @@
   "name": "ac-web-react",
   "private": true,
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "type": "module",
   "description": "React demo for AC — a stock @ai-sdk/react useChat app rendering an AC agent over the AI SDK UI Message Stream Protocol.",
   "scripts": {
