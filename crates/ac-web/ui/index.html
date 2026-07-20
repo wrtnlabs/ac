@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AC — web harness</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161a21; --panel-2: #1c212b; --border: #2a3140;
+    --text: #e6e9ef; --dim: #8b93a5; --accent: #7aa2f7; --ok: #9ece6a;
+    --err: #f7768e; --warn: #e0af68; --think: #565f89;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f7f8fa; --panel: #ffffff; --panel-2: #eef1f5; --border: #d8dee9;
+      --text: #1a1e26; --dim: #6a7386; --accent: #3b6ea5; --ok: #4d7f2a;
+      --err: #c34043; --warn: #a67c2e; --think: #8a91a5;
+      color-scheme: light;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--text);
+    display: grid; grid-template-columns: 260px 1fr; height: 100vh;
+  }
+  code, pre, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+
+  aside {
+    background: var(--panel); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  aside header { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  aside header h1 { font-size: 15px; letter-spacing: .04em; }
+  aside header h1 span { color: var(--accent); }
+  aside header .sub { color: var(--dim); font-size: 11px; margin-top: 2px; }
+  #new-chat {
+    margin: 12px 16px 6px; padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
+    cursor: pointer; font-size: 13px; text-align: left;
+  }
+  #new-chat:hover { border-color: var(--accent); }
+  #sessions { overflow-y: auto; flex: 1; padding: 6px 8px; }
+  .session {
+    padding: 8px 10px; border-radius: 8px; cursor: pointer; margin-bottom: 2px;
+    overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px;
+  }
+  .session:hover { background: var(--panel-2); }
+  .session.active { background: var(--panel-2); outline: 1px solid var(--border); }
+  .session .when { color: var(--dim); font-size: 11px; display: block; }
+
+  main { display: flex; flex-direction: column; min-height: 0; }
+  #topbar {
+    display: flex; align-items: center; gap: 10px; padding: 10px 18px;
+    border-bottom: 1px solid var(--border); background: var(--panel);
+    font-size: 12px; color: var(--dim);
+  }
+  #status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+  #status-dot.on { background: var(--ok); }
+  #status-dot.off { background: var(--err); }
+  #usage { margin-left: auto; }
+
+  #transcript { flex: 1; overflow-y: auto; padding: 20px 0 12px; }
+  .lane { max-width: 780px; margin: 0 auto; padding: 0 18px; }
+  .block { margin-bottom: 14px; }
+  .user .bubble {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 12px; padding: 10px 14px; white-space: pre-wrap;
+  }
+  .user .who, .agent .who { font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+  .agent .text { white-space: pre-wrap; }
+  details.thought {
+    border-left: 3px solid var(--think); padding: 4px 10px; margin: 8px 0;
+    color: var(--think); font-size: 13px;
+  }
+  details.thought summary { cursor: pointer; user-select: none; }
+  details.thought .t { white-space: pre-wrap; margin-top: 4px; }
+  .tool {
+    border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+    margin: 8px 0; overflow: hidden; font-size: 13px;
+  }
+  .tool .head { display: flex; align-items: center; gap: 8px; padding: 7px 12px; }
+  .tool .name { font-weight: 600; }
+  .chip {
+    font-size: 11px; padding: 1px 8px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--dim);
+  }
+  .chip.in_progress { color: var(--warn); border-color: var(--warn); }
+  .chip.completed { color: var(--ok); border-color: var(--ok); }
+  .chip.failed { color: var(--err); border-color: var(--err); }
+  .tool pre {
+    margin: 0; padding: 8px 12px; border-top: 1px solid var(--border);
+    background: var(--panel-2); font-size: 12px; overflow-x: auto;
+    max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .tool pre .label { color: var(--dim); }
+  .citation {
+    display: inline-block; margin: 2px 6px 2px 0; padding: 2px 10px;
+    border: 1px solid var(--border); border-radius: 999px; font-size: 12px;
+  }
+  .citation a { color: var(--accent); text-decoration: none; }
+  .stopchip { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  .errblock { color: var(--err); white-space: pre-wrap; }
+
+  #composer {
+    border-top: 1px solid var(--border); background: var(--panel); padding: 12px 18px;
+  }
+  #composer .lane { display: flex; gap: 10px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    font: inherit; min-height: 42px; max-height: 160px; outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  button.act {
+    padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--accent); color: #fff; cursor: pointer; font: inherit;
+  }
+  button.act[disabled] { opacity: .45; cursor: default; }
+  button.act.stop { background: var(--err); }
+  #banner {
+    display: none; padding: 8px 18px; background: var(--err); color: #fff; font-size: 13px;
+  }
+</style>
+</head>
+<body>
+<aside>
+  <header>
+    <h1>AC <span>web harness</span></h1>
+    <div class="sub">an ACP client in your browser</div>
+  </header>
+  <button id="new-chat">＋ New chat</button>
+  <div id="sessions"></div>
+</aside>
+<main>
+  <div id="banner">connection lost — <a href="" style="color:#fff">reload</a></div>
+  <div id="topbar">
+    <div id="status-dot"></div>
+    <span id="model" class="mono"></span>
+    <span id="sid" class="mono"></span>
+    <span id="usage" class="mono"></span>
+  </div>
+  <div id="transcript"><div class="lane" id="lane"></div></div>
+  <div id="composer"><div class="lane">
+    <textarea id="input" placeholder="Ask the agent — it works inside the sandbox directory"></textarea>
+    <button class="act" id="send">Send</button>
+  </div></div>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const lane = $("lane"), input = $("input"), sendBtn = $("send");
+
+// ---- JSON-RPC over WebSocket: the browser IS an ACP client ---------------
+let ws, nextId = 1;
+const pending = new Map(); // id -> {resolve, reject}
+
+function rpc(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, { resolve, reject });
+    ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+  });
+}
+function notify(method, params) {
+  ws.send(JSON.stringify({ jsonrpc: "2.0", method, params }));
+}
+
+let config = { model: "", cwd: "", sessions: [] };
+let sessionId = null;   // active ACP session
+let turnInFlight = false;
+
+async function boot() {
+  config = await (await fetch("/api/config")).json();
+  $("model").textContent = config.model;
+  renderSessions();
+
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = async () => {
+    $("status-dot").className = "on";
+    await rpc("initialize", {
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "ac-web-ui", version: "0.1.0" },
+    });
+  };
+  ws.onclose = () => {
+    $("status-dot").className = "off"; $("banner").style.display = "block";
+    // Settle everything in flight so the composer unlocks and errors render.
+    for (const [, p] of pending) p.reject(new Error("connection lost"));
+    pending.clear();
+    turnInFlight = false;
+    sendBtn.textContent = "Send"; sendBtn.classList.remove("stop");
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
+      const p = pending.get(msg.id);
+      if (p) { pending.delete(msg.id); msg.error ? p.reject(msg.error) : p.resolve(msg.result); }
+    } else if (msg.method === "session/update") {
+      onUpdate(msg.params);
+    }
+  };
+}
+
+// ---- sessions -------------------------------------------------------------
+function renderSessions() {
+  const box = $("sessions");
+  box.innerHTML = "";
+  for (const s of config.sessions) {
+    const el = document.createElement("div");
+    el.className = "session" + (s.id === sessionId ? " active" : "");
+    const when = new Date(s.updated_at_ms).toLocaleString();
+    el.innerHTML = `<span class="title"></span><span class="when">${when}</span>`;
+    el.querySelector(".title").textContent = s.title || s.id.slice(0, 8) + "…";
+    el.onclick = () => openSession(s.id);
+    box.appendChild(el);
+  }
+}
+async function refreshSessions() {
+  config = await (await fetch("/api/config")).json();
+  renderSessions();
+}
+async function newChat() {
+  clearTranscript();
+  const res = await rpc("session/new", { cwd: config.cwd, mcpServers: [] });
+  sessionId = res.sessionId;
+  $("sid").textContent = sessionId.slice(0, 8) + "…";
+  await refreshSessions();
+}
+async function openSession(id) {
+  if (turnInFlight) return;
+  clearTranscript();
+  sessionId = id;
+  $("sid").textContent = id.slice(0, 8) + "…";
+  renderSessions();
+  // session/load replays history as ordinary session/update notifications —
+  // the transcript below is rebuilt by the same code that renders live turns.
+  await rpc("session/load", { sessionId: id, cwd: config.cwd, mcpServers: [] });
+}
+
+// ---- transcript rendering -------------------------------------------------
+const toolCards = new Map(); // toolCallId -> elements
+let lastKind = null; // "agent-text" | "thought" | null — for chunk coalescing
+let currentTextEl = null, currentThoughtEl = null;
+
+function clearTranscript() {
+  lane.innerHTML = ""; toolCards.clear(); lastKind = null;
+  currentTextEl = null; currentThoughtEl = null;
+}
+function scrollDown() {
+  const t = $("transcript"); t.scrollTop = t.scrollHeight;
+}
+function userBlock(text) {
+  const el = document.createElement("div");
+  el.className = "block user";
+  el.innerHTML = `<div class="who">you</div><div class="bubble"></div>`;
+  el.querySelector(".bubble").textContent = text;
+  lane.appendChild(el); lastKind = null; scrollDown();
+}
+function agentText(text) {
+  if (lastKind !== "agent-text") {
+    const el = document.createElement("div");
+    el.className = "block agent";
+    el.innerHTML = `<div class="who">agent</div><div class="text"></div>`;
+    lane.appendChild(el);
+    currentTextEl = el.querySelector(".text");
+    lastKind = "agent-text";
+  }
+  currentTextEl.textContent += text; scrollDown();
+}
+function thoughtText(text) {
+  if (lastKind !== "thought") {
+    const el = document.createElement("details");
+    el.className = "thought";
+    el.innerHTML = `<summary>thinking…</summary><div class="t"></div>`;
+    lane.appendChild(el);
+    currentThoughtEl = el.querySelector(".t");
+    lastKind = "thought";
+  }
+  currentThoughtEl.textContent += text; scrollDown();
+}
+function citation(name, uri) {
+  // Citation URIs are provider/agent-controlled: only allow web schemes so a
+  // javascript: URL can never execute in this origin.
+  let parsed;
+  try { parsed = new URL(uri, location.href); } catch { return; }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+  const el = document.createElement("span");
+  el.className = "citation";
+  const a = document.createElement("a");
+  a.href = parsed.href; a.target = "_blank"; a.rel = "noreferrer";
+  a.textContent = "🔎 " + (name || uri);
+  el.appendChild(a);
+  lane.appendChild(el); lastKind = null; scrollDown();
+}
+function toolCall(u) {
+  const el = document.createElement("div");
+  el.className = "block tool";
+  el.innerHTML = `<div class="head"><span class="name"></span><span class="chip"></span></div>`;
+  el.querySelector(".name").textContent = u.title;
+  const chip = el.querySelector(".chip");
+  const status = u.status || "pending";
+  chip.textContent = status; chip.classList.add(status);
+  if (u.rawInput !== undefined) {
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(u.rawInput, null, 1);
+    el.appendChild(pre);
+  }
+  lane.appendChild(el);
+  toolCards.set(u.toolCallId, el);
+  lastKind = null; scrollDown();
+}
+function toolUpdate(u) {
+  const el = toolCards.get(u.toolCallId);
+  if (!el) return;
+  if (u.status) {
+    const chip = el.querySelector(".chip");
+    chip.className = "chip " + u.status;
+    chip.textContent = u.status;
+  }
+  if (u.rawOutput !== undefined) {
+    const pre = document.createElement("pre");
+    const out = typeof u.rawOutput === "string" ? u.rawOutput : JSON.stringify(u.rawOutput, null, 1);
+    pre.textContent = out.length > 4000 ? out.slice(0, 4000) + "\n…" : out;
+    el.appendChild(pre);
+  }
+  scrollDown();
+}
+function stopChip(reason) {
+  if (reason === "end_turn") return;
+  const el = document.createElement("div");
+  el.className = "stopchip";
+  el.textContent = "◼ " + reason;
+  lane.appendChild(el); lastKind = null; scrollDown();
+}
+function errBlock(message) {
+  const el = document.createElement("div");
+  el.className = "block errblock";
+  el.textContent = "✗ " + message;
+  lane.appendChild(el); lastKind = null; scrollDown();
+}
+
+function onUpdate(params) {
+  if (params.sessionId !== sessionId) return;
+  const u = params.update;
+  switch (u.sessionUpdate) {
+    case "user_message_chunk":
+      if (u.content.type === "text") userBlock(u.content.text);
+      break;
+    case "agent_message_chunk":
+      if (u.content.type === "text") agentText(u.content.text);
+      else if (u.content.type === "resource_link") citation(u.content.name, u.content.uri);
+      break;
+    case "agent_thought_chunk":
+      if (u.content.type === "text") thoughtText(u.content.text);
+      break;
+    case "tool_call": toolCall(u); break;
+    case "tool_call_update": toolUpdate(u); break;
+    case "usage_update":
+      $("usage").textContent =
+        (u.used / 1000).toFixed(1) + "k / " + (u.size / 1000).toFixed(0) + "k ctx";
+      break;
+  }
+}
+
+// ---- composer -------------------------------------------------------------
+async function send() {
+  if (turnInFlight) {
+    notify("session/cancel", { sessionId });
+    return;
+  }
+  const text = input.value.trim();
+  if (!text) return;
+  // Lock BEFORE any await — a double Enter must not mint two sessions or
+  // fire the same prompt twice.
+  turnInFlight = true;
+  sendBtn.textContent = "Stop"; sendBtn.classList.add("stop");
+  input.value = "";
+  try {
+    if (!sessionId) await newChat();
+  } catch (err) {
+    errBlock(err.message || JSON.stringify(err));
+    turnInFlight = false;
+    sendBtn.textContent = "Send"; sendBtn.classList.remove("stop");
+    return;
+  }
+  userBlock(text);
+  try {
+    const res = await rpc("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text }],
+    });
+    stopChip(res.stopReason);
+  } catch (err) {
+    errBlock(err.message || JSON.stringify(err));
+  } finally {
+    turnInFlight = false;
+    sendBtn.textContent = "Send"; sendBtn.classList.remove("stop");
+    refreshSessions();
+  }
+}
+
+sendBtn.onclick = send;
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("new-chat").onclick = () => { if (!turnInFlight) newChat(); };
+
+boot();
+</script>
+</body>
+</html>

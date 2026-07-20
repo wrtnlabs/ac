@@ -1,20 +1,20 @@
 [package]
-name = "ac-store"
+name = "ac-web"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-ac-types.workspace = true
-rusqlite.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
+ac-acp.workspace = true
+ac-cli.workspace = true
 ac-provider.workspace = true
-ac-provider-mock.workspace = true
+ac-provider-openrouter.workspace = true
 ac-runtime.workspace = true
+ac-store.workspace = true
 ac-tool.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+futures.workspace = true
+serde = { workspace = true }
 serde_json.workspace = true
-tempfile.workspace = true
 tokio.workspace = true

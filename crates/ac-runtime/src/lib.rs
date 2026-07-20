@@ -38,8 +38,13 @@ impl Default for AgentConfig {
     }
 }
 
-/// A typed event emitted as the loop makes progress.
-#[derive(Debug, Clone)]
+/// A typed event emitted as the loop makes progress. Serializable so hosts
+/// can put it on a wire (a daemon socket, a WebSocket) or in a log; the tag
+/// layout is part of the kit's public surface — change it deliberately.
+/// Adjacently tagged (`{"type": …, "data": …}`) — internal tagging cannot
+/// represent newtype variants of primitives (`Text(String)` fails at runtime).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     Text(String),
     Thinking(String),
@@ -109,6 +114,21 @@ impl Session {
             hook: None,
             messages: Vec::new(),
         }
+    }
+
+    /// Rebuild a session from persisted history — the reload-recovery path.
+    /// The kit doesn't know where history lives (SQLite, JSONL, a test
+    /// fixture); the host loads it and hands it back.
+    pub fn resume(
+        provider: Arc<dyn Provider>,
+        registry: Arc<ToolRegistry>,
+        ctx: Arc<ToolCtx>,
+        config: AgentConfig,
+        history: Vec<Message>,
+    ) -> Self {
+        let mut session = Self::new(provider, registry, ctx, config);
+        session.messages = history;
+        session
     }
 
     pub fn set_hook(&mut self, hook: Arc<dyn StepHook>) {
@@ -271,6 +291,50 @@ impl Session {
             });
 
             iteration += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tag layout is public surface: every variant must round-trip.
+    #[test]
+    fn every_agent_event_variant_round_trips() {
+        let events = vec![
+            AgentEvent::Text("hi".into()),
+            AgentEvent::Thinking("hm".into()),
+            AgentEvent::ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({ "path": "a.txt" }),
+            },
+            AgentEvent::ToolResult {
+                id: "c1".into(),
+                name: "read_file".into(),
+                output: "ok".into(),
+                is_error: false,
+            },
+            AgentEvent::Citation {
+                url: "https://example.com".into(),
+                title: Some("Example".into()),
+            },
+            AgentEvent::Usage(TokenUsage::default()),
+            AgentEvent::TurnComplete {
+                stop_reason: StopReason::EndTurn,
+            },
+            AgentEvent::Error("boom".into()),
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event)
+                .unwrap_or_else(|e| panic!("serialize {event:?}: {e}"));
+            let back: AgentEvent =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("deserialize {json}: {e}"));
+            assert_eq!(
+                std::mem::discriminant(&event),
+                std::mem::discriminant(&back)
+            );
         }
     }
 }

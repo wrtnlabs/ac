@@ -11,8 +11,16 @@ Crates are `ac-*`. The workspace is source-public but not published to crates.io
 ## Crate map (dependency arrows point down)
 
 ```
+ac-web                     LIVE: the web harness — third host and standing proof that the boundary is
+                           the ACP protocol, not an API. axum server bridging WebSocket frames ↔ the
+                           same ac-acp agent that serves stdio; hand-written browser ACP client
+                           (ui/index.html); zero agent logic in the binary
 ac-cli                     smoke binary / generic host (phase 1: raw completion; later: full generic agent)
-ac-acp                     ACP Agent-side impl (adopt agent-client-protocol crate) — phase 4
+ac-acp                     LIVE: Agent-side ACP over the official agent-client-protocol crate (~1.2,
+                           minor-pinned). initialize/new/prompt/cancel/load; AgentEvent → session/update;
+                           prompt work spawned off the dispatch loop; cancelled turns respond
+                           StopReason::Cancelled and the session rebuilds from its own history;
+                           store present → loadSession capability + persistence + first-prompt titling
 ac-runtime                 THE LOOP: Session/Turn/Task, step hooks, tool router, read-before-write,
                            compaction, cancellation, typed event stream — phase 2
 ac-tools                   hard built-ins: read/write/edit file, ls/glob, grep, shell, fetch — phase 2
@@ -22,7 +30,9 @@ ac-mcp                     LIVE: rmcp 2.x adapter — McpConnection discovers se
                            them as RawTool entries in the same registry as built-ins; errors-as-data,
                            cancel-raced calls, annotations untrusted by default — phase 3
 ac-sandbox                 seatbelt (macOS) / landlock+seccompiler (Linux) mechanism; policy injected — phase 3
-ac-store                   SessionStore trait + rusqlite impl (+ later JSONL rollout) — phase 3
+ac-store                   LIVE: rusqlite session+message store — opaque ids, host-owned meta JSON,
+                           seq-ordered message log; pairs with Session::resume for reload recovery
+                           (+ later JSONL rollout) — phase 3
 ac-provider-openrouter     wire crate: reqwest + eventsource-stream SSE, cache_control breakpoints,
                            usage accounting, retry taxonomy — phase 1 (live)
 ac-provider                Provider trait (one required stream_completion), CompletionRequest — phase 1 (live)
@@ -39,6 +49,8 @@ ac-types                   zero-dep foundation: messages, content parts, Complet
 5. **SandboxPolicy + SessionStore** — mechanism in the kit, policy/storage location from the host.
 
 The kit ships **no prompts**. System prompt is host-supplied; the kit contributes tool specs only. Templates (when needed) use minijinja.
+
+**The serving boundary is ACP.** Clients (web UI, editors, future hosts) speak the Agent Client Protocol to the core; they never link against the runtime. What varies per host enters `ac-acp` through `AcpOptions` — a `SessionFactory` (provider/registry/policy per session cwd) and an optional `SqliteStore`. A host binary like `ac-web` is transport glue only; if it grows agent logic, that's the smell. Host-side conveniences that are UI concerns (listing sessions for a picker) may be host endpoints, but the conversation itself is all protocol.
 
 ## Buy-vs-build ledger (verified 2026-07-20; don't relitigate without new evidence)
 
@@ -60,6 +72,8 @@ The kit ships **no prompts**. System prompt is host-supplied; the kit contribute
 - **Egress / SSRF:** `fetch` and `shell` reach any network the host process can (e.g. `http://169.254.169.254` metadata, loopback). Containment today is filesystem-only. The domain-allowlist egress proxy is `ac-sandbox`'s job (mirror Anthropic sandbox-runtime's proxy design) — do not paper over it with ad-hoc IP checks in the tools.
 - **No OS process sandbox yet:** `shell` is cwd-contained and reaps its process group, but the command can read/write anything the host user can. `ac-sandbox` (seatbelt / landlock+seccompiler) closes this.
 - **Truncated-stream detection:** the loop treats a stream that ends without an explicit `Stop` as a clean `EndTurn`. Acceptable while the provider contract guarantees `Stop`; revisit if a provider can end early.
+- **Same-session concurrency across connections is detected, not prevented:** two ACP connections (e.g. two browser tabs) can `session/load` the same stored session; a concurrent writer surfaces as a seq-CAS conflict (`StoreError::SeqConflict` → prompt error telling the client to reload) rather than a silent history fork. Prevention needs process-wide shared session state (an `AcpOptions` seam) — do it when a real host needs it.
+- **`StopReason::Refusal` keeps the refused turn in history:** the ACP spec says a refused prompt "won't be included in the next prompt", but the kit currently persists and replays it. Honoring it needs a `Session::truncate` + store truncation; deferred until a provider actually emits Refusal in practice.
 - **MCP surface is tools-only, snapshot-at-register:** resources/prompts/sampling/elicitation are not surfaced; `toolListChanged` notifications are ignored (a host refreshes by re-running `register_tools`); remote servers (streamable-HTTP transport + OAuth) are not wired — child-process stdio and in-process transports are. Copy codex `rmcp-client`'s OAuth/keyring patterns when remote lands.
 
 ## Reference reading
