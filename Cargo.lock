@@ -61,8 +61,8 @@ name = "ac-runtime"
 version = "0.1.0"
 dependencies = [
  "ac-provider",
+ "ac-provider-mock",
  "ac-tool",
- "ac-tools",
  "ac-types",
  "async-stream",
  "futures",

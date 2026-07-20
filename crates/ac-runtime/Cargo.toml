@@ -16,5 +16,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-ac-tools = { workspace = true }
+ac-provider-mock = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true }

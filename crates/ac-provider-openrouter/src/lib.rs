@@ -3,7 +3,7 @@
 //! unified [`CompletionEvent`] enum. Owns the parts a generic SDK gets wrong:
 //! Anthropic `cache_control` breakpoints, usage accounting, error taxonomy.
 
-use ac_provider::{CompletionRequest, EventStream, Provider};
+use ac_provider::{CompletionRequest, EventStream, Provider, ToolChoice};
 use ac_types::{
     CompletionError, CompletionEvent, ContentPart, Role, StopReason, TokenUsage, ToolUse,
 };
@@ -104,6 +104,14 @@ fn build_body(request: &CompletionRequest) -> Value {
                 })
             })
             .collect();
+    }
+    if !request.tools.is_empty() {
+        body["tool_choice"] = match &request.tool_choice {
+            ToolChoice::Auto => json!("auto"),
+            ToolChoice::None => json!("none"),
+            ToolChoice::Required => json!("required"),
+            ToolChoice::Force(name) => json!({ "type": "function", "function": { "name": name } }),
+        };
     }
     if let Some(max_tokens) = request.max_tokens {
         body["max_tokens"] = json!(max_tokens);

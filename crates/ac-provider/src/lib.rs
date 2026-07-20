@@ -21,8 +21,22 @@ pub struct CompletionRequest {
     pub messages: Vec<Message>,
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
+    #[serde(default)]
+    pub tool_choice: ToolChoice,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+}
+
+/// How the model may use tools this request. `Force` names a tool the model
+/// must call — the mechanism a step hook uses to pin a forced step.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    #[default]
+    Auto,
+    None,
+    Required,
+    Force(String),
 }
 
 impl CompletionRequest {
@@ -33,6 +47,7 @@ impl CompletionRequest {
             cache_system: false,
             messages: Vec::new(),
             tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
             max_tokens: None,
             temperature: None,
         }
