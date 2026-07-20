@@ -51,3 +51,19 @@ pub trait Tool: Send + Sync + 'static {
         ctx: Arc<ToolCtx>,
     ) -> BoxFuture<'static, ToolOutput>;
 }
+
+/// A tool whose name, description, and input schema are only known at runtime —
+/// the registration path for tools that arrive over a wire (MCP servers) rather
+/// than being compiled in. Input reaches `run` as the model's raw JSON
+/// arguments; validating it is the tool's own job (an MCP server validates
+/// against the schema it advertised), and invalid input must come back as
+/// [`ToolOutput::error`] data, never a panic.
+pub trait RawTool: Send + Sync + 'static {
+    fn spec(&self) -> ac_types::ToolSpec;
+    fn capability(&self) -> Capability;
+    fn run(
+        self: Arc<Self>,
+        input: serde_json::Value,
+        ctx: Arc<ToolCtx>,
+    ) -> BoxFuture<'static, ToolOutput>;
+}

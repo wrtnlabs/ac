@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde_json::Value;
 
 use crate::ctx::ToolCtx;
-use crate::tool::{Capability, Tool, ToolOutput};
+use crate::tool::{Capability, RawTool, Tool, ToolOutput};
 
 trait DynTool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
@@ -40,6 +40,25 @@ impl<T: Tool> DynTool for Erased<T> {
     }
 }
 
+struct ErasedRaw<T: RawTool> {
+    tool: Arc<T>,
+    spec: ToolSpec,
+}
+
+impl<T: RawTool> DynTool for ErasedRaw<T> {
+    fn spec(&self) -> &ToolSpec {
+        &self.spec
+    }
+
+    fn capability(&self) -> Capability {
+        self.tool.capability()
+    }
+
+    fn run_value(&self, input: Value, ctx: Arc<ToolCtx>) -> BoxFuture<'static, ToolOutput> {
+        self.tool.clone().run(input, ctx)
+    }
+}
+
 /// All tools a run can see, regardless of source (built-in, host, MCP).
 /// BTreeMap so spec order — what the model sees — is deterministic.
 #[derive(Default)]
@@ -62,6 +81,20 @@ impl ToolRegistry {
         self.tools.insert(
             spec.name.clone(),
             Arc::new(Erased {
+                tool: Arc::new(tool),
+                spec,
+            }),
+        );
+    }
+
+    /// Registers a runtime-described tool ([`RawTool`]), replacing any previous
+    /// tool with the same name. The spec — including the input schema — is
+    /// taken verbatim from the tool; nothing is derived.
+    pub fn register_raw<T: RawTool>(&mut self, tool: T) {
+        let spec = tool.spec();
+        self.tools.insert(
+            spec.name.clone(),
+            Arc::new(ErasedRaw {
                 tool: Arc::new(tool),
                 spec,
             }),
@@ -174,6 +207,61 @@ mod tests {
             .await;
         assert!(!out.is_error);
         assert_eq!(out.content, "hi");
+    }
+
+    struct RawEcho;
+
+    impl RawTool for RawEcho {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "raw_echo".into(),
+                description: "Echoes the raw input value.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string" } },
+                    "required": ["text"],
+                }),
+            }
+        }
+
+        fn capability(&self) -> Capability {
+            Capability::Mutating
+        }
+
+        fn run(
+            self: Arc<Self>,
+            input: Value,
+            _ctx: Arc<ToolCtx>,
+        ) -> BoxFuture<'static, ToolOutput> {
+            Box::pin(std::future::ready(match input.get("text") {
+                Some(Value::String(s)) => ToolOutput::ok(s.clone()),
+                _ => ToolOutput::error("raw_echo: missing text"),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_tool_spec_is_verbatim_and_input_passes_through() {
+        let mut registry = ToolRegistry::new();
+        registry.register_raw(RawEcho);
+
+        let specs = registry.specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "raw_echo");
+        assert_eq!(specs[0].input_schema["required"][0], "text");
+        assert_eq!(registry.capability("raw_echo"), Some(Capability::Mutating));
+
+        let out = registry
+            .run("raw_echo", serde_json::json!({ "text": "hi" }), ctx())
+            .await;
+        assert!(!out.is_error);
+        assert_eq!(out.content, "hi");
+
+        // No serde validation layer on the raw path: the tool sees the value
+        // verbatim and reports bad input as error data itself.
+        let out = registry.run("raw_echo", serde_json::json!({}), ctx()).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("missing text"));
     }
 
     #[tokio::test]

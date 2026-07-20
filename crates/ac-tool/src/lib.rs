@@ -11,4 +11,4 @@ mod tool;
 pub use ctx::{Extensions, FileTimes, PathLocks, ToolCtx, WriteCheck};
 pub use policy::{PathPolicy, PolicyError, SubtreePolicy};
 pub use registry::ToolRegistry;
-pub use tool::{Capability, Tool, ToolOutput};
+pub use tool::{Capability, RawTool, Tool, ToolOutput};

@@ -5,3 +5,22 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+ac-tool.workspace = true
+ac-types.workspace = true
+futures.workspace = true
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-async-rw",
+    "transport-io",
+    "transport-child-process",
+] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+ac-provider.workspace = true
+ac-provider-mock.workspace = true
+ac-runtime.workspace = true
+rmcp = { workspace = true, features = ["server"] }
+tempfile.workspace = true

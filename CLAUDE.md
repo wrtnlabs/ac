@@ -18,7 +18,9 @@ ac-runtime                 THE LOOP: Session/Turn/Task, step hooks, tool router,
 ac-tools                   hard built-ins: read/write/edit file, ls/glob, grep, shell, fetch — phase 2
 ac-tool                    Tool trait, type-erased ToolDyn, registry, JSON-schema spec serialization — phase 2
 ac-skills                  SKILL.md (agentskills.io) parser + layered user/project/bundled resolver — phase 3
-ac-mcp                     thin adapter over rmcp: discovered MCP tools -> ToolDyn in the registry — phase 3
+ac-mcp                     LIVE: rmcp 2.x adapter — McpConnection discovers server tools and registers
+                           them as RawTool entries in the same registry as built-ins; errors-as-data,
+                           cancel-raced calls, annotations untrusted by default — phase 3
 ac-sandbox                 seatbelt (macOS) / landlock+seccompiler (Linux) mechanism; policy injected — phase 3
 ac-store                   SessionStore trait + rusqlite impl (+ later JSONL rollout) — phase 3
 ac-provider-openrouter     wire crate: reqwest + eventsource-stream SSE, cache_control breakpoints,
@@ -33,7 +35,7 @@ ac-types                   zero-dep foundation: messages, content parts, Complet
 1. **PathPolicy** — built-in fs tools are compiled in but never decide *where* they may act; the host implements `resolve_read/resolve_write`. (A generic host allows the cwd subtree; a document-oriented host can confine writes to a project directory its own tools select at runtime.)
 2. **Step hooks** — per-loop-iteration hook to pin a forced tool, swap model, filter tools, edit system prompt (the AI-SDK `prepareStep` equivalent; forced step chains — e.g. "the first tool call must be the host's project-selection tool" — live host-side).
 3. **Typed ctx Extensions** — a type-map slot on the run context so host tools carry host state without freezing the ctx struct (the codex `extension_data` pattern).
-4. **Tool registration** — three sources, one registry: hard built-ins, host tools, MCP tools. Every tool gets a capability classification (read-only vs mutating) — enforced kit-level.
+4. **Tool registration** — three sources, one registry: hard built-ins, host tools, MCP tools. Compiled-in tools use the typed `Tool` trait (schema derived via schemars); wire-discovered tools use `RawTool` (runtime spec passed through verbatim, input validated by the tool itself). Every tool gets a capability classification (read-only vs mutating) — enforced kit-level. MCP `ToolAnnotations` are server-claimed hints: MCP tools default to `Mutating` regardless of `readOnlyHint`, and a host honors the hint only via an explicit `trust_annotations` opt-in — a read-only permission mode must not be bypassable by a lying server.
 5. **SandboxPolicy + SessionStore** — mechanism in the kit, policy/storage location from the host.
 
 The kit ships **no prompts**. System prompt is host-supplied; the kit contributes tool specs only. Templates (when needed) use minijinja.
@@ -58,6 +60,7 @@ The kit ships **no prompts**. System prompt is host-supplied; the kit contribute
 - **Egress / SSRF:** `fetch` and `shell` reach any network the host process can (e.g. `http://169.254.169.254` metadata, loopback). Containment today is filesystem-only. The domain-allowlist egress proxy is `ac-sandbox`'s job (mirror Anthropic sandbox-runtime's proxy design) — do not paper over it with ad-hoc IP checks in the tools.
 - **No OS process sandbox yet:** `shell` is cwd-contained and reaps its process group, but the command can read/write anything the host user can. `ac-sandbox` (seatbelt / landlock+seccompiler) closes this.
 - **Truncated-stream detection:** the loop treats a stream that ends without an explicit `Stop` as a clean `EndTurn`. Acceptable while the provider contract guarantees `Stop`; revisit if a provider can end early.
+- **MCP surface is tools-only, snapshot-at-register:** resources/prompts/sampling/elicitation are not surfaced; `toolListChanged` notifications are ignored (a host refreshes by re-running `register_tools`); remote servers (streamable-HTTP transport + OAuth) are not wired — child-process stdio and in-process transports are. Copy codex `rmcp-client`'s OAuth/keyring patterns when remote lands.
 
 ## Reference reading
 
