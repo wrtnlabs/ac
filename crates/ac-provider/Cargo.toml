@@ -1,0 +1,10 @@
+[package]
+name = "ac-provider"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ac-types = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }

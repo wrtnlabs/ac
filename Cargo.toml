@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+ac-types = { path = "crates/ac-types" }
+ac-provider = { path = "crates/ac-provider" }
+ac-provider-openrouter = { path = "crates/ac-provider-openrouter" }
+ac-tool = { path = "crates/ac-tool" }
+ac-tools = { path = "crates/ac-tools" }
+ac-runtime = { path = "crates/ac-runtime" }
+ac-skills = { path = "crates/ac-skills" }
+ac-mcp = { path = "crates/ac-mcp" }
+ac-sandbox = { path = "crates/ac-sandbox" }
+ac-acp = { path = "crates/ac-acp" }
+ac-store = { path = "crates/ac-store" }
+
+anyhow = "1"
+async-stream = "0.3"
+eventsource-stream = "0.2"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }

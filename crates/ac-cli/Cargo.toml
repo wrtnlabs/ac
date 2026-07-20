@@ -1,0 +1,17 @@
+[package]
+name = "ac-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ac"
+path = "src/main.rs"
+
+[dependencies]
+ac-provider = { workspace = true }
+ac-provider-openrouter = { workspace = true }
+ac-types = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
