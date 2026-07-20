@@ -64,9 +64,19 @@ pub fn build_host(
 
     let mut server_tools = Vec::new();
     if options.web_search {
-        server_tools.push(ServerTool::WebSearch {
+        let web_search = ServerTool::WebSearch {
             max_results: Some(5),
-        });
+        };
+        // Honor the capability handshake: a provider that can't run web search
+        // would silently ignore the request, so tell the user instead.
+        if provider.supports_server_tool(&web_search) {
+            server_tools.push(web_search);
+        } else {
+            eprintln!(
+                "warning: provider '{}' does not support web search; --web-search ignored",
+                provider.name()
+            );
+        }
     }
 
     let config = AgentConfig {

@@ -120,6 +120,8 @@ fn build_body(request: &CompletionRequest) -> Value {
     // Server-side web search rides OpenRouter's `web` plugin. The model decides
     // 0..N searches; results come back as url_citation annotations (see
     // map_events). ServerTool variants OpenRouter can't do fall through ignored.
+    // Accumulate across all requested server tools so none clobbers another.
+    let mut plugins: Vec<Value> = Vec::new();
     for tool in &request.server_tools {
         match tool {
             ServerTool::WebSearch { max_results } => {
@@ -127,9 +129,12 @@ fn build_body(request: &CompletionRequest) -> Value {
                 if let Some(n) = max_results {
                     plugin["max_results"] = json!(n);
                 }
-                body["plugins"] = json!([plugin]);
+                plugins.push(plugin);
             }
         }
+    }
+    if !plugins.is_empty() {
+        body["plugins"] = json!(plugins);
     }
     if let Some(max_tokens) = request.max_tokens {
         body["max_tokens"] = json!(max_tokens);
@@ -246,9 +251,14 @@ where
                     yield CompletionEvent::Thinking { text: reasoning, signature: None };
                 }
                 for annotation in choice.delta.annotations {
-                    if let Some(citation) = annotation.url_citation {
+                    // A citation is decorative metadata — never let a malformed
+                    // or shape-shifted one abort a load-bearing turn. Skip any
+                    // without a url rather than failing the whole stream.
+                    if let Some(citation) = annotation.url_citation
+                        && let Some(url) = citation.url
+                    {
                         yield CompletionEvent::Citation(Citation {
-                            url: citation.url,
+                            url,
                             title: citation.title,
                         });
                     }
@@ -334,7 +344,8 @@ struct AnnotationChunk {
 
 #[derive(Deserialize)]
 struct UrlCitationChunk {
-    url: String,
+    // Lenient on purpose: a citation missing its url is skipped, not fatal.
+    url: Option<String>,
     title: Option<String>,
 }
 
@@ -475,5 +486,43 @@ mod tests {
         assert_eq!(citations.len(), 1);
         assert_eq!(citations[0].url, "https://example.com/a");
         assert_eq!(citations[0].title.as_deref(), Some("Example A"));
+    }
+
+    // A malformed citation (no url) must be skipped, not abort the turn — the
+    // model's answer and any well-formed citation still come through.
+    #[tokio::test]
+    async fn malformed_citation_is_skipped_not_fatal() {
+        fn frame(data: &str) -> eventsource_stream::Event {
+            eventsource_stream::Event {
+                data: data.into(),
+                ..Default::default()
+            }
+        }
+        let frames = vec![
+            Ok::<_, std::convert::Infallible>(frame(
+                r#"{"choices":[{"delta":{"annotations":[{"type":"url_citation","url_citation":{"title":"no url here"}}],"content":"answer"}}]}"#,
+            )),
+            Ok(frame(
+                r#"{"choices":[{"delta":{"annotations":[{"type":"url_citation","url_citation":{"url":"https://ok.example"}}]}}]}"#,
+            )),
+            Ok(frame(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            )),
+        ];
+
+        let mut stream = map_events(futures::stream::iter(frames));
+        let (mut citations, mut text, mut stopped) = (Vec::new(), String::new(), false);
+        while let Some(item) = stream.next().await {
+            match item.expect("no frame should error the stream") {
+                CompletionEvent::Citation(c) => citations.push(c),
+                CompletionEvent::Text(t) => text.push_str(&t),
+                CompletionEvent::Stop(_) => stopped = true,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "answer", "answer text must survive a bad citation");
+        assert!(stopped, "stream must still terminate cleanly");
+        assert_eq!(citations.len(), 1, "only the well-formed citation surfaces");
+        assert_eq!(citations[0].url, "https://ok.example");
     }
 }
