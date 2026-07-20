@@ -53,6 +53,12 @@ The kit ships **no prompts**. System prompt is host-supplied; the kit contribute
 
 **License rule:** Zed's agent/model/sandbox crates are **GPL-3.0-or-later** — copy their *designs* (unified `LanguageModelCompletionEvent` shape, `Sandbox::wrap` API), NEVER their code. codex-rs is Apache-2.0 and vendor-friendly (cleanest lift: `execpolicy`; `apply-patch`/`sandboxing` are entangled with codex internals — reference only). The `codex-*` crates ON crates.io are a stale third-party fork — never depend on them.
 
+## Known deferred gaps (own them when the phase lands)
+
+- **Egress / SSRF:** `fetch` and `shell` reach any network the host process can (e.g. `http://169.254.169.254` metadata, loopback). Containment today is filesystem-only. The domain-allowlist egress proxy is `ac-sandbox`'s job (mirror Anthropic sandbox-runtime's proxy design) — do not paper over it with ad-hoc IP checks in the tools.
+- **No OS process sandbox yet:** `shell` is cwd-contained and reaps its process group, but the command can read/write anything the host user can. `ac-sandbox` (seatbelt / landlock+seccompiler) closes this.
+- **Truncated-stream detection:** the loop treats a stream that ends without an explicit `Stop` as a clean `EndTurn`. Acceptable while the provider contract guarantees `Stop`; revisit if a provider can end early.
+
 ## Reference reading
 
 - [zed](https://github.com/zed-industries/zed) — `crates/language_model_core` (the event enum to mirror), `crates/anthropic` (hand-rolled SSE shape), `crates/agent/src/thread.rs` `run_turn_internal` (concurrent-tools select! loop), `crates/sandbox` (best command-wrapper API design).

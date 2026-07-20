@@ -19,3 +19,5 @@ tokio-util = { workspace = true }
 ac-provider-mock = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+schemars = { workspace = true }

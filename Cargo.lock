@@ -11,10 +11,16 @@ name = "ac-cli"
 version = "0.1.0"
 dependencies = [
  "ac-provider",
+ "ac-provider-mock",
  "ac-provider-openrouter",
+ "ac-runtime",
+ "ac-tool",
+ "ac-tools",
  "ac-types",
  "anyhow",
  "futures",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -66,6 +72,8 @@ dependencies = [
  "ac-types",
  "async-stream",
  "futures",
+ "schemars",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -107,6 +115,7 @@ dependencies = [
  "ac-tool",
  "futures",
  "globset",
+ "libc",
  "regex",
  "reqwest",
  "schemars",

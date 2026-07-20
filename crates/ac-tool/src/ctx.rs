@@ -13,6 +13,7 @@ pub struct ToolCtx {
     pub policy: Arc<dyn PathPolicy>,
     pub extensions: Extensions,
     pub file_times: FileTimes,
+    pub locks: PathLocks,
     pub cancel: CancellationToken,
 }
 
@@ -22,8 +23,30 @@ impl ToolCtx {
             policy,
             extensions: Extensions::default(),
             file_times: FileTimes::default(),
+            locks: PathLocks::default(),
             cancel: CancellationToken::new(),
         }
+    }
+}
+
+/// Per-path async mutex map. When a turn runs several mutating tools
+/// concurrently, a read-modify-write on the same file would otherwise race and
+/// lose an update; a tool that holds `locks.lock(path)` across its
+/// read→modify→write is serialized against any other holder of the same path.
+#[derive(Default)]
+pub struct PathLocks(Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>);
+
+impl PathLocks {
+    /// Acquire the lock for `path`, awaiting any concurrent holder. The returned
+    /// guard serializes same-path writers; distinct paths never contend.
+    pub async fn lock(&self, path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = {
+            let mut map = self.0.lock().expect("path-locks lock poisoned");
+            map.entry(path.to_path_buf())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        mutex.lock_owned().await
     }
 }
 
