@@ -1,0 +1,17 @@
+[package]
+name = "ac-provider-mock"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# A scripted Provider for offline, deterministic end-to-end testing: no network,
+# no API key. You hand it a queue of scripted turns; each `stream_completion`
+# call pops the next turn and emits its events. This is what makes AC's e2e
+# loop verifiable in CI.
+
+[dependencies]
+ac-provider = { workspace = true }
+ac-types = { workspace = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }

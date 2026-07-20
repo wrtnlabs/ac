@@ -5,3 +5,16 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+ac-provider = { workspace = true }
+ac-tool = { workspace = true }
+ac-types = { workspace = true }
+async-stream = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+ac-tools = { workspace = true }
+tempfile = { workspace = true }

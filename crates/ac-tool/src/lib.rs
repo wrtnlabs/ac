@@ -1,3 +1,14 @@
-//! Tool trait, type-erased ToolDyn, registry, and JSON-schema spec serialization (schemars). Phase 2.
-//!
-//! Placeholder — see CLAUDE.md for the crate map and phase plan.
+//! The tool system: typed [`Tool`] trait, type-erased registry, JSON-schema
+//! spec generation (schemars), and the run context tools receive — including
+//! the [`PathPolicy`] seam (hosts decide *where* tools may act), typed
+//! [`Extensions`], and per-run read-before-write [`FileTimes`].
+
+mod ctx;
+mod policy;
+mod registry;
+mod tool;
+
+pub use ctx::{Extensions, FileTimes, ToolCtx, WriteCheck};
+pub use policy::{PathPolicy, PolicyError, SubtreePolicy};
+pub use registry::ToolRegistry;
+pub use tool::{Capability, Tool, ToolOutput};

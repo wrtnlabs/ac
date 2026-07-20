@@ -11,6 +11,7 @@ publish = false
 ac-types = { path = "crates/ac-types" }
 ac-provider = { path = "crates/ac-provider" }
 ac-provider-openrouter = { path = "crates/ac-provider-openrouter" }
+ac-provider-mock = { path = "crates/ac-provider-mock" }
 ac-tool = { path = "crates/ac-tool" }
 ac-tools = { path = "crates/ac-tools" }
 ac-runtime = { path = "crates/ac-runtime" }
@@ -24,8 +25,14 @@ anyhow = "1"
 async-stream = "0.3"
 eventsource-stream = "0.2"
 futures = "0.3"
+globset = "0.4"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+walkdir = "2"
