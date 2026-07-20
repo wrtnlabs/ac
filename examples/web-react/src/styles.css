@@ -47,7 +47,7 @@ main { display: flex; flex-direction: column; min-height: 0; }
 .block { margin-bottom: 14px; }
 .who { font-size: 11px; color: var(--dim); margin-bottom: 4px; }
 .user .bubble { background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; white-space: pre-wrap; }
-.agent .text { white-space: pre-wrap; }
+.assistant .text { white-space: pre-wrap; }
 details.thought { border-left: 3px solid var(--think); padding: 4px 10px; margin: 8px 0; color: var(--think); font-size: 13px; }
 details.thought summary { cursor: pointer; user-select: none; }
 details.thought .t { white-space: pre-wrap; margin-top: 4px; }
