@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use ac_provider::ToolChoice;
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
 use ac_runtime::{AgentEvent, Session};
 use ac_types::{ContentPart, Role, StopReason};
@@ -212,4 +213,219 @@ async fn policy_refuses_write_escaping_root_end_to_end() {
         saw_error_result,
         "the policy-refusal error should have been fed back to the model"
     );
+}
+
+/// Lay a valid skill directory under `root`.
+fn seed_skill(root: &std::path::Path, name: &str, description: &str, body: &str) {
+    let skill_dir = root.join(name);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
+    )
+    .unwrap();
+}
+
+/// The SHIPPED skills wiring, through `build_host` exactly as the binary uses
+/// it: with a skills root and a required skill, the catalog reaches the system
+/// prompt, the first request forces `load_skill`, the choice frees once the
+/// history shows the skill was loaded, and a file written per the skill's
+/// instructions lands on disk.
+#[tokio::test]
+async fn shipped_host_forces_required_skill_then_frees() {
+    let dir = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    seed_skill(
+        skills.path(),
+        "output-style",
+        "Conventions for written output.",
+        "Every file you write must contain the token GROVE-42.",
+    );
+
+    let provider = MockProvider::new(vec![
+        vec![
+            tool_use(
+                "call-skill",
+                "load_skill",
+                json!({ "name": "output-style" }),
+            ),
+            stop_tool_use(),
+        ],
+        vec![
+            tool_use(
+                "call-write",
+                "write_file",
+                json!({ "path": "note.txt", "content": "GROVE-42" }),
+            ),
+            stop_tool_use(),
+        ],
+        vec![text("done"), stop_end()],
+    ]);
+
+    let handle = provider.clone();
+    let host = ac_cli::build_host(
+        Arc::new(provider),
+        dir.path(),
+        "mock/model".to_string(),
+        ac_cli::HostOptions {
+            skills_root: Some(skills.path().to_path_buf()),
+            require_skill: Some("output-style".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("build_host");
+
+    let (result, _events) = run(host.session, "write a note").await;
+    assert_eq!(result.expect("turn ok"), StopReason::EndTurn);
+
+    let requests = handle.requests();
+    assert_eq!(requests.len(), 3, "expected three model round-trips");
+
+    let system = requests[0].system.as_deref().expect("a system prompt");
+    assert!(
+        system.contains("## Skills"),
+        "the skill catalog block must reach the system prompt"
+    );
+    assert!(
+        system.contains("- output-style — Conventions for written output."),
+        "the catalog must advertise the seeded skill: {system}"
+    );
+
+    assert_eq!(
+        requests[0].tool_choice,
+        ToolChoice::Force("load_skill".to_string()),
+        "the first request must force the required skill load"
+    );
+    assert_eq!(
+        requests[1].tool_choice,
+        ToolChoice::Auto,
+        "once the history shows load_skill was called, the choice is free"
+    );
+    assert_eq!(requests[2].tool_choice, ToolChoice::Auto);
+
+    // The skill body reached the model, and the skill-directed file is real.
+    let skill_fed_back = requests.iter().any(|r| {
+        r.messages.iter().any(|m| {
+            m.content.iter().any(|p| {
+                matches!(p, ContentPart::ToolResult(tr)
+                    if tr.tool_use_id == "call-skill" && tr.content.contains("GROVE-42"))
+            })
+        })
+    });
+    assert!(
+        skill_fed_back,
+        "the loaded skill body must be fed back to the model"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("note.txt")).expect("note.txt must exist"),
+        "GROVE-42"
+    );
+}
+
+/// Forcing pins the tool, not its arguments — a load of the WRONG skill (or a
+/// typo that errors) must not release the requirement. Only a successful load
+/// of the required skill frees the choice.
+#[tokio::test]
+async fn a_wrong_skill_load_does_not_release_the_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    seed_skill(
+        skills.path(),
+        "output-style",
+        "Conventions for written output.",
+        "Every file you write must contain the token GROVE-42.",
+    );
+    seed_skill(skills.path(), "decoy", "An unrelated skill.", "Decoy body.");
+
+    let provider = MockProvider::new(vec![
+        // Obeys the forced tool but names the wrong skill…
+        vec![
+            tool_use("call-decoy", "load_skill", json!({ "name": "decoy" })),
+            stop_tool_use(),
+        ],
+        // …then typos a name, which errors…
+        vec![
+            tool_use("call-typo", "load_skill", json!({ "name": "outputstyle" })),
+            stop_tool_use(),
+        ],
+        // …then loads the required skill, releasing the force.
+        vec![
+            tool_use(
+                "call-skill",
+                "load_skill",
+                json!({ "name": "output-style" }),
+            ),
+            stop_tool_use(),
+        ],
+        vec![text("done"), stop_end()],
+    ]);
+
+    let handle = provider.clone();
+    let host = ac_cli::build_host(
+        Arc::new(provider),
+        dir.path(),
+        "mock/model".to_string(),
+        ac_cli::HostOptions {
+            skills_root: Some(skills.path().to_path_buf()),
+            require_skill: Some("output-style".to_string()),
+            ..Default::default()
+        },
+    )
+    .expect("build_host");
+
+    let (result, _events) = run(host.session, "write a note").await;
+    assert_eq!(result.expect("turn ok"), StopReason::EndTurn);
+
+    let choices: Vec<ToolChoice> = handle
+        .requests()
+        .iter()
+        .map(|r| r.tool_choice.clone())
+        .collect();
+    assert_eq!(
+        choices,
+        vec![
+            ToolChoice::Force("load_skill".to_string()),
+            ToolChoice::Force("load_skill".to_string()),
+            ToolChoice::Force("load_skill".to_string()),
+            ToolChoice::Auto,
+        ],
+        "the force must persist across a wrong-name load and an errored load"
+    );
+}
+
+/// A required skill that doesn't exist (or a requirement without a skills
+/// root at all) must fail at build time, not at the first turn.
+#[test]
+fn build_host_rejects_a_missing_required_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    seed_skill(skills.path(), "present", "A skill that exists.", "Body.");
+
+    let err = ac_cli::build_host(
+        Arc::new(MockProvider::new(vec![])),
+        dir.path(),
+        "mock/model".to_string(),
+        ac_cli::HostOptions {
+            skills_root: Some(skills.path().to_path_buf()),
+            require_skill: Some("absent".to_string()),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("a missing required skill must fail the build");
+    assert!(err.to_string().contains("absent"));
+    assert!(err.to_string().contains("present"), "lists what exists");
+
+    let err = ac_cli::build_host(
+        Arc::new(MockProvider::new(vec![])),
+        dir.path(),
+        "mock/model".to_string(),
+        ac_cli::HostOptions {
+            require_skill: Some("anything".to_string()),
+            ..Default::default()
+        },
+    )
+    .err()
+    .expect("require_skill without a skills root must fail the build");
+    assert!(err.to_string().contains("skills root"));
 }

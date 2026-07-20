@@ -54,11 +54,14 @@ dependencies = [
  "ac-provider-mock",
  "ac-provider-openrouter",
  "ac-runtime",
+ "ac-skills",
  "ac-tool",
  "ac-tools",
  "ac-types",
  "anyhow",
  "futures",
+ "schemars 1.2.1",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -142,6 +145,16 @@ version = "0.1.0"
 [[package]]
 name = "ac-skills"
 version = "0.1.0"
+dependencies = [
+ "ac-tool",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "ac-store"

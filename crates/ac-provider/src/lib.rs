@@ -45,7 +45,7 @@ pub enum ServerTool {
 
 /// How the model may use tools this request. `Force` names a tool the model
 /// must call — the mechanism a step hook uses to pin a forced step.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoice {
     #[default]

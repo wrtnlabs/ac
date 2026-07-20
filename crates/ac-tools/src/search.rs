@@ -70,7 +70,7 @@ impl Tool for Glob {
                 Ok(g) => g.compile_matcher(),
                 Err(e) => return ToolOutput::error(format!("invalid glob pattern: {e}")),
             };
-            let root = ctx.policy.root().to_path_buf();
+            let root = ctx.policy.root();
 
             let result = tokio::task::spawn_blocking(move || {
                 // Cap collection during the walk (not just the output) so an
@@ -181,7 +181,7 @@ impl Tool for Grep {
                 Ok(p) => p,
                 Err(e) => return ToolOutput::error(e.to_string()),
             };
-            let root = ctx.policy.root().to_path_buf();
+            let root = ctx.policy.root();
 
             let result = tokio::task::spawn_blocking(move || {
                 grep_walk(&resolved, &root, &regex, glob_matcher.as_ref())

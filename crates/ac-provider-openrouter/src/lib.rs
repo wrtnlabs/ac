@@ -435,6 +435,41 @@ mod tests {
         assert_eq!(messages[0]["tool_call_id"], json!("call_1"));
     }
 
+    // tool_choice only makes sense alongside tools; with no tools declared the
+    // key must be absent entirely (some backends reject a dangling tool_choice).
+    #[test]
+    fn tool_choice_is_omitted_without_tools() {
+        let mut request = CompletionRequest::new("test/model");
+        request.tool_choice = ToolChoice::Required;
+        let body = build_body(&request);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn tool_choice_variants_encode() {
+        let spec = ac_types::ToolSpec {
+            name: "lookup".into(),
+            description: "d".into(),
+            input_schema: json!({ "type": "object" }),
+        };
+        let cases = [
+            (ToolChoice::Auto, json!("auto")),
+            (ToolChoice::None, json!("none")),
+            (ToolChoice::Required, json!("required")),
+            (
+                ToolChoice::Force("lookup".into()),
+                json!({ "type": "function", "function": { "name": "lookup" } }),
+            ),
+        ];
+        for (choice, expected) in cases {
+            let mut request = CompletionRequest::new("test/model");
+            request.tools.push(spec.clone());
+            request.tool_choice = choice;
+            assert_eq!(build_body(&request)["tool_choice"], expected);
+        }
+    }
+
     // --- provider-server-tools seam (web search) ---
     // Encode side: requesting the WebSearch server tool must add OpenRouter's
     // `web` plugin, and nothing when it isn't requested.

@@ -9,6 +9,6 @@ mod registry;
 mod tool;
 
 pub use ctx::{Extensions, FileTimes, PathLocks, ToolCtx, WriteCheck};
-pub use policy::{PathPolicy, PolicyError, SubtreePolicy};
+pub use policy::{PathPolicy, PolicyError, ReadOnlyPolicy, SplitPolicy, SubtreePolicy, SwapPolicy};
 pub use registry::ToolRegistry;
 pub use tool::{Capability, RawTool, Tool, ToolOutput};

@@ -205,7 +205,7 @@ impl Tool for WriteFile {
 
             ToolOutput::ok(format!(
                 "wrote {n} bytes to {}",
-                rel(ctx.policy.root(), &resolved)
+                rel(&ctx.policy.root(), &resolved)
             ))
         })
     }
@@ -311,7 +311,7 @@ impl Tool for EditFile {
                 ctx.file_times.stamp(resolved.clone(), mtime);
             }
 
-            ToolOutput::ok(format!("edited {}", rel(ctx.policy.root(), &resolved)))
+            ToolOutput::ok(format!("edited {}", rel(&ctx.policy.root(), &resolved)))
         })
     }
 }

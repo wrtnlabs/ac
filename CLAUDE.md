@@ -28,7 +28,10 @@ ac-runtime                 THE LOOP: Session/Turn/Task, step hooks, tool router,
                            compaction, cancellation, typed event stream — phase 2
 ac-tools                   hard built-ins: read/write/edit file, ls/glob, grep, shell, fetch — phase 2
 ac-tool                    Tool trait, type-erased ToolDyn, registry, JSON-schema spec serialization — phase 2
-ac-skills                  SKILL.md (agentskills.io) parser + layered user/project/bundled resolver — phase 3
+ac-skills                  LIVE: agentskills.io SKILL.md support — hand-rolled scalar-only frontmatter
+                           parser (richer YAML is skipped with a reason, never mis-parsed), layered
+                           resolver (earlier layer shadows; every rejected candidate carries a reason),
+                           read-only load_skill tool, catalog_markdown() system-prompt block — phase 3
 ac-mcp                     LIVE: rmcp 2.x adapter — McpConnection discovers server tools and registers
                            them as RawTool entries in the same registry as built-ins; errors-as-data,
                            cancel-raced calls, annotations untrusted by default — phase 3
@@ -82,6 +85,8 @@ The AI SDK is two halves and only one overlaps AC: its *server/provider* half (`
 - **Truncated-stream detection:** the loop treats a stream that ends without an explicit `Stop` as a clean `EndTurn`. Acceptable while the provider contract guarantees `Stop`; revisit if a provider can end early.
 - **Same-session concurrency across connections is detected, not prevented:** two ACP connections (e.g. two browser tabs) can `session/load` the same stored session; a concurrent writer surfaces as a seq-CAS conflict (`StoreError::SeqConflict` → prompt error telling the client to reload) rather than a silent history fork. Prevention needs process-wide shared session state (an `AcpOptions` seam) — do it when a real host needs it.
 - **`StopReason::Refusal` keeps the refused turn in history:** the ACP spec says a refused prompt "won't be included in the next prompt", but the kit currently persists and replays it. Honoring it needs a `Session::truncate` + store truncation; deferred until a provider actually emits Refusal in practice.
+- **Skill directories are body-only today:** a skill directory may carry assets/scripts alongside its SKILL.md, but `load_skill` returns only the SKILL.md body. Widening the loaded skill's directory into the path policy so tools can read those companion files is a host choice (compose it with `SplitPolicy`/`SwapPolicy`), not wired kit-side.
+- **Skill frontmatter is preserved, not enforced:** unknown keys (`allowed-tools`, `license`, …) survive parsing into `Frontmatter.fields`, but no kit layer acts on them yet — a host that wants `allowed-tools` semantics filters its registry itself.
 - **MCP surface is tools-only, snapshot-at-register:** resources/prompts/sampling/elicitation are not surfaced; `toolListChanged` notifications are ignored (a host refreshes by re-running `register_tools`); remote servers (streamable-HTTP transport + OAuth) are not wired — child-process stdio and in-process transports are. Copy codex `rmcp-client`'s OAuth/keyring patterns when remote lands.
 
 ## Reference reading

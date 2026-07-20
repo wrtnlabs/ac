@@ -17,12 +17,16 @@ struct Args {
     dir: PathBuf,
     prompt: String,
     web_search: bool,
+    skills: Option<PathBuf>,
+    require_skill: Option<String>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut model = "anthropic/claude-haiku-4.5".to_string();
     let mut dir: Option<PathBuf> = None;
     let mut web_search = false;
+    let mut skills: Option<PathBuf> = None;
+    let mut require_skill: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
 
     let mut it = std::env::args().skip(1);
@@ -40,13 +44,27 @@ fn parse_args() -> anyhow::Result<Args> {
                 dir = Some(PathBuf::from(v));
             }
             "--web-search" => web_search = true,
+            "--skills" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--skills needs a value"))?;
+                skills = Some(PathBuf::from(v));
+            }
+            "--require-skill" => {
+                require_skill = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow::anyhow!("--require-skill needs a value"))?,
+                );
+            }
             _ => rest.push(arg),
         }
     }
 
     let prompt = rest.join(" ");
     if prompt.trim().is_empty() {
-        anyhow::bail!("usage: ac [--model <id>] [--dir <path>] [--web-search] <prompt...>");
+        anyhow::bail!(
+            "usage: ac [--model <id>] [--dir <path>] [--web-search] [--skills <dir>] [--require-skill <name>] <prompt...>"
+        );
     }
 
     let dir = match dir {
@@ -59,6 +77,8 @@ fn parse_args() -> anyhow::Result<Args> {
         dir,
         prompt,
         web_search,
+        skills,
+        require_skill,
     })
 }
 
@@ -72,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
     let provider = Arc::new(OpenRouter::new(api_key));
     let options = HostOptions {
         web_search: args.web_search,
+        skills_root: args.skills,
+        require_skill: args.require_skill,
     };
     let host = build_host(provider, &args.dir, args.model, options)?;
     let mut session = host.session;
