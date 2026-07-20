@@ -11,10 +11,13 @@ Crates are `ac-*`. The workspace is source-public but not published to crates.io
 ## Crate map (dependency arrows point down)
 
 ```
-ac-web                     LIVE: the web harness — third host and standing proof that the boundary is
-                           the ACP protocol, not an API. axum server bridging WebSocket frames ↔ the
+ac-web                     LIVE: the ACP web harness — axum server bridging WebSocket frames ↔ the
                            same ac-acp agent that serves stdio; hand-written browser ACP client
-                           (ui/index.html); zero agent logic in the binary
+                           (ui/index.html); zero agent logic in the binary. The EDITOR-ecosystem proof.
+ac-ai-sdk                  LIVE: the Vercel AI SDK adapter — lib maps AgentEvent ↔ the v5 UI Message
+                           Stream Protocol (UIMessageChunk out, UIMessage hydration in); bin is an axum
+                           host serving it over SSE to a stock useChat React app (examples/web-react).
+                           The WEB-ecosystem proof. Sibling of ac-acp, not stacked on it.
 ac-cli                     smoke binary / generic host (phase 1: raw completion; later: full generic agent)
 ac-acp                     LIVE: Agent-side ACP over the official agent-client-protocol crate (~1.2,
                            minor-pinned). initialize/new/prompt/cancel/load; AgentEvent → session/update;
@@ -30,8 +33,9 @@ ac-mcp                     LIVE: rmcp 2.x adapter — McpConnection discovers se
                            them as RawTool entries in the same registry as built-ins; errors-as-data,
                            cancel-raced calls, annotations untrusted by default — phase 3
 ac-sandbox                 seatbelt (macOS) / landlock+seccompiler (Linux) mechanism; policy injected — phase 3
-ac-store                   LIVE: rusqlite session+message store — opaque ids, host-owned meta JSON,
-                           seq-ordered message log; pairs with Session::resume for reload recovery
+ac-store                   LIVE: rusqlite session+message store — opaque or caller-adopted ids,
+                           host-owned meta JSON, seq-ordered message log (seq-CAS append);
+                           pairs with Session::resume for reload recovery
                            (+ later JSONL rollout) — phase 3
 ac-provider-openrouter     wire crate: reqwest + eventsource-stream SSE, cache_control breakpoints,
                            usage accounting, retry taxonomy — phase 1 (live)
@@ -50,7 +54,11 @@ ac-types                   zero-dep foundation: messages, content parts, Complet
 
 The kit ships **no prompts**. System prompt is host-supplied; the kit contributes tool specs only. Templates (when needed) use minijinja.
 
-**The serving boundary is ACP.** Clients (web UI, editors, future hosts) speak the Agent Client Protocol to the core; they never link against the runtime. What varies per host enters `ac-acp` through `AcpOptions` — a `SessionFactory` (provider/registry/policy per session cwd) and an optional `SqliteStore`. A host binary like `ac-web` is transport glue only; if it grows agent logic, that's the smell. Host-side conveniences that are UI concerns (listing sessions for a picker) may be host endpoints, but the conversation itself is all protocol.
+**Serving is layered, not one protocol.** Clients speak a *wire* to the core; they never link against the runtime. Two wires ship, one per ecosystem, and **both are thin adapters off the one `AgentEvent` stream — neither is stacked on the other**:
+- **ACP** (`ac-acp`, out-of-process / editors) — the standardized agent↔host RPC (Zed, JetBrains, stdio). What varies enters via `AcpOptions` (`SessionFactory` + optional `SqliteStore`).
+- **The Vercel AI SDK UI Message Stream Protocol** (`ac-ai-sdk`, web/React) — so a stock `@ai-sdk/react` `useChat` app renders an AC agent with zero custom client code. `ChunkEncoder` maps `AgentEvent → UIMessageChunk`.
+
+The AI SDK is two halves and only one overlaps AC: its *server/provider* half (`streamText`) is what AC **replaces** — running AC under it is the force-fit to avoid; its *client/UI* half (`useChat`) is the ecosystem AC **feeds**. A host binary (`ac-web`, `ac-ai-sdk`) is transport glue only; agent logic in it is the smell. UI conveniences (a session-list endpoint) may be host endpoints; the conversation is all protocol.
 
 ## Buy-vs-build ledger (verified 2026-07-20; don't relitigate without new evidence)
 

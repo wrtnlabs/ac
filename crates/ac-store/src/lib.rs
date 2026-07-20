@@ -131,6 +131,21 @@ impl SqliteStore {
         })
     }
 
+    /// Ensures a session exists under a caller-chosen id, no-op if it already
+    /// does. For hosts whose client mints the session id (an AI SDK `useChat`
+    /// chat id, an ACP session id): the id is theirs, the store just adopts
+    /// it. Returns true if a new row was created.
+    pub fn create_session_with_id(&self, id: &str, title: Option<&str>) -> Result<bool> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let now = now_ms();
+        let created = conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, title, meta, created_at, updated_at)
+             VALUES (?1, ?2, NULL, ?3, ?3)",
+            params![id, title, now],
+        )?;
+        Ok(created > 0)
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Option<SessionRecord>> {
         let conn = self.conn.lock().expect("store lock poisoned");
         let row = conn
@@ -505,6 +520,30 @@ mod tests {
         );
         // Nothing was written by the failed append.
         assert_eq!(store.message_count(&s.id).unwrap(), 2);
+    }
+
+    #[test]
+    fn create_with_id_is_idempotent_and_adopts_the_caller_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            store
+                .create_session_with_id("chat-abc", Some("hi"))
+                .unwrap()
+        );
+        // Second call is a no-op — the row is kept, not replaced.
+        assert!(
+            !store
+                .create_session_with_id("chat-abc", Some("other"))
+                .unwrap()
+        );
+        let record = store.get_session("chat-abc").unwrap().unwrap();
+        assert_eq!(record.id, "chat-abc");
+        assert_eq!(record.title.as_deref(), Some("hi"));
+        // The adopted id works as a normal session for the message log.
+        store
+            .append_messages("chat-abc", &[msg(Role::User, "yo")], Some(0))
+            .unwrap();
+        assert_eq!(store.message_count("chat-abc").unwrap(), 1);
     }
 
     #[test]

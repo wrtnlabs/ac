@@ -9,6 +9,7 @@ publish = false
 
 [workspace.dependencies]
 ac-types = { path = "crates/ac-types" }
+ac-ai-sdk = { path = "crates/ac-ai-sdk" }
 ac-provider = { path = "crates/ac-provider" }
 ac-provider-openrouter = { path = "crates/ac-provider-openrouter" }
 ac-provider-mock = { path = "crates/ac-provider-mock" }

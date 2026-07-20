@@ -24,6 +24,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ac-ai-sdk"
+version = "0.1.0"
+dependencies = [
+ "ac-cli",
+ "ac-provider",
+ "ac-provider-mock",
+ "ac-provider-openrouter",
+ "ac-runtime",
+ "ac-store",
+ "ac-tool",
+ "ac-types",
+ "anyhow",
+ "async-stream",
+ "axum",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "ac-cli"
 version = "0.1.0"
 dependencies = [
