@@ -28,10 +28,18 @@ ac-runtime                 THE LOOP: Session/Turn/Task, step hooks, tool router,
                            compaction, cancellation, typed event stream — phase 2
 ac-tools                   hard built-ins: read/write/edit file, ls/glob, grep, shell, fetch — phase 2
 ac-tool                    Tool trait, type-erased ToolDyn, registry, JSON-schema spec serialization — phase 2
-ac-skills                  LIVE: agentskills.io SKILL.md support — hand-rolled scalar-only frontmatter
-                           parser (richer YAML is skipped with a reason, never mis-parsed), layered
-                           resolver (earlier layer shadows; every rejected candidate carries a reason),
-                           read-only load_skill tool, catalog_markdown() system-prompt block — phase 3
+ac-skills                  LIVE: SKILL.md skills mirroring the codex-rs architecture (studied
+                           2026-07-21) — skills are INJECTED TEXT, not a tool: catalog_markdown()
+                           renders "- name: description (file: /abs/SKILL.md)" + usage prose for the
+                           system prompt; $name / [$name](path) mentions select skills (unambiguous
+                           names only, env-var lookalikes excluded); build_skill_injections() wraps
+                           SKILL.md verbatim in <skill><name/><path/>…</skill> for the turn input;
+                           the model reads companion files itself at the listed paths. Hand-rolled
+                           scalar-only frontmatter (richer YAML skipped with a reason, never
+                           mis-parsed; name falls back to the dir name), recursive depth-6 discovery,
+                           duplicate names kept (ambiguity blocks plain mentions), dep-light
+                           (thiserror only). No load_skill tool, no allowed-tools enforcement, no
+                           per-skill permission widening — codex parity
 ac-mcp                     LIVE: rmcp 2.x adapter — McpConnection discovers server tools and registers
                            them as RawTool entries in the same registry as built-ins; errors-as-data,
                            cancel-raced calls, annotations untrusted by default — phase 3
@@ -60,7 +68,7 @@ ac-types                   zero-dep foundation: messages, content parts, Complet
 4. **Tool registration** — three sources, one registry: hard built-ins, host tools, MCP tools. Compiled-in tools use the typed `Tool` trait (schema derived via schemars); wire-discovered tools use `RawTool` (runtime spec passed through verbatim, input validated by the tool itself). Every tool gets a capability classification (read-only vs mutating) — enforced kit-level. MCP `ToolAnnotations` are server-claimed hints: MCP tools default to `Mutating` regardless of `readOnlyHint`, and a host honors the hint only via an explicit `trust_annotations` opt-in — a read-only permission mode must not be bypassable by a lying server.
 5. **SandboxPolicy + SessionStore** — mechanism in the kit, policy/storage location from the host.
 
-The kit ships **no prompts**. System prompt is host-supplied; the kit contributes tool specs only. Templates (when needed) use minijinja.
+The kit ships **no prompts**, with one scoped exception: system prompt and persona are host-supplied, the kit contributes tool specs — and `ac-skills` ships the model-facing skills catalog + usage prose (`catalog_markdown`, the `<skill>` injection format), because that text IS the skills mechanism (codex ships it in core-skills for the same reason). Hosts opt in by calling it. Templates (when needed) use minijinja.
 
 **Serving is layered, not one protocol.** Clients speak a *wire* to the core; they never link against the runtime. Two wires ship, one per ecosystem, and **both are thin adapters off the one `AgentEvent` stream — neither is stacked on the other**:
 - **ACP** (`ac-acp`, out-of-process / editors) — the standardized agent↔host RPC (Zed, JetBrains, stdio). What varies enters via `AcpOptions` (`SessionFactory` + optional `SqliteStore`).
@@ -90,14 +98,13 @@ The AI SDK is two halves and only one overlaps AC: its *server/provider* half (`
 - **Truncated-stream detection:** the loop treats a stream that ends without an explicit `Stop` as a clean `EndTurn`. Acceptable while the provider contract guarantees `Stop`; revisit if a provider can end early.
 - **Same-session concurrency across connections is detected, not prevented:** two ACP connections (e.g. two browser tabs) can `session/load` the same stored session; a concurrent writer surfaces as a seq-CAS conflict (`StoreError::SeqConflict` → prompt error telling the client to reload) rather than a silent history fork. Prevention needs process-wide shared session state (an `AcpOptions` seam) — do it when a real host needs it.
 - **`StopReason::Refusal` keeps the refused turn in history:** the ACP spec says a refused prompt "won't be included in the next prompt", but the kit currently persists and replays it. Honoring it needs a `Session::truncate` + store truncation; deferred until a provider actually emits Refusal in practice.
-- **Skill directories are body-only today:** a skill directory may carry assets/scripts alongside its SKILL.md, but `load_skill` returns only the SKILL.md body. Widening the loaded skill's directory into the path policy so tools can read those companion files is a host choice (compose it with `SplitPolicy`/`SwapPolicy`), not wired kit-side.
-- **Skill frontmatter is preserved, not enforced:** unknown keys (`allowed-tools`, `license`, …) survive parsing into `Frontmatter.fields`, but no kit layer acts on them yet — a host that wants `allowed-tools` semantics filters its registry itself.
+- **Skills mirror codex-rs, deliberately partially.** The architecture (text injection, mention selection, read-the-file-yourself progressive disclosure) is codex's; these codex subsystems were studied and *deliberately skipped* for now: the `agents/openai.yaml` sidecar (interface/dependencies/policy metadata), `[[skills.config]]` enable/disable rules, the catalog token-budget degradation ladder, implicit-invocation telemetry, plugin namespacing, and remote/orchestrator/environment skill sources. A host that contains reads (like `ac-cli`) grants its skills roots read access statically at build (`ReadGrants` + `SandboxPolicy::read_also`) — skill use never changes policy at runtime, matching codex's removal of skill-scoped permission widening (their #15812). `allowed-tools` is intentionally NOT a kit concept (codex has no such field).
 - **MCP surface is tools-only, snapshot-at-register:** resources/prompts/sampling/elicitation are not surfaced; `toolListChanged` notifications are ignored (a host refreshes by re-running `register_tools`); remote servers (streamable-HTTP transport + OAuth) are not wired — child-process stdio and in-process transports are. Copy codex `rmcp-client`'s OAuth/keyring patterns when remote lands.
 
 ## Reference reading
 
 - [zed](https://github.com/zed-industries/zed) — `crates/language_model_core` (the event enum to mirror), `crates/anthropic` (hand-rolled SSE shape), `crates/agent/src/thread.rs` `run_turn_internal` (concurrent-tools select! loop), `crates/sandbox` (best command-wrapper API design).
-- [codex](https://github.com/openai/codex) `codex-rs/` — `core/src/session/` + `core/src/tasks/` (Session/Turn/Task model), `core/src/tools/{registry,router}.rs`, `sandboxing/src/seatbelt.rs` (Apache-2.0 SBPL profile + seccomp set — **liftable** for `ac-sandbox`, see docs/ac-sandbox.md), `windows-sandbox-rs/` (bespoke restricted-token/firewall Windows sandbox — reference only, ~18k LOC, ships disabled), `app-server-protocol` (versioned JSON-RPC discipline), `rollout/` (JSONL persistence).
+- [codex](https://github.com/openai/codex) `codex-rs/` — `core/src/session/` + `core/src/tasks/` (Session/Turn/Task model), `core/src/tools/{registry,router}.rs`, `sandboxing/src/seatbelt.rs` (Apache-2.0 SBPL profile + seccomp set — **liftable** for `ac-sandbox`, see docs/ac-sandbox.md), `core-skills/` + `skills/` (the skill system `ac-skills` mirrors: catalog render, `$mention` syntax, `<skill>` injection format — studied in full 2026-07-21), `windows-sandbox-rs/` (bespoke restricted-token/firewall Windows sandbox — reference only, ~18k LOC, ships disabled), `app-server-protocol` (versioned JSON-RPC discipline), `rollout/` (JSONL persistence).
 - Vercel eve (TS, concepts only): per-tool declarative approval policies (`never/once/always/predicate`), lazy markdown skills, channels-as-adapters, MCP-as-one-connection-kind.
 
 ## Conventions

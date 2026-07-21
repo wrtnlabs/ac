@@ -18,7 +18,7 @@ struct Args {
     prompt: String,
     web_search: bool,
     skills: Option<PathBuf>,
-    require_skill: Option<String>,
+    skill: Option<String>,
     sandbox: bool,
     sandbox_network: bool,
 }
@@ -28,7 +28,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut dir: Option<PathBuf> = None;
     let mut web_search = false;
     let mut skills: Option<PathBuf> = None;
-    let mut require_skill: Option<String> = None;
+    let mut skill: Option<String> = None;
     // The binary sandboxes the shell tool by default (kernel FS containment +
     // resource caps), with network on so ordinary tooling works. `--no-sandbox`
     // opts out; `--sandbox-no-network` keeps the sandbox but cuts egress.
@@ -59,10 +59,10 @@ fn parse_args() -> anyhow::Result<Args> {
                     .ok_or_else(|| anyhow::anyhow!("--skills needs a value"))?;
                 skills = Some(PathBuf::from(v));
             }
-            "--require-skill" => {
-                require_skill = Some(
+            "--skill" => {
+                skill = Some(
                     it.next()
-                        .ok_or_else(|| anyhow::anyhow!("--require-skill needs a value"))?,
+                        .ok_or_else(|| anyhow::anyhow!("--skill needs a value"))?,
                 );
             }
             _ => rest.push(arg),
@@ -73,7 +73,7 @@ fn parse_args() -> anyhow::Result<Args> {
     if prompt.trim().is_empty() {
         anyhow::bail!(
             "usage: ac [--model <id>] [--dir <path>] [--web-search] [--skills <dir>] \
-             [--require-skill <name>] [--no-sandbox] [--sandbox-no-network] <prompt...>"
+             [--skill <name>] [--no-sandbox] [--sandbox-no-network] <prompt...>"
         );
     }
 
@@ -88,7 +88,7 @@ fn parse_args() -> anyhow::Result<Args> {
         prompt,
         web_search,
         skills,
-        require_skill,
+        skill,
         sandbox,
         sandbox_network,
     })
@@ -111,11 +111,14 @@ async fn main() -> anyhow::Result<()> {
     let options = HostOptions {
         web_search: args.web_search,
         skills_root: args.skills,
-        require_skill: args.require_skill,
+        skill: args.skill,
         sandbox: args.sandbox,
         sandbox_network: args.sandbox_network,
     };
     let host = build_host(provider, &args.dir, args.model, options)?;
+    // Skill mentions ($name) and the --skill selection inject SKILL.md bodies
+    // into the turn input, codex-style — before the session ever runs.
+    let input = ac_cli::compose_turn_input(&host, &args.prompt);
     let mut session = host.session;
 
     // Ctrl-C cancels the loop and any running shell via the shared token.
@@ -129,8 +132,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
 
-    let prompt = args.prompt;
-    let handle = tokio::spawn(async move { session.run_turn(prompt, tx).await });
+    let handle = tokio::spawn(async move { session.run_turn(input, tx).await });
 
     let mut usage: Option<TokenUsage> = None;
     while let Some(event) = rx.recv().await {

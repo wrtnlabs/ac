@@ -213,6 +213,93 @@ impl PathPolicy for SwapPolicy {
     }
 }
 
+/// A shared, grow-only set of read-root grants. A host creates one, installs
+/// it in a [`GrantedReadPolicy`], and grants the extra directories reads may
+/// resolve into — statically at build time (e.g. the generic host granting
+/// its skills roots) or from a host component that earns new read access
+/// mid-run. Each grant is canonicalized when added and resolved
+/// symlink-safely on use — a grant is a [`SubtreePolicy`] under the hood.
+/// Grants only ever widen READS; there is deliberately no write variant.
+#[derive(Default)]
+pub struct ReadGrants {
+    roots: RwLock<Vec<SubtreePolicy>>,
+}
+
+impl ReadGrants {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Grant read access under `dir`. The directory must exist (it is
+    /// canonicalized here — granting a path that may later appear would let a
+    /// symlink planted in the meantime redirect the grant).
+    pub fn grant(&self, dir: impl AsRef<Path>) -> std::io::Result<()> {
+        let policy = SubtreePolicy::new(dir)?;
+        let mut roots = self.roots.write().expect("read-grants lock poisoned");
+        if !roots.iter().any(|p| p.root == policy.root) {
+            roots.push(policy);
+        }
+        Ok(())
+    }
+
+    /// The canonicalized roots granted so far, in grant order.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.roots
+            .read()
+            .expect("read-grants lock poisoned")
+            .iter()
+            .map(|p| p.root.clone())
+            .collect()
+    }
+
+    fn resolve_read(&self, path: &Path) -> Option<PathBuf> {
+        let roots = self.roots.read().expect("read-grants lock poisoned");
+        roots.iter().find_map(|p| p.resolve_read(path).ok())
+    }
+}
+
+/// Combinator: reads that the inner policy denies fall back to a dynamic set
+/// of [`ReadGrants`]; writes always go to the inner policy alone — a grant can
+/// never widen write access. Relative paths keep resolving against the inner
+/// policy's root (granted directories are reached by absolute path), so a
+/// grant never changes what a relative name denotes. Symlink safety is
+/// preserved on both sides: the inner policy resolves as before, and each
+/// grant resolves through its own [`SubtreePolicy`].
+pub struct GrantedReadPolicy {
+    inner: Arc<dyn PathPolicy>,
+    grants: Arc<ReadGrants>,
+}
+
+impl GrantedReadPolicy {
+    pub fn new(inner: Arc<dyn PathPolicy>, grants: Arc<ReadGrants>) -> Self {
+        Self { inner, grants }
+    }
+}
+
+impl PathPolicy for GrantedReadPolicy {
+    fn root(&self) -> PathBuf {
+        self.inner.root()
+    }
+
+    fn resolve_read(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        match self.inner.resolve_read(path) {
+            Ok(resolved) => Ok(resolved),
+            Err(inner_err) => {
+                if path.is_absolute()
+                    && let Some(resolved) = self.grants.resolve_read(path)
+                {
+                    return Ok(resolved);
+                }
+                Err(inner_err)
+            }
+        }
+    }
+
+    fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        self.inner.resolve_write(path)
+    }
+}
+
 fn normalize_lexically(path: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -347,6 +434,66 @@ mod tests {
         ));
         swap.swap(inner);
         assert!(ctx.policy.resolve_write(Path::new("file.txt")).is_ok());
+    }
+
+    #[test]
+    fn granted_reads_widen_reads_only_and_only_after_the_grant() {
+        let (_dir, inner) = policy();
+        let inner_root = inner.root();
+        let grants = Arc::new(ReadGrants::new());
+        let granted = GrantedReadPolicy::new(Arc::new(inner), grants.clone());
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().canonicalize().unwrap();
+        std::fs::write(outside_root.join("companion.md"), "data").unwrap();
+        let companion = outside_root.join("companion.md");
+
+        // Before the grant: denied, with the inner policy's own error.
+        assert!(matches!(
+            granted.resolve_read(&companion),
+            Err(PolicyError::Outside(_))
+        ));
+
+        grants.grant(&outside_root).unwrap();
+        assert_eq!(grants.roots(), vec![outside_root.clone()]);
+
+        // After: the read resolves — but the same path as a WRITE stays denied.
+        assert_eq!(granted.resolve_read(&companion).unwrap(), companion);
+        assert!(matches!(
+            granted.resolve_write(&companion),
+            Err(PolicyError::Outside(_))
+        ));
+
+        // Relative paths still denote inner-root files, grant or no grant.
+        let relative = granted.resolve_read(Path::new("companion.md")).unwrap();
+        assert!(relative.starts_with(&inner_root));
+
+        // Granting the same root twice does not duplicate it.
+        grants.grant(&outside_root).unwrap();
+        assert_eq!(grants.roots().len(), 1);
+
+        // A grant target must exist at grant time.
+        assert!(grants.grant(outside_root.join("missing")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_a_granted_root_cannot_escape_it() {
+        let (_dir, inner) = policy();
+        let grants = Arc::new(ReadGrants::new());
+        let granted = GrantedReadPolicy::new(Arc::new(inner), grants.clone());
+
+        let grant_dir = tempfile::tempdir().unwrap();
+        let grant_root = grant_dir.path().canonicalize().unwrap();
+        let secret_dir = tempfile::tempdir().unwrap();
+        std::fs::write(secret_dir.path().join("secret"), "s").unwrap();
+        std::os::unix::fs::symlink(secret_dir.path(), grant_root.join("link")).unwrap();
+        grants.grant(&grant_root).unwrap();
+
+        assert!(matches!(
+            granted.resolve_read(&grant_root.join("link/secret")),
+            Err(PolicyError::Outside(_))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

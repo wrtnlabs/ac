@@ -95,7 +95,7 @@ pub struct Session {
     registry: Arc<ToolRegistry>,
     ctx: Arc<ToolCtx>,
     config: AgentConfig,
-    hook: Option<Arc<dyn StepHook>>,
+    hooks: Vec<Arc<dyn StepHook>>,
     messages: Vec<Message>,
 }
 
@@ -111,7 +111,7 @@ impl Session {
             registry,
             ctx,
             config,
-            hook: None,
+            hooks: Vec::new(),
             messages: Vec::new(),
         }
     }
@@ -131,8 +131,10 @@ impl Session {
         session
     }
 
-    pub fn set_hook(&mut self, hook: Arc<dyn StepHook>) {
-        self.hook = Some(hook);
+    /// Install a step hook. Hooks compose: each runs in registration order on
+    /// every model round-trip, each seeing the previous hooks' edits.
+    pub fn add_hook(&mut self, hook: Arc<dyn StepHook>) {
+        self.hooks.push(hook);
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -167,7 +169,7 @@ impl Session {
             req.tools = self.registry.specs();
             req.server_tools = self.config.server_tools.clone();
 
-            if let Some(hook) = &self.hook {
+            for hook in &self.hooks {
                 hook.prepare(iteration, &mut req);
             }
 

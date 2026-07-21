@@ -216,7 +216,7 @@ async fn step_hook() {
         ctx,
         AgentConfig::default(),
     );
-    session.set_hook(Arc::new(SwapHook));
+    session.add_hook(Arc::new(SwapHook));
 
     let (tx, _rx) = mpsc::unbounded_channel();
     session.run_turn("go".into(), tx).await.unwrap();
@@ -227,6 +227,40 @@ async fn step_hook() {
         reqs[0].tool_choice,
         ac_provider::ToolChoice::Force(ref n) if n == "echo"
     ));
+}
+
+/// Hooks compose in registration order, each seeing the previous edits.
+struct AppendHook(&'static str);
+impl StepHook for AppendHook {
+    fn prepare(&self, _iteration: usize, request: &mut ac_provider::CompletionRequest) {
+        let mut model = request.model.clone();
+        model.push_str(self.0);
+        request.model = model;
+    }
+}
+
+#[tokio::test]
+async fn hooks_compose_in_registration_order() {
+    let provider = MockProvider::new(vec![vec![text("hi"), stop_end()]]);
+    let (ctx, _dir) = make_ctx();
+    let mut session = Session::new(
+        Arc::new(provider.clone()),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        AgentConfig::default(),
+    );
+    session.add_hook(Arc::new(AppendHook("-first")));
+    session.add_hook(Arc::new(AppendHook("-second")));
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    session.run_turn("go".into(), tx).await.unwrap();
+
+    let reqs = provider.requests();
+    assert!(
+        reqs[0].model.ends_with("-first-second"),
+        "later hooks must see earlier hooks' edits: {}",
+        reqs[0].model
+    );
 }
 
 #[tokio::test]

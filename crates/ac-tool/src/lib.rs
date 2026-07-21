@@ -10,7 +10,10 @@ mod sandbox;
 mod tool;
 
 pub use ctx::{Extensions, FileTimes, PathLocks, ToolCtx, WriteCheck};
-pub use policy::{PathPolicy, PolicyError, ReadOnlyPolicy, SplitPolicy, SubtreePolicy, SwapPolicy};
+pub use policy::{
+    GrantedReadPolicy, PathPolicy, PolicyError, ReadGrants, ReadOnlyPolicy, SplitPolicy,
+    SubtreePolicy, SwapPolicy,
+};
 pub use registry::ToolRegistry;
 pub use sandbox::{
     CommandSpec, NetworkMode, Prepared, ResourceLimits, SandboxError, SandboxLauncher, SandboxMode,
