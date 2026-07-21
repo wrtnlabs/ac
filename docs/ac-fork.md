@@ -1,123 +1,150 @@
-# Design: fork / rewind — branching a session from an earlier point
+# RFC: The session log, forking, and rewind
 
-Status: **studied, design of record, not yet implemented** (2026-07-21). Grounded in a full read
-of openai/codex `codex-rs` at commit `1836ae0612` (Apache-2.0): `rollout/src/recorder.rs`,
-`core/src/thread_manager.rs`, `core/src/thread_rollout_truncation.rs`,
-`core/src/session/mod.rs` (fork persistence), `core/src/session/handlers.rs` (in-place
-rollback), `app-server/src/request_processors/thread_processor.rs` (`thread/fork`), and the TUI
-backtrack surface. File:line references are into that checkout. Depends on AC adopting an
-event-log session substrate (the codex "rollout"); this document specifies both together.
+**Status:** design of record — accepted, not yet implemented (2026-07-21).
+**Requires:** nothing. **Required by:** [ac-compaction.md](ac-compaction.md) (compaction is an
+event in this log); the fork boundary rule depends on a definition from
+[ac-queue-steer.md](ac-queue-steer.md).
 
-## The problem
+The key words MUST, MUST NOT, SHOULD, and MAY are to be interpreted as in RFC 2119.
 
-Hosts want transcript editing: go back to an earlier user message, change it, and continue from
-there — without destroying the original session. They also want cheap "try something on the
-side" branches. A row-of-messages store can *append*; it cannot express "this thread is that
-thread up to point X, then diverges" without a substrate designed for it. Codex's answer is an
-append-only event log per thread plus fork-by-copying-a-truncated-prefix, and it is the design
-to mirror.
+## 1. Motivation
 
-## What codex does
+Hosts want three capabilities that a mutable row-store of messages cannot express cleanly:
 
-### The rollout: one append-only JSONL event log per thread
+1. **Branching** — "go back to an earlier point in this session and try something different,
+   keeping both timelines."
+2. **Rewind** — "drop the last *k* exchanges from what the model sees," without destroying the
+   record that they happened.
+3. **Deterministic reconstruction** — resume, audit, or replay any session purely from its own
+   record.
 
-Every thread is a file of timestamped lines (`RolloutLine`), each a tagged `RolloutItem`:
-session meta, response items, compaction markers (with their replacement history), per-turn
-context, world-state baselines, and protocol events (protocol.rs:3209-3224). The first line is
-the session-meta head carrying identity and lineage: `id`, `forked_from_id`,
-`parent_thread_id`, and (in the newer paginated mode) `history_base` — an exclusive
-byte-offset/ordinal cutoff into a *parent* file (protocol.rs:3082-3139).
+All three are projections of one substrate decision: **the session record is an append-only
+event log, and every derived view — including "what the model currently sees" — is a pure
+function of that log.** Mutation is replaced by appending semantic markers; branching is
+replaced by prefix duplication under a new identity. This RFC specifies the log, the
+projection, and the two operations.
 
-Resume is replay: read the lines, tolerate individually-broken ones, rebuild in-memory history
-(applying compaction replacements and context baselines), seed token usage
-(recorder.rs:960-1023, session/mod.rs:1284+). Two rules make the substrate fork-safe:
+## 2. The log
 
-- **The file is never rewritten.** Even in-place rollback is an *appended marker*:
-  `ThreadRolledBack { num_turns }` goes on the end of the same file, and every scanner applies
-  it logically when computing positions (handlers.rs:446-548, thread_rollout_truncation.rs:36-38).
-- **First session-meta wins on load.** A fork's file *contains the source's meta line* mid-file
-  (copied with the prefix); the loader takes the first meta as canonical and treats later ones
-  as ordinary items (recorder.rs:986-1010). Lineage survives; identity is unambiguous.
+A session is recorded as a log
 
-### Fork = copy a truncated prefix into a new log
+> `L = ⟨m₀, e₁, e₂, …, eₙ⟩`
 
-`thread/fork` (thread_processor.rs:3961-4290) reads the source thread's raw items — the source
-is **only ever read, never mutated** — truncates the in-memory copy at a boundary, and spawns a
-new thread whose first persisted write is the new meta head (fresh UUIDv7 id,
-`forked_from_id = source`) plus the entire copied prefix **in one atomic append** so a cold
-resume can never observe a half-copied fork (session/mod.rs:1324-1359).
+where `m₀` is a **metadata head** and each `eᵢ` is a timestamped, type-tagged event: a
+conversation item, a turn-boundary event, a context marker, a compaction record, or a rewind
+marker. The head carries the session's **identity** `ι` (globally unique, time-ordered) and its
+**lineage** `λ` (the identity of the session it was forked from, if any).
 
-Truncation boundaries are *persisted canonical turn starts*, not free positions
-(thread_rollout_truncation.rs):
+Two axioms define the substrate:
 
-- `before_turn_id` (exclusive) and `last_turn_id` (inclusive-through) cut at recorded
-  turn-started boundaries; ids that were synthesized while projecting old logs are rejected
-  because they don't name a stable raw boundary; an in-progress turn cannot be `last_turn_id`.
-- `TruncateBeforeNthUserMessage(n)` cuts before the nth user message — with positions computed
-  against the *post-rollback* effective history, since rolled-back lines physically remain.
-- A fork of a thread that ends **mid-turn** is allowed but honest: the copied prefix gets a
-  synthesized interrupt boundary — the same "the user interrupted the previous turn on purpose"
-  history marker plus aborted-turn event a live interrupt would record
-  (thread_manager.rs:1951-1990) — so the fork's model sees a deliberate cut, not a silent one.
+- **A1 (append-only).** `L` grows only at its end. No event, once written, is modified or
+  removed — including by rewind and compaction, which are themselves events.
+- **A2 (self-sufficiency).** Every consumer — resume, fork, audit, projection — reads `L` and
+  nothing else. Auxiliary stores (a sessions index, titles, metadata caches) are derived data
+  and MUST be reconstructible from logs.
 
-Ephemeral forks skip the file entirely (pathless session, used for side-conversations), and
-subagent spawns are forks too — full history or last-N-turns — with both `parent_thread_id`
-and `forked_from_id` set (spawn.rs:700-735).
+Robustness requirements on the reader: replay MUST tolerate individually corrupt lines
+(skip and count, never abort the session), and when a log contains more than one metadata head
+— which fork produces by construction, §4 — **the first head is canonical** and later heads are
+inert data.
 
-### Compaction rides along
+## 3. The projection
 
-No special fork/compaction guard exists and none is needed: compaction markers are ordinary
-items in the prefix, replayed on load via their embedded replacement history; a compaction gets
-its own addressable turn boundary; forking *before* a compaction naturally yields the
-pre-compaction context. This only works because compaction is itself an event in the log — see
-[ac-compaction.md](ac-compaction.md).
+Define the **effective history** `E(L)`: the sequence of items the model would be given if a
+turn started now. `E` is a left fold over `L` in which ordinary items accumulate and marker
+events transform the accumulation:
 
-### The client surface
+- a **rewind marker** `ρ(k)` removes the last `k` turns from the accumulation;
+- a **compaction record** `κ(H′)` replaces the accumulation with its embedded replacement
+  history `H′` ([ac-compaction.md](ac-compaction.md));
+- all other events accumulate or annotate.
 
-The TUI's Esc-Esc backtrack is fork, never in-place truncation: pick an earlier user message →
-`thread/fork` with `before_turn_id` → new thread attached with the old prompt restored to the
-composer for editing; the original thread is untouched. Guardrails worth keeping verbatim: a
-*steered* (non-first) user message inside a turn cannot be branched independently — forking
-happens at turn boundaries only; an in-progress turn's prompt cannot be branched; selecting the
-very first turn starts a brand-new thread instead of forking. The in-place alternative
-(`thread/rollback`, the appended marker) refuses while a turn is running.
+> **I1 (determinism).** `E(L)` is a pure function of `L`. Two processes replaying the same log
+> reach identical effective histories; there is no session state outside the log.
 
-### The v2 substrate codex is moving toward
+> **I2 (record/view separation).** `ρ` and `κ` change `E(L)` without changing any prior event.
+> The record keeps everything; the view is computed. Consequently *all positional reasoning* —
+> "the third user message," "the boundary of turn `t`" — MUST be performed against `E(L)`,
+> never against raw positions in `L`, or rewound content resurfaces in the arithmetic.
 
-Paginated threads chain physical files by cutoff instead of copying: `history_base` points into
-the parent file at an ordinal/byte offset, and a lineage resolver walks the chain with cycle
-detection and bounds validation (thread-store rollout_lineage.rs:31-132). Copy-free forks are
-the destination; the copy path is the shipped v1. Codex's own `thread/fork` currently *rejects*
-paginated sources — evidence the copy design is the right first phase.
+**Rewind** is thereby fully specified: append `ρ(k)`. It MUST be refused while a turn is in
+progress (the projection would change under a running computation, violating step atomicity
+from [ac-queue-steer.md](ac-queue-steer.md) R1). It does not undo external effects — files
+written, commands run — and MUST NOT claim to; it edits the model's view, nothing else.
 
-## What AC adopts
+## 4. Fork
 
-Two pieces, in dependency order — both app-agnostic:
+### 4.1 Cut points
 
-1. **`ac-rollout`: the event-log substrate.** One append-only JSONL log per session of
-   timestamped, type-tagged items: session meta head (id, `forked_from_id`, timestamps),
-   messages/response items, compaction markers with replacement history, lifecycle events.
-   Load = replay with per-line fault tolerance and first-meta-wins. In-place rewind = an
-   appended rollback marker that all position math honors. This subsumes what `ac-store`'s
-   message table does for history (the SQLite side remains the *index* — sessions list, titles,
-   metadata — while the log becomes the source of truth for content; codex uses exactly this
-   split).
-2. **Fork as a kit operation** on that substrate: read source items → truncate at a canonical
-   turn boundary (`before`/`through`/`nth-user-message`) → new log with fresh id + lineage +
-   atomically-appended copied prefix; synthesize the interrupt boundary when the cut lands
-   mid-turn; never touch the source. Ephemeral (in-memory) forks fall out for free by skipping
-   persistence.
+Let `B(L)` be the set of **canonical cut points** of `L`: the recorded starts of completed
+turns, plus the end of the log. Forking is permitted **only at canonical cut points**:
 
-Rules inherited unchanged: forks only at turn boundaries (a steered message mid-turn is not a
-boundary — see [ac-queue-steer.md](ac-queue-steer.md)); no fork of an in-progress boundary;
-append-only always; lineage as data (`forked_from_id`) so hosts can render ancestry.
+- A user message that entered a turn by steering is *not* a cut point — it has no independent
+  turn boundary, and a history cut mid-turn would split a step (violating step atomicity).
+  Only a turn's initial input can head a branch.
+- A cut point inside an in-progress turn does not exist yet; forking "through" a running turn
+  is undefined and MUST be rejected.
+- Positions given positionally (e.g. "before the *n*-th user message") are resolved against
+  `E(L)` per I2.
 
-## Deferred
+### 4.2 The operation
 
-- Copy-free forking (cutoff chains into parent logs à la `history_base`) — v2, after the copy
-  path proves the API. The copy path's contract is deliberately compatible: a cutoff is just a
-  prefix that didn't need copying.
-- Zstd cold-compression of old logs and paginated loading — storage optimizations, not
-  semantics.
-- Cross-session dedup/GC of forked prefixes — explicitly a non-goal; disk is cheap, correctness
-  of an append-only log is not.
+For `c ∈ B(L)`:
+
+> `fork(L, c) = L′ = ⟨m₀′⟩ ⧺ L[1..c)`  with fresh identity `ι′` and lineage `λ′ = ι`.
+
+Properties, all REQUIRED:
+
+- **I3 (source immutability).** `fork` reads `L` and writes only `L′`. The source session is
+  never modified, locked, or annotated by being forked. Arbitrarily many forks of one source
+  may exist concurrently.
+- **I4 (atomic birth).** `L′`'s head and its entire copied prefix are persisted as one atomic
+  append. No observer — including a crash-recovery replay — can see a half-copied fork.
+- **I5 (identity).** `ι′` is fresh; the source's head, copied inside the prefix, is inert
+  under the first-head-canonical rule (§2). Lineage `λ′` makes ancestry a queryable DAG; a
+  fork of a fork chains lineage.
+- **I6 (honesty at ragged edges).** If `c` is the end of a log whose final turn never
+  completed, the copied prefix ends mid-turn. The fork MUST append the same
+  deliberate-interruption marker a live cancellation would produce
+  ([ac-queue-steer.md](ac-queue-steer.md) §5), so the branch's model sees an intentional cut,
+  not an unexplained truncation.
+
+A fork MAY be **ephemeral**: identical semantics with persistence elided — the natural
+substrate for side-explorations that are discarded unless promoted.
+
+### 4.3 What rides along
+
+Because compaction records are ordinary events (A1), a copied prefix containing `κ(H′)`
+replays exactly as the source did at that point: the branch inherits the compacted view. No
+special case exists — this is I1 doing its job. Forking from a cut *before* a compaction
+record yields the pre-compaction view, for free, by the same argument.
+
+## 5. The transcript-editing pattern
+
+The host capability this substrate exists to serve, stated once so the division of labor is
+explicit: *select an earlier user message → fork before its turn → restore that message into
+the composer of the branch for editing.* The original session is untouched (I3). Selections
+that violate §4.1 (a steered message; an in-progress turn) are refused with typed errors;
+selecting the very first turn degenerates to "start a new session" — a fork of an empty prefix
+is one, and implementations SHOULD say so rather than materialize a trivial branch.
+
+Everything above the arrow — selection UI, prompt restoration, presentation of lineage — is
+host territory. The runtime's surface is exactly `fork(L, c)`, `ρ(k)`, and the typed
+refusals.
+
+## 6. Deferred
+
+- **Copy-free forking.** `fork` by prefix *reference* — `L′` records `(ι, c)` instead of the
+  copied prefix — trades I4's simplicity for storage sharing, and requires a lineage resolver
+  with cycle detection and cut-bounds validation. The copy semantics above are deliberately a
+  strict subset: a reference is a prefix that didn't need copying, so the contract survives
+  the migration. Ship copies first.
+- **Cold-storage compression and paginated replay** — storage engineering; no semantic
+  content.
+- **Garbage collection of forked prefixes** — a non-goal. Disk is cheap; the correctness of an
+  append-only record is not.
+
+---
+*Provenance: this design distills the session-log and forking system of a production agent
+runtime (openai/codex, Apache-2.0), studied 2026-07-21. The distillation is behavioral — no
+code was carried over.*

@@ -1,107 +1,142 @@
-# Design: compaction — context summarization as a first-class turn lifecycle
+# RFC: Context compaction
 
-Status: **studied, design of record, not yet implemented** (2026-07-21). Grounded in a read of
-openai/codex `codex-rs` at commit `1836ae0612` (Apache-2.0): `core/src/compact.rs`,
-`core/src/compact_token_budget.rs`, `core/src/compact_remote*.rs`,
-`core/src/compact_model_fallback.rs`, `core/src/session/turn.rs` (triggers), and
-`prompts/templates/compact/`. Referenced by [ac-fork.md](ac-fork.md) (compaction markers in the
-event log) and [ac-queue-steer.md](ac-queue-steer.md) (post-compaction drain deferral). When AC
-implements compaction, this document is the contract.
+**Status:** design of record — accepted, not yet implemented (2026-07-21).
+**Requires:** [ac-fork.md](ac-fork.md) (compaction is an event in the session log).
+**Interacts with:** [ac-queue-steer.md](ac-queue-steer.md) §4 (post-compaction drain deferral).
 
-## The problem
+The key words MUST, MUST NOT, SHOULD, and MAY are to be interpreted as in RFC 2119.
 
-Long sessions exhaust the context window mid-task. Truncation loses the work; refusing loses
-the user. The naive fix — "summarize the transcript when it gets big" — underspecifies
-everything that matters: *when* it fires, *what survives verbatim*, *where* the summary sits in
-the rebuilt history, and *what downstream machinery observes*. Codex's compaction answers all
-four precisely, and the answers are the design worth mirroring.
+## 1. Motivation
 
-## What codex does
+Let `τ(H)` be the token measure of an effective history and `W` the model's context window.
+Within a session `τ` is monotonically increasing, `W` is constant; every sufficiently long task
+crosses `τ → W`. At that boundary the naive options are both losses: truncate (destroy the
+task's accumulated state) or refuse (destroy the task). Compaction is the third option — a
+transformation `C : H → H′` with `τ(H′) ≪ τ(H)` that *preserves the task* — but "summarize the
+transcript" underspecifies the four questions that decide whether the task actually survives:
 
-### Compaction is a handoff, not a shortening
+1. **When** does `C` fire? (Too late is a hard failure; too eager burns quality and cost.)
+2. **What survives verbatim** and what is summarized?
+3. **Where** does the summary sit in `H′`? (Position is meaning, to a model.)
+4. **What do observers see?** (Downstream machinery must not fork its behavior on how the
+   context was reduced.)
 
-The summarization prompt (prompts/templates/compact/prompt.md) opens: *"You are performing a
-CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the
-task"* — progress, decisions, constraints, next steps, critical data. And when the summary
-re-enters the fresh window it is prefixed (summary_prefix.md): *"Another language model started
-to solve this problem and produced a summary of its thinking process…"*. Framing compaction as
-an **agent-to-agent handoff** — the model is literally told the summary came from another LLM —
-is why the summaries carry decisions and next steps rather than prose recap. This framing is the
-single most load-bearing design choice in the system.
+This RFC fixes all four.
 
-### One lifecycle, four triggers
+## 2. The central design commitment: compaction is a handoff
 
-Every variant runs the same lifecycle: pre-compact hooks → strategy → post-compact hooks, a
-compaction item recorded into the turn stream, and a `Compacted` event carrying the summary
-message **and the full replacement history** so clients and the event log see exactly what the
-context became. Triggers:
+The transformation is framed — to the model performing it and to the model receiving it — as
+**one agent handing off a task to another**, not as text shortening. The summarizing model is
+instructed that it is producing a checkpoint *for another LLM that will resume the task*:
+current progress, decisions made, constraints and preferences in force, what remains, and the
+data needed to continue. The receiving model is told the summary is *the work of another model
+that began this problem*, to be built upon without repeating it.
 
-- **Manual** — the user asks.
-- **Pre-turn** — before sampling starts, the token budget is checked; exhausted → compact first
-  (turn.rs:800-830).
-- **Mid-turn** — after *every* sampling step, while the model still needs follow-up on a long
-  task: budget exhausted → compact and continue the same turn (turn.rs:342-379). This is the
-  "agent wraps up its long task with a checkpoint summary" behavior visible in clients.
-- **Model switch** — every model declares a *compaction compatibility hash*; when a session's
-  model changes and the hashes differ, codex compacts **through the previous model first**
-  (compact_model_fallback.rs) so the new model starts from a clean handoff instead of an
-  incompatible history. No other runtime does this.
+This framing is the load-bearing choice. A "shorten this" instruction yields prose recap —
+optimized for a human skimmer; a handoff instruction yields decisions, invariants, and next
+steps — optimized for resumption. Stated as the core requirement:
 
-### One lifecycle, three strategies
+> **R1 (handoff completeness).** `C` MUST be specified such that an agent given only `H′` can
+> continue the task an agent given `H` was performing: progress, decisions, constraints, and
+> next steps are preserved *as content*, not recoverable only by inference.
 
-- **Local summarization** — the model summarizes its own history under the handoff prompt.
-- **Remote** — a backend performs the summarization server-side (`compact_remote_v2`).
-- **Token-budget** — *no summarization at all*: install a fresh context window. Still modeled as
-  compaction so hooks, items, and analytics observe the identical lifecycle
-  (compact_token_budget.rs:20-24 states this explicitly).
+## 3. Structure of the transformation
 
-Strategy is invisible to everything downstream — that uniformity is the point.
+`C(H) = H′ = context′ ⧺ U ⧺ ⟨σ⟩` where:
 
-### Placement is trained-behavior-aware
+- `σ` is the **summary** produced under R1 (possibly empty — §4, strategies);
+- `U` is the sequence of **user messages of `H`, verbatim**, each independently capped at a
+  fixed token bound;
+- `context′` is the re-established once-per-window context (system-level material the host
+  injects per context window, not per turn).
 
-Mid-turn compaction injects re-established initial context *above* the last real user message so
-the **summary lands as the last item** — "the model is trained to see the compaction summary as
-the last item in history after mid-turn compaction" (compact.rs:56-64). Pre-turn/manual
-compaction instead clears and lets the next regular turn fully re-inject initial context —
-which is why once-per-context-window prompt material (e.g. a skills catalog) re-injects after
-compaction, not per turn.
+> **R2 (user-input fidelity).** What the *user* said is never summarized — paraphrase of
+> instructions is corruption of instructions. The per-message cap exists only so a single
+> pathological input cannot monopolize the fresh window; within it, survival is verbatim. What
+> the *agent* did (sampling, tool traffic, intermediate outputs) is exactly the material `σ`
+> compresses.
 
-### Selective survival
+> **R3 (effectiveness).** `τ(H′)` MUST fall below the trigger threshold by a margin sufficient
+> to preclude immediate re-triggering; a `C` that does not achieve this MUST surface as an
+> error rather than loop.
 
-Actual **user messages survive compaction verbatim** (each capped — 20k tokens — so one giant
-paste can't monopolize the fresh window); it is the *work* — tool calls, reasoning, outputs —
-that gets summarized away. The budget check itself has a cache-aware scope option
-(`BodyAfterPrefix`): measure against the window *excluding the cached prefix*, so a large stable
-prefix doesn't trigger needless compaction.
+**Placement.** When compaction interrupts a task in flight (mid-turn, §5), `σ` MUST be the
+*final* item of `H′`, with `context′` inserted above the last user message: the resuming model
+treats the most recent item as "where I am," and the checkpoint is exactly that. When
+compaction completes between turns, placement is unconstrained and the next turn re-injects
+`context′` in full.
 
-## What AC adopts
+**Record.** Per [ac-fork.md](ac-fork.md), `C` appends a compaction record `κ(H′)` to the
+session log carrying `σ` *and the complete replacement history* `H′`. The projection applies
+it; the pre-compaction events remain in the log (audit, fork-before-compaction); observers
+receive the record itself, so what the context became is never ambiguous.
 
-Compaction as a projection over the session log, not a mutation of it — which is why this
-design depends on [ac-fork.md](ac-fork.md)'s substrate:
+## 4. One lifecycle; triggers × strategies
 
-1. **A compaction item in the event log** carrying the summary and the replacement history. The
-   log keeps everything; the *effective* history after a compaction item is its replacement.
-   Fork, resume, and clients all read the same marker.
-2. **The trigger taxonomy** — manual / pre-turn / mid-turn / model-switch — with mid-turn as
-   the one that matters most (it is what lets a long task finish instead of dying at the window
-   edge). Model-switch compaction enters when AC models carry compatibility metadata; the seam
-   (compact-through-the-previous-provider) costs nothing to leave room for.
-3. **The strategy split** with the same uniformity rule: local summarization first;
-   fresh-window (no-summarize) as the degenerate strategy; remote is a host/provider concern
-   behind the same lifecycle.
-4. **The handoff framing** — AC ships the compaction prompt and summary prefix (adapted from
-   codex's, Apache-2.0) the way it ships the skills catalog text: model-facing text that *is*
-   the mechanism.
-5. **Placement + survival rules** as stated: mid-turn summary lands last; user messages survive
-   verbatim, capped; once-per-window host context re-injects after compaction (hosts hook this
-   — the seam already exists conceptually in how the system prompt is host-supplied).
-6. **Steer interaction**: after a mid-turn compaction, pending steered input defers exactly one
-   sampling request when the model owes a tool continuation ([ac-queue-steer.md](ac-queue-steer.md)).
+Compaction is one lifecycle — pre-hooks → transformation → record → post-hooks — parameterized
+on two orthogonal axes.
 
-## Deferred
+**Triggers** (predicates over session state):
 
-- Remote/server-side strategy — needs a backend; the lifecycle slot is reserved.
-- Compaction analytics taxonomy (trigger/phase/strategy/status) — adopt the *shape* when AC
-  grows a metrics seam; do not grow a telemetry dependency for it.
-- Auto-compaction of tool outputs mid-stream (independent of window pressure) — different
-  problem (output truncation already handles the worst of it); revisit with evidence.
+| Trigger | Predicate | Notes |
+| --- | --- | --- |
+| Manual | user request | always available |
+| Pre-turn | `τ(E(L)) ≥ β` before a turn's first step | clears the runway before new work |
+| Mid-turn | after step `sᵢ`: `follow_up(sᵢ) ∧ τ ≥ β` | the one that saves long tasks: checkpoint, then *continue the same turn* |
+| Model switch | successor model's context-compatibility differs from the predecessor's | compact **under the predecessor** before the successor's first step, so the new model starts from a handoff rather than a history shaped for another model |
+
+`β ≤ W` is the **budget**. Implementations SHOULD support a budget scope that excludes a
+stable cached prefix from `τ` — a large invariant prefix (cached at the provider) consumes no
+marginal cost and ought not trigger compaction.
+
+**Strategies** (how `σ` is produced):
+
+| Strategy | `σ` | Use |
+| --- | --- | --- |
+| Summarize | produced by the model under R1 | default |
+| Fresh window | `σ = ∅` — `H′` is `context′ ⧺ U` alone | degenerate case; a deliberate reset |
+| Delegated | produced by an external service under the same R1 contract | host/provider concern |
+
+> **R4 (uniformity).** Triggers and strategies MUST be observationally equivalent except
+> through the content of `σ` and the trigger recorded on `κ`. Hooks fire identically; the
+> record has one shape; no consumer branches on "which kind" of compaction occurred. This is
+> what keeps every downstream system — forking, resumption, analytics, clients — one code
+> path.
+
+## 5. Interaction with mid-turn input
+
+After a **mid-turn** compaction, if the model still owes a tool continuation, pending steered
+input defers for exactly one step ([ac-queue-steer.md](ac-queue-steer.md) §4): the model MUST
+re-establish its interrupted work against `H′` before new user intent lands, or the steer is
+interpreted against a context the model has not yet re-entered. This is the single coupling
+between the two designs, and it lives in the run loop's drain discipline, not in `C`.
+
+Compaction turns are **non-steerable** ([ac-queue-steer.md](ac-queue-steer.md) §3): user
+intent cannot coherently join a history transformation in progress.
+
+## 6. Invariants
+
+- **I1.** The log retains the full pre-compaction record; `C` changes only the projection.
+  (Follows from [ac-fork.md](ac-fork.md) A1 + I2.)
+- **I2.** A fork whose prefix contains `κ(H′)` reproduces the compacted view; a fork cut
+  before it reproduces the pre-compaction view. No special-casing exists or is permitted.
+- **I3.** User messages in `E(L)` after compaction are byte-identical to their originals, up
+  to the per-message cap (R2).
+- **I4.** In mid-turn compaction, `σ` is the terminal item of the replacement (placement
+  rule); the turn then continues — compaction MUST NOT end a turn that owed follow-up.
+- **I5.** `C` composes: `C(C(H))` is well-defined and each application appends its own record.
+  Repeated compaction of a very long task is the designed steady state, bounded by R3.
+
+## 7. Deferred
+
+- The delegated strategy's transport — a service contract, reserved lifecycle slot, no design
+  needed yet.
+- A metrics taxonomy (trigger/phase/strategy/outcome) — adopt the shape when a metrics seam
+  exists; a telemetry dependency is not justified by it.
+- Mid-stream reduction of individual oversized tool outputs — a different problem (bounded
+  capture at the tool layer already addresses its worst case); revisit with evidence.
+
+---
+*Provenance: this design distills the compaction system of a production agent runtime
+(openai/codex, Apache-2.0), studied 2026-07-21, including its handoff framing, which this
+document restates as R1. The distillation is behavioral — no code was carried over.*
