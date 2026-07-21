@@ -1,9 +1,9 @@
 # RFC: The session log, forking, and rewind
 
 **Status:** design of record — accepted, not yet implemented (2026-07-21).
-**Requires:** nothing. **Required by:** [ac-compaction.md](ac-compaction.md) (compaction is an
-event in this log); the fork boundary rule depends on a definition from
-[ac-queue-steer.md](ac-queue-steer.md).
+**Requires:** [ac-queue-steer.md](ac-queue-steer.md) (step atomicity, the interruption marker).
+**Required by:** [ac-compaction.md](ac-compaction.md) (compaction is an event in this log),
+[ac-context.md](ac-context.md), [ac-hooks.md](ac-hooks.md), [ac-serving.md](ac-serving.md).
 
 The key words MUST, MUST NOT, SHOULD, and MAY are to be interpreted as in RFC 2119.
 

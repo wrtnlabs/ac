@@ -2,13 +2,14 @@
 
 **Status:** design of record — accepted, not yet implemented (2026-07-21).
 **Requires:** [ac-fork.md](ac-fork.md) (compaction is an event in the session log).
+**Required by:** [ac-context.md](ac-context.md), [ac-hooks.md](ac-hooks.md).
 **Interacts with:** [ac-queue-steer.md](ac-queue-steer.md) §4 (post-compaction drain deferral).
 
 The key words MUST, MUST NOT, SHOULD, and MAY are to be interpreted as in RFC 2119.
 
 ## 1. Motivation
 
-Let `τ(H)` be the token measure of an effective history and `W` the model's context window.
+Let `H = E(L)` be the effective history of [ac-fork.md](ac-fork.md) §3, and `τ(H)` its token measure and `W` the model's context window.
 Within a session `τ` is monotonically increasing, `W` is constant; every sufficiently long task
 crosses `τ → W`. At that boundary the naive options are both losses: truncate (destroy the
 task's accumulated state) or refuse (destroy the task). Compaction is the third option — a
@@ -51,7 +52,8 @@ steps — optimized for resumption. Stated as the core requirement:
   injects per context window, not per turn).
 
 > **R2 (user-input fidelity).** What the *user* said is never summarized — paraphrase of
-> instructions is corruption of instructions. The per-message cap exists only so a single
+> instructions is corruption of instructions. (Injected fragments are excluded from `U` despite
+> their user role — the recognition predicate of [ac-context.md](ac-context.md) identifies them.) The per-message cap exists only so a single
 > pathological input cannot monopolize the fresh window; within it, survival is verbatim. What
 > the *agent* did (sampling, tool traffic, intermediate outputs) is exactly the material `σ`
 > compresses.

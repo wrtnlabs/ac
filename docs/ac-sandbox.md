@@ -1,6 +1,6 @@
 # RFC: `ac-sandbox` — an OS-level sandbox for the `shell` tool
 
-Status: **v1 implemented + verified** (2026-07-21). The seam, both backends, resource caps, and
+**Status:** implemented — specification of record (v1 verified 2026-07-21). The seam, both backends, resource caps, and
 the fail-closed envelope are built and wired into the CLI host. macOS is live-verified end-to-end
 (8 `ac-sandbox` smoke tests spawn real `sandbox-exec` and prove write-escape denial, secret-read
 denial, the network on/off gate, and `RLIMIT_FSIZE` enforcement; a shipped-path e2e test drives
@@ -61,7 +61,7 @@ on/off now is honest; shipping a string allowlist now would be pretend. The allo
 clean, self-contained v2.
 
 Native Windows gets `off` + a loud banner, and we document "run under WSL2 for the Linux path" —
-matching what `sandbox-runtime` and the current Canvas host already do. This is the only honest
+matching what `sandbox-runtime`-based hosts already do. This is the only honest
 bounded answer; codex's restricted-token/firewall build is real but enormous and ships off by
 default.
 

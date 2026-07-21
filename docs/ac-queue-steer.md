@@ -1,7 +1,7 @@
 # RFC: Mid-turn input — steering
 
 **Status:** design of record — accepted, not yet implemented (2026-07-21).
-**Requires:** nothing (touches only the run loop). **Required by:** [ac-fork.md](ac-fork.md) §4 (boundary definition), [ac-compaction.md](ac-compaction.md) §5 (drain deferral).
+**Requires:** [ac-loop.md](ac-loop.md) (the step model this design extends). **Required by:** [ac-fork.md](ac-fork.md) §4 (boundary definition), [ac-compaction.md](ac-compaction.md) §5 (drain deferral).
 
 The key words MUST, MUST NOT, SHOULD, and MAY are to be interpreted as in RFC 2119.
 
@@ -48,8 +48,8 @@ Each active turn carries:
 
 Two per-step predicates govern continuation:
 
-- `follow_up(sᵢ)` — true iff the model's response in `sᵢ` requires another step (it issued tool
-  calls, or explicitly declined to end its turn);
+- `follow_up(sᵢ)` — the loop specification's continuation predicate ([ac-loop.md](ac-loop.md)):
+  true iff the model's response in `sᵢ` owes another step;
 - the turn's continuation condition after `sᵢ`:  **continue iff `follow_up(sᵢ) ∨ Q ≠ ∅`.**
 
 ## 3. Operations

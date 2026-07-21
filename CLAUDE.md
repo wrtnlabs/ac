@@ -4,6 +4,8 @@ AC is an **app-agnostic AI agent runtime**: providers, the agent loop, hard buil
 
 Crates are `ac-*`. The workspace is source-public but not published to crates.io (`publish = false`).
 
+**The specification set lives in [docs/](docs/) — [docs/architecture.md](docs/architecture.md) is the index and reading order.** Every subsystem has an RFC-style spec (implemented systems: specification of record; unbuilt systems: design of record; doctrine: in force). When code and spec disagree, that is a defect in one of them — fix deliberately, never silently.
+
 ## The one rule that keeps this honest
 
 **No `ac-*` crate may ever name a consumer concept.** No host-application domain semantics, no host-specific tools. Apps reach in through the five seams below; the dependency arrow never points outward. If a change needs the kit to know about a host, the change is wrong — extend a seam instead. A second toy host (the `ac-cli` generic agent) must stay alive forever as the proof.
