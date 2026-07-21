@@ -1,14 +1,21 @@
 # RFC: `ac-sandbox` — an OS-level sandbox for the `shell` tool
 
-Status: **v1 implemented** (2026-07-21). The seam, both backends, resource caps, and the
-fail-closed envelope are built and wired into the CLI host. macOS is live-verified end-to-end:
-the `ac-sandbox` Seatbelt smoke tests spawn real `sandbox-exec` commands and prove write-escape
-denial, secret-read denial, the network on/off gate, and `RLIMIT_FSIZE` enforcement. The Linux
-backend (landlock + seccomp + rlimit) is compile-verified against the real `landlock 0.4` /
-`seccompiler 0.5` / `libc` APIs (cross-target `cargo check` + clippy) and carries a smoke-test
-suite that asserts containment on a native-Linux runner (CI); its runtime pass is gated on that
-runner rather than macOS. The v2 egress-allowlist phase remains unbuilt. This document is the
-design of record; `docs/ac-sandbox.md` in a diff means the contract changed.
+Status: **v1 implemented + verified** (2026-07-21). The seam, both backends, resource caps, and
+the fail-closed envelope are built and wired into the CLI host. macOS is live-verified end-to-end
+(8 `ac-sandbox` smoke tests spawn real `sandbox-exec` and prove write-escape denial, secret-read
+denial, the network on/off gate, and `RLIMIT_FSIZE` enforcement; a shipped-path e2e test drives
+`build_host → shell → sandbox-exec`). Linux is verified in a real container (kernel 6.12): seccomp
+(network-off) and both `setrlimit` caps genuinely enforce at the kernel level; the landlock FS
+layer is compile/API-verified and honestly gated by a real-enforcement probe.
+
+That container run earned its keep: it caught a **fail-open** — on a kernel where Landlock is
+compiled but not in the active LSM list, `landlock_create_ruleset` succeeds and `restrict_self`
+returns `Ok` while enforcing *nothing*, so a create-success probe reported `Strict` while writes
+escaped. Fixed: the backend now probes *actual* enforcement (apply a read-only ruleset on a
+scratch thread, attempt a forbidden write) and reports `Degraded`/refuses rather than a false
+`Strict`. This is the exact "never pretend to sandbox" rule catching itself. The v2
+egress-allowlist phase remains unbuilt. This document is the design of record; `docs/ac-sandbox.md`
+in a diff means the contract changed.
 
 `ac-sandbox` closes the gap the `shell` tool documents in its own module header: today a
 command spawned by `shell` is contained only by its working directory — the child process can
