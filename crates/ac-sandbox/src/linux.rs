@@ -54,13 +54,17 @@ const DEV_WRITE_NODES: &[&str] = &[
 ];
 
 pub fn prepare(policy: &SandboxPolicy, spec: &CommandSpec) -> Result<Prepared, SandboxError> {
-    // Decide the achievable mode up front from a parent-side landlock probe, so
-    // the envelope is honest and fail-closed policies refuse before spawning.
-    let landlock_supported = landlock_available();
+    // Decide the achievable mode up front from a parent-side probe that checks
+    // ACTUAL enforcement, not mere syscall availability — on a kernel where
+    // Landlock is compiled but not in the active LSM list, `landlock_create_
+    // ruleset` succeeds yet `restrict_self` enforces nothing. Reporting Strict
+    // there would be the fail-open the whole design forbids.
+    let landlock_supported = landlock_enforces();
     if !landlock_supported && policy.fail_closed {
         return Err(SandboxError::NotEnforceable(
-            "landlock is not available on this kernel and the policy is \
-             fail-closed; enable Landlock LSM or allow degraded mode"
+            "landlock does not enforce on this kernel (LSM inactive or absent) \
+             and the policy is fail-closed; enable the Landlock LSM or allow \
+             degraded mode"
                 .to_string(),
         ));
     }
@@ -137,15 +141,56 @@ fn write_grant_paths(policy: &SandboxPolicy) -> Vec<PathBuf> {
     paths
 }
 
-/// Whether the kernel supports landlock, probed by creating a throwaway ruleset
-/// in the parent. Best-effort: a create failure means no Landlock LSM.
-fn landlock_available() -> bool {
-    let abi = ABI::V1;
-    Ruleset::default()
-        .set_compatibility(CompatLevel::BestEffort)
-        .handle_access(AccessFs::from_all(abi))
-        .and_then(|r| r.create())
-        .is_ok()
+/// Whether Landlock *actually enforces* on this kernel — not merely whether the
+/// syscalls exist. Probed once per process (cached) by applying a real ruleset
+/// on a throwaway thread and confirming it denies a forbidden action. This is
+/// the honest detector: a "present but inactive LSM" (Landlock compiled in but
+/// not on the boot `lsm=` list, e.g. Docker Desktop's LinuxKit) accepts the
+/// syscalls but enforces nothing, and only an actual violation attempt reveals
+/// it.
+fn landlock_enforces() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(probe_landlock)
+}
+
+fn probe_landlock() -> bool {
+    // `restrict_self` binds the *calling thread* (and its future children), so
+    // run the probe on a scratch thread — the main thread and the real command
+    // children stay unrestricted.
+    std::thread::spawn(|| {
+        let abi = ABI::V1;
+        // Handle all FS access but grant only READ on "/": no write anywhere.
+        let ruleset = match Ruleset::default()
+            .set_compatibility(CompatLevel::BestEffort)
+            .handle_access(AccessFs::from_all(abi))
+            .and_then(|r| r.create())
+        {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        let ruleset = match PathFd::new("/") {
+            Ok(fd) => match ruleset.add_rule(PathBeneath::new(fd, AccessFs::from_read(abi))) {
+                Ok(r) => r,
+                Err(_) => return false,
+            },
+            Err(_) => return false,
+        };
+        if ruleset.restrict_self().is_err() {
+            return false;
+        }
+        // Creating a file requires a write grant we did not give. If it
+        // succeeds, Landlock is not actually enforcing.
+        let probe = std::env::temp_dir().join(format!("ac-ll-probe-{}", std::process::id()));
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    })
+    .join()
+    .unwrap_or(false)
 }
 
 fn enforce_landlock(read_paths: &[PathBuf], write_paths: &[PathBuf]) -> Result<(), String> {

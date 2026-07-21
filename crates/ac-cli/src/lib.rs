@@ -29,6 +29,11 @@ fn build_sandbox_policy(workspace: &Path, network: bool) -> SandboxPolicy {
     } else {
         NetworkMode::Off
     };
+    // A CLI degrades rather than refusing all shell on a kernel that can't fully
+    // enforce (e.g. Linux without an active Landlock LSM): seccomp + rlimits
+    // still apply, and the shell result's `sandbox.mode` surfaces `degraded`.
+    // macOS always enforces (Seatbelt), so this never downgrades there.
+    policy.fail_closed = false;
     policy
 }
 

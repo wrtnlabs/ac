@@ -50,11 +50,19 @@ fn workspace() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
 }
 
+/// A workspace policy that degrades (rather than refusing) where the kernel
+/// can't fully enforce, so these tests run on kernels without an active
+/// Landlock LSM — the FS-containment asserts then gate on `mode == Strict`,
+/// while seccomp (network) and rlimit assertions hold unconditionally.
+fn policy(root: &Path) -> SandboxPolicy {
+    SandboxPolicy::workspace(root).allow_degraded()
+}
+
 #[tokio::test]
 async fn a_plain_command_runs() {
     let ws = workspace();
     let root = ws.path().canonicalize().unwrap();
-    let r = run(SandboxPolicy::workspace(&root), &root, "echo hello-sandbox").await;
+    let r = run(policy(&root), &root, "echo hello-sandbox").await;
     assert_eq!(r.exit, Some(0), "stderr: {}", r.stderr);
     assert_eq!(r.stdout.trim(), "hello-sandbox");
     eprintln!("mode = {:?}", r.mode);
@@ -65,7 +73,7 @@ async fn a_write_inside_the_workspace_succeeds() {
     let ws = workspace();
     let root = ws.path().canonicalize().unwrap();
     let r = run(
-        SandboxPolicy::workspace(&root),
+        policy(&root),
         &root,
         "echo contained > out.txt && cat out.txt",
     )
@@ -83,7 +91,7 @@ async fn a_write_outside_the_workspace_is_denied_when_strict() {
     let target = outside_root.join("evil.txt");
 
     let r = run(
-        SandboxPolicy::workspace(&root),
+        policy(&root),
         &root,
         &format!("echo pwned > {}", target.display()),
     )
@@ -116,7 +124,7 @@ async fn reading_outside_the_grant_is_denied_when_strict() {
     std::fs::write(outside_root.join("secret"), "TOP-SECRET-VALUE").unwrap();
 
     let r = run(
-        SandboxPolicy::workspace(&root),
+        policy(&root),
         &root,
         &format!("cat {}", outside_root.join("secret").display()),
     )
@@ -163,7 +171,7 @@ async fn network_off_blocks_socket_and_on_allows_it() {
     let url = format!("http://127.0.0.1:{port}/");
     let cmd = format!("curl -s -m 4 {url}");
 
-    let off = run(SandboxPolicy::workspace(&root), &root, &cmd).await;
+    let off = run(policy(&root), &root, &cmd).await;
     assert_ne!(off.exit, Some(0), "network-off must block the connect");
     assert!(
         !off.stdout.contains("hi"),
@@ -171,12 +179,7 @@ async fn network_off_blocks_socket_and_on_allows_it() {
         off.stdout
     );
 
-    let on = run(
-        SandboxPolicy::workspace(&root).with_network(NetworkMode::On),
-        &root,
-        &cmd,
-    )
-    .await;
+    let on = run(policy(&root).with_network(NetworkMode::On), &root, &cmd).await;
     assert_eq!(
         on.exit,
         Some(0),
@@ -192,7 +195,7 @@ async fn network_off_blocks_socket_and_on_allows_it() {
 async fn a_file_size_rlimit_is_kernel_enforced() {
     let ws = workspace();
     let root = ws.path().canonicalize().unwrap();
-    let mut policy = SandboxPolicy::workspace(&root);
+    let mut policy = policy(&root);
     policy.limits = ResourceLimits {
         max_file_size: Some(2048),
         ..Default::default()
@@ -224,12 +227,18 @@ async fn a_file_size_rlimit_is_kernel_enforced() {
 async fn a_process_rlimit_is_applied_to_the_child() {
     let ws = workspace();
     let root = ws.path().canonicalize().unwrap();
-    let mut policy = SandboxPolicy::workspace(&root);
+    let mut policy = policy(&root);
     policy.limits = ResourceLimits {
         max_processes: Some(4096),
         ..Default::default()
     };
-    let r = run(policy, &root, "ulimit -u").await;
+    // Read the child's real RLIMIT_NPROC from /proc (dash's `ulimit` has no
+    // `-u`), proving setrlimit was applied in pre_exec.
+    let r = run(policy, &root, "grep '^Max processes' /proc/self/limits").await;
     assert_eq!(r.exit, Some(0), "stderr: {}", r.stderr);
-    assert_eq!(r.stdout.trim(), "4096");
+    assert!(
+        r.stdout.contains("4096"),
+        "the child must see the RLIMIT_NPROC we set; got {:?}",
+        r.stdout
+    );
 }
