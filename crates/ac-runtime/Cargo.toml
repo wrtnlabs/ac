@@ -21,7 +21,10 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 ac-provider-mock = { workspace = true }
+ac-tools = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 schemars = { workspace = true }

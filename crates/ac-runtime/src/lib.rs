@@ -10,6 +10,7 @@
 mod compaction;
 mod fragments;
 mod hooks;
+mod spawn;
 mod steer;
 
 use std::sync::Arc;
@@ -30,6 +31,7 @@ pub use compaction::{
     CompactionConfig, CompactionError, CompactionOutcome, CompactionStrategy, CompactionTrigger,
 };
 pub use hooks::{ForcedChainHook, HookRegistry, Observation, ObservationHook, StepPrepareHook};
+pub use spawn::ReferenceSpawner;
 pub use steer::{SteerError, SteerHandle, SteerInput, TurnClass};
 
 use steer::SteerState;

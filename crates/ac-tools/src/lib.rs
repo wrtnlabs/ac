@@ -22,6 +22,7 @@ mod fetch;
 mod files;
 mod search;
 mod shell;
+mod task;
 
 pub use fetch::{Fetch, FetchInput};
 pub use files::{
@@ -30,13 +31,16 @@ pub use files::{
 };
 pub use search::{Glob, GlobInput, Grep, GrepInput};
 pub use shell::{Shell, ShellInput};
+pub use task::{Task, TaskInput};
 
 use ac_tool::ToolRegistry;
 
 /// Register all eight built-in tools into `registry`.
 ///
 /// Hosts that want a narrower surface can skip this and register individual
-/// tools (each is a `pub` struct) instead.
+/// tools (each is a `pub` struct) instead. [`Task`] is deliberately **not** here:
+/// delegation is opt-in — a host registers it only on a parent run and leaves it
+/// out of a child's surface ([docs/ac-subagents.md] §4, the recursion guard).
 pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(ReadFile);
     registry.register(WriteFile);

@@ -3,12 +3,17 @@
 //! the [`PathPolicy`] seam (hosts decide *where* tools may act), typed
 //! [`Extensions`], and per-run read-before-write [`FileTimes`].
 
+mod agent;
 mod ctx;
 mod policy;
 mod registry;
 mod sandbox;
 mod tool;
 
+pub use agent::{
+    AgentDefinition, AgentSpawner, RefusingSpawner, SpawnRequest, SpawnResult, SpawnStatus,
+    ToolScope, as_dyn,
+};
 pub use ctx::{Extensions, FileTimes, PathLocks, ToolCtx, WriteCheck};
 pub use policy::{
     GrantedReadPolicy, PathPolicy, PolicyError, ReadGrants, ReadOnlyPolicy, SplitPolicy,

@@ -152,6 +152,7 @@ dependencies = [
  "ac-provider-mock",
  "ac-rollout",
  "ac-tool",
+ "ac-tools",
  "ac-types",
  "async-stream",
  "futures",

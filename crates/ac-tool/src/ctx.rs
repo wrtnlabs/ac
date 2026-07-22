@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::AgentSpawner;
 use crate::policy::PathPolicy;
 use crate::sandbox::SandboxLauncher;
 
@@ -17,6 +18,11 @@ pub struct ToolCtx {
     /// unsandboxed (and say so) or refuse. Install one with
     /// [`with_sandbox`](ToolCtx::with_sandbox).
     pub sandbox: Option<Arc<dyn SandboxLauncher>>,
+    /// The sub-agent seam ([docs/ac-subagents.md]). `None` means delegation is
+    /// unavailable here — a `task`-style tool must refuse as data. A CHILD ctx
+    /// has this `None` by construction: that absence IS the recursion guard.
+    /// Install one with [`with_spawner`](ToolCtx::with_spawner).
+    pub spawner: Option<Arc<dyn AgentSpawner>>,
     pub extensions: Extensions,
     pub file_times: FileTimes,
     pub locks: PathLocks,
@@ -28,6 +34,7 @@ impl ToolCtx {
         Self {
             policy,
             sandbox: None,
+            spawner: None,
             extensions: Extensions::default(),
             file_times: FileTimes::default(),
             locks: PathLocks::default(),
@@ -39,6 +46,21 @@ impl ToolCtx {
     /// behind an `Arc`).
     pub fn with_sandbox(mut self, sandbox: Arc<dyn SandboxLauncher>) -> Self {
         self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// Install a sub-agent spawner (builder-style). A child context is built
+    /// *without* this call — the omission is the structural recursion guard.
+    pub fn with_spawner(mut self, spawner: Arc<dyn AgentSpawner>) -> Self {
+        self.spawner = Some(spawner);
+        self
+    }
+
+    /// Use `cancel` as this context's cancellation token (builder-style). A
+    /// child context is built with a token *derived from* the parent's
+    /// (`parent.cancel.child_token()`) so cancel flows down but never up.
+    pub fn with_cancel(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
         self
     }
 }
