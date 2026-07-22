@@ -175,6 +175,6 @@ message chunks) demonstrate:
 - **Structured tool outputs.** Output is a string plus `is_error`; richer payloads await evidence.
 - **Sequence numbers and resumable cursors on the event itself** — host territory (ring
   buffers, replay windows) until a second host proves a shared need.
-- **Nested streams for sub-agents** — out of scope until multi-agent sessions exist.
+- **Nested streams for sub-agents** — [ac-subagents.md](ac-subagents.md) keeps this host territory: a child run has its own host-supplied sink and log, the parent's stream carries only the `task` tool call and its result, and the kit adds no event variant. A child-spawned marker MAY be promoted later on evidence.
 - **Durable citations and usage** — promotion into history is a store question, not a stream
   question.

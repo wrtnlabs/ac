@@ -105,7 +105,10 @@ Properties, all REQUIRED:
   append. No observer — including a crash-recovery replay — can see a half-copied fork.
 - **I5 (identity).** `ι′` is fresh; the source's head, copied inside the prefix, is inert
   under the first-head-canonical rule (§2). Lineage `λ′` makes ancestry a queryable DAG; a
-  fork of a fork chains lineage.
+  fork of a fork chains lineage. `λ` is **peer-branch** lineage only — a fork is a sibling
+  timeline the user may keep — and is explicitly **not** the sub-agent mechanism: a delegated
+  child is a fresh root (`λ = ∅`) owned by its spawner, its parentage held in host metadata,
+  never in `λ` ([ac-subagents.md](ac-subagents.md) §3).
 - **I6 (honesty at ragged edges).** If `c` is the end of a log whose final turn never
   completed, the copied prefix ends mid-turn. The fork MUST append the same
   deliberate-interruption marker a live cancellation would produce

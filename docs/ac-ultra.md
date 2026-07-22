@@ -54,7 +54,7 @@ before committing.
 | Effort as a request parameter | the completion-request contract ([ac-provider.md](ac-provider.md)) — an agnostic tier the wire crate maps to a provider's tiers or its thinking-token budget |
 | Effort as a per-step setting | the step-prepare phase ([ac-hooks.md](ac-hooks.md)), alongside model swap and forced choice |
 | "A mode is a standing injected instruction" | already the reactive-injection cadence of [ac-context.md](ac-context.md) — no new mechanism |
-| The sub-agent seam itself (spawn / wait / delegate) | a distinct subsystem with no spec yet; earns its own document if and when AC commits to building it — not before, per the "specs are contracts, not speculation" rule |
+| The sub-agent seam itself (spawn / delegate) | specified in [ac-subagents.md](ac-subagents.md) — an injected spawn capability, the child a fresh session; the "wait" is synchronous (the `task` tool returns the child's result). "Ultra" is a standing delegation-mode injection *over* that seam, not part of it |
 
 The takeaway for AC: adopting "effort" is a **request-parameter** change (two small edits). Adopting
 "ultra" is an **orchestration** change (a subsystem decision) — and the two must not be bundled, or
