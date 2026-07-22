@@ -1,6 +1,8 @@
 //! The agent loop: a `Session` that drives a `Provider` and a `ToolRegistry`
 //! until the model stops asking for tools, emitting a typed `AgentEvent` stream.
 
+mod steer;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +13,31 @@ use ac_types::{
 };
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
+
+pub use steer::{SteerError, SteerHandle, SteerInput, TurnClass};
+
+use steer::SteerState;
+
+/// Recorded into history when a turn is cancelled on purpose, so the next
+/// turn's model reads the interruption as deliberate — not an anomaly to
+/// re-attempt — and knows partial effects may have landed
+/// ([docs/ac-queue-steer.md] §5, [docs/ac-fork.md] I6).
+pub const INTERRUPTION_MARKER: &str = "The previous turn was interrupted on purpose. Any commands or tools it had started may \
+     have partially executed; do not assume its work completed.";
+
+/// Deactivates the active turn when the turn's scope ends, on every exit path
+/// including a panic unwind — so a stale active turn never outlives its
+/// `run_turn`.
+struct ActiveTurnGuard {
+    state: Arc<SteerState>,
+    id: String,
+}
+
+impl Drop for ActiveTurnGuard {
+    fn drop(&mut self) {
+        self.state.deactivate(&self.id);
+    }
+}
 
 /// Static configuration for a `Session`.
 pub struct AgentConfig {
@@ -97,6 +124,7 @@ pub struct Session {
     config: AgentConfig,
     hooks: Vec<Arc<dyn StepHook>>,
     messages: Vec<Message>,
+    steer: Arc<SteerState>,
 }
 
 impl Session {
@@ -113,6 +141,7 @@ impl Session {
             config,
             hooks: Vec::new(),
             messages: Vec::new(),
+            steer: Arc::new(SteerState::new()),
         }
     }
 
@@ -141,25 +170,85 @@ impl Session {
         &self.messages
     }
 
+    /// A handle for submitting mid-turn input to whatever turn is running on
+    /// this session. Obtain it before starting the turn; use it from another
+    /// task while `run_turn` executes ([docs/ac-queue-steer.md]).
+    pub fn steer_handle(&self) -> SteerHandle {
+        SteerHandle::new(self.steer.clone())
+    }
+
+    /// Move the active turn's pending steers into history as plain user
+    /// messages, unsampled — the terminal-flush of [docs/ac-queue-steer.md] §4:
+    /// input the runtime accepted reaches history even when the turn ends
+    /// abnormally (R2), except under deliberate cancellation ([`on_user_cancel`]).
+    fn flush_pending(&mut self) {
+        for item in self.steer.take_pending() {
+            match item {
+                SteerInput::Text(t) => self.messages.push(Message::text(Role::User, t)),
+            }
+        }
+    }
+
+    /// Deliberate cancellation ([docs/ac-queue-steer.md] §5): discard the
+    /// pending queue (the user said stop, including what they just typed) and
+    /// record the interruption marker so the next turn's model reads the cut as
+    /// intentional.
+    fn on_user_cancel(&mut self) {
+        let _ = self.steer.take_pending();
+        self.messages
+            .push(Message::text(Role::User, INTERRUPTION_MARKER));
+    }
+
     pub async fn run_turn(
         &mut self,
         user_text: String,
         sink: UnboundedSender<AgentEvent>,
     ) -> Result<StopReason, RuntimeError> {
+        // Cloned so the turn's `tokio::select!` futures don't borrow `self`,
+        // leaving `&mut self` free to record markers in the branch bodies.
+        let cancel = self.ctx.cancel.clone();
+        let provider = self.provider.clone();
+
         self.messages.push(Message::text(Role::User, user_text));
+
+        // The turn's own input (I₀) must sample before any steer, so draining
+        // is deferred (`drainable = false`) until the first step completes; the
+        // guard deactivates the turn on every exit, including a panic.
+        let turn_id = self.steer.activate(TurnClass::Regular);
+        let _turn_guard = ActiveTurnGuard {
+            state: self.steer.clone(),
+            id: turn_id.clone(),
+        };
+        let mut drainable = false;
 
         let mut iteration = 0usize;
         loop {
             if iteration >= self.config.max_iterations {
+                self.flush_pending();
                 return Err(RuntimeError::MaxIterations(self.config.max_iterations));
             }
-            if self.ctx.cancel.is_cancelled() {
+            if cancel.is_cancelled() {
+                self.on_user_cancel();
                 return Err(RuntimeError::Cancelled);
             }
             // A dropped receiver means nobody is listening — treat it as an
             // implicit cancel so we stop spending tokens and running tools.
+            // Not deliberate user intent: discard the queue, but record no
+            // interruption marker (the client simply went away).
             if sink.is_closed() {
+                let _ = self.steer.take_pending();
                 return Err(RuntimeError::Cancelled);
+            }
+
+            // Step boundary: drain pending steers into history as plain user
+            // messages ([docs/ac-queue-steer.md] §4). `drainable` gates the
+            // initial deferral above.
+            if drainable {
+                for item in self.steer.take_pending() {
+                    match item {
+                        SteerInput::Text(t) => self.messages.push(Message::text(Role::User, t)),
+                    }
+                }
             }
 
             let mut req = CompletionRequest::new(&self.config.model);
@@ -176,8 +265,17 @@ impl Session {
             // Await the connection, but let a cancel break out of it.
             let mut stream = tokio::select! {
                 biased;
-                _ = self.ctx.cancel.cancelled() => return Err(RuntimeError::Cancelled),
-                res = self.provider.stream_completion(req) => res?,
+                _ = cancel.cancelled() => {
+                    self.on_user_cancel();
+                    return Err(RuntimeError::Cancelled);
+                }
+                res = provider.stream_completion(req) => match res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.flush_pending();
+                        return Err(RuntimeError::Completion(e));
+                    }
+                },
             };
 
             let mut text = String::new();
@@ -189,7 +287,10 @@ impl Session {
                 // a stalled or never-closing stream can't wedge the turn.
                 let next = tokio::select! {
                     biased;
-                    _ = self.ctx.cancel.cancelled() => return Err(RuntimeError::Cancelled),
+                    _ = cancel.cancelled() => {
+                        self.on_user_cancel();
+                        return Err(RuntimeError::Cancelled);
+                    }
                     n = async {
                         match self.config.idle_timeout {
                             Some(d) => tokio::time::timeout(d, stream.next()).await.map_err(|_| ()),
@@ -198,10 +299,16 @@ impl Session {
                     } => n,
                 };
                 let event = match next {
-                    Err(()) => return Err(RuntimeError::Timeout),
+                    Err(()) => {
+                        self.flush_pending();
+                        return Err(RuntimeError::Timeout);
+                    }
                     Ok(None) => break,
                     Ok(Some(Ok(ev))) => ev,
-                    Ok(Some(Err(e))) => return Err(RuntimeError::Completion(e)),
+                    Ok(Some(Err(e))) => {
+                        self.flush_pending();
+                        return Err(RuntimeError::Completion(e));
+                    }
                 };
                 match event {
                     CompletionEvent::Text(s) => {
@@ -243,9 +350,20 @@ impl Session {
                 cache: false,
             });
 
+            // A completed step makes the queue drainable from here on.
+            drainable = true;
+
+            // No tool calls: the model owes no continuation, so the turn ends —
+            // unless a steer is pending, which extends it for one more step
+            // ([docs/ac-queue-steer.md] §4). `end_if_idle` makes the empty-check
+            // and deactivation atomic, closing the terminal race.
             if tool_uses.is_empty() {
-                let _ = sink.send(AgentEvent::TurnComplete { stop_reason });
-                return Ok(stop_reason);
+                if self.steer.end_if_idle(&turn_id) {
+                    let _ = sink.send(AgentEvent::TurnComplete { stop_reason });
+                    return Ok(stop_reason);
+                }
+                iteration += 1;
+                continue;
             }
 
             // Spawn each tool on its own task: they run concurrently, and a

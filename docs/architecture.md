@@ -86,7 +86,7 @@ append-only **log** ([ac-fork.md](ac-fork.md)) that makes branching, rewind, and
 | --- | --- |
 | [ac-fork.md](ac-fork.md) | the append-only session log; forking and rewind |
 | [ac-compaction.md](ac-compaction.md) | context compaction as an agent-to-agent handoff |
-| [ac-queue-steer.md](ac-queue-steer.md) | mid-turn input steering |
+| [ac-queue-steer.md](ac-queue-steer.md) | mid-turn input steering *(implemented)* |
 | [ac-approvals.md](ac-approvals.md) | pre-flight intent classification and approval routing |
 | [ac-context.md](ac-context.md) | marked fragments, injection cadence, budgeted rendering |
 | [ac-hooks.md](ac-hooks.md) | the lifecycle-phase taxonomy for extension seams |

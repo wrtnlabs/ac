@@ -1,6 +1,6 @@
 # RFC: Mid-turn input — steering
 
-**Status:** design of record — accepted, not yet implemented (2026-07-21).
+**Status:** implemented — specification of record (2026-07-22).
 **Requires:** [ac-loop.md](ac-loop.md) (the step model this design extends). **Required by:** [ac-fork.md](ac-fork.md) §4 (boundary definition), [ac-compaction.md](ac-compaction.md) §5 (drain deferral).
 
 The key words MUST, MUST NOT, SHOULD, and MAY are to be interpreted as in RFC 2119.
