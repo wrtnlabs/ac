@@ -47,6 +47,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ac-approvals"
+version = "0.1.0"
+
+[[package]]
 name = "ac-cli"
 version = "0.1.0"
 dependencies = [
@@ -215,6 +219,7 @@ dependencies = [
 name = "ac-tools"
 version = "0.1.0"
 dependencies = [
+ "ac-approvals",
  "ac-tool",
  "futures",
  "globset",

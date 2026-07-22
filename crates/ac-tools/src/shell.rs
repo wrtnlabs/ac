@@ -16,9 +16,27 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ac_tool::{Capability, CommandSpec, SandboxMode, Tool, ToolCtx, ToolOutput};
+use ac_approvals::{ApprovalConfig, RoleContainment, Verdict};
+use ac_tool::{Capability, CommandSpec, PathPolicy, SandboxMode, Tool, ToolCtx, ToolOutput};
 use futures::future::BoxFuture;
 use serde::Deserialize;
+
+/// Adapts the tool context's [`PathPolicy`] into the [`RoleContainment`] the
+/// approval engine delegates path-role checks to: a role token is *readable* iff
+/// a read resolve succeeds, *writable* iff a write resolve succeeds. The region
+/// verdict is what matters — a relative token resolves against the policy root,
+/// which is the same write region the command runs in, so a false "not
+/// contained" only ever over-asks (raises to `prompt`), never under-asks.
+struct PolicyContainment<'a>(&'a dyn PathPolicy);
+
+impl RoleContainment for PolicyContainment<'_> {
+    fn readable(&self, path: &str) -> bool {
+        self.0.resolve_read(Path::new(path)).is_ok()
+    }
+    fn writable(&self, path: &str) -> bool {
+        self.0.resolve_write(Path::new(path)).is_ok()
+    }
+}
 
 /// Per-stream capture cap (~32 KiB); output beyond it is dropped and flagged.
 const STREAM_CAP: usize = 32 * 1024;
@@ -98,7 +116,10 @@ impl Tool for Shell {
             // Build the command through the OS-sandbox seam when a launcher is
             // installed; otherwise run it unsandboxed and mark the envelope. A
             // launcher that cannot enforce its policy fails closed — we never
-            // fall back to an unsandboxed spawn behind the caller's back.
+            // fall back to an unsandboxed spawn behind the caller's back. Built
+            // here (before classification) but NOT spawned, so the achieved
+            // sandbox mode can inform the approval verdict while a `forbidden`
+            // still spawns nothing (I1).
             let (mut command, sandbox_mode) = match &ctx.sandbox {
                 Some(launcher) => {
                     let spec =
@@ -118,6 +139,38 @@ impl Tool for Shell {
                     (c, SandboxMode::Off)
                 }
             };
+
+            // Pre-flight intent classification (ac-approvals). When the host has
+            // installed an ApprovalConfig, classify the command line before the
+            // built command is spawned (I1): a `forbidden` verdict refuses here,
+            // as data the model reads (R3). No interactive approval channel is
+            // wired yet, so `prompt` resolves to `forbidden` (ac-approvals §3) — a
+            // host that wires a channel is where interactive prompting lands.
+            // The unknown default `U` is honored only under STRICT kernel
+            // containment; where the achieved mode is degraded or off, `U` is
+            // clamped up to at least `prompt`, so a host that set `U = safe`
+            // cannot silently allow unknown commands on an unsandboxed host (§2).
+            // Classification composes with — never replaces — the path-policy and
+            // sandbox layers (I5). Absent a config, the command runs unclassified.
+            if let Some(cfg) = ctx.extensions.get::<ApprovalConfig>() {
+                let unknown = if matches!(sandbox_mode, SandboxMode::Strict) {
+                    cfg.unknown
+                } else {
+                    cfg.unknown.join(Verdict::Prompt)
+                };
+                let containment = PolicyContainment(ctx.policy.as_ref());
+                let class =
+                    ac_approvals::classify(&input.command, &cfg.policy, &containment, unknown);
+                if ac_approvals::without_channel(class.verdict) == Verdict::Forbidden {
+                    let mut msg = String::from("command refused by approval policy");
+                    let reasons = class.refusal_reasons();
+                    if !reasons.is_empty() {
+                        msg.push_str(": ");
+                        msg.push_str(&reasons.join("; "));
+                    }
+                    return ToolOutput::error(msg);
+                }
+            }
             command
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -228,4 +281,147 @@ where
         }
     }
     (String::from_utf8_lossy(&buf).into_owned(), truncated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ac_approvals::{Matcher, Policy, ProgramRules, Rule};
+    use ac_tool::SubtreePolicy;
+
+    fn run(cmd: &str, ctx: Arc<ToolCtx>) -> impl std::future::Future<Output = ToolOutput> {
+        Arc::new(Shell).run(
+            ShellInput {
+                command: cmd.to_string(),
+                cwd: None,
+            },
+            ctx,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_forbidden_command_is_refused_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        // `echo` is safe (Rest → Safe); everything else is unknown → prompt →
+        // (no channel wired) forbidden.
+        let policy = Policy::load([ProgramRules::new(
+            "echo",
+            [Rule::new([Matcher::Rest], Verdict::Safe)],
+        )])
+        .unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions.insert(ApprovalConfig::new(policy));
+
+        // The safe command runs: a JSON envelope carrying an exit code.
+        let out = run("echo hi", ctx.clone()).await;
+        assert!(!out.is_error, "echo should be allowed: {}", out.content);
+        assert!(out.content.contains("\"exit_code\""));
+
+        // The unknown command is refused as data — not a JSON envelope, so it
+        // never spawned (I1).
+        let out = run("rm -rf x", ctx).await;
+        assert!(out.is_error);
+        assert!(
+            out.content
+                .starts_with("command refused by approval policy")
+        );
+        assert!(!out.content.contains("\"exit_code\""));
+    }
+
+    #[tokio::test]
+    async fn a_role_escape_forbids_an_otherwise_safe_command() {
+        let dir = tempfile::tempdir().unwrap();
+        // `cat <path>` is safe when the path is read-contained.
+        let policy = Policy::load([ProgramRules::new(
+            "cat",
+            [Rule::new([Matcher::ReadPath], Verdict::Safe)],
+        )])
+        .unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions.insert(ApprovalConfig::new(policy));
+
+        // An in-tree read is allowed; an absolute path escaping the root raises
+        // the match to prompt → (no channel) forbidden.
+        let out = run("cat /etc/passwd", ctx).await;
+        assert!(out.is_error);
+        assert!(
+            out.content
+                .starts_with("command refused by approval policy")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_config_commands_run_unclassified() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        let out = run("echo hi", ctx).await;
+        assert!(!out.is_error);
+        assert!(out.content.contains("\"exit_code\""));
+    }
+
+    #[tokio::test]
+    async fn u_safe_is_clamped_to_prompt_without_strict_containment() {
+        let dir = tempfile::tempdir().unwrap();
+        // The host set U = safe, but installs no sandbox launcher, so the
+        // achieved mode is `off`. An unknown command must NOT silently allow: the
+        // shell clamps U up to prompt → (no channel) forbidden (§2).
+        let policy = Policy::load([ProgramRules::new(
+            "echo",
+            [Rule::new([Matcher::Rest], Verdict::Safe)],
+        )])
+        .unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions
+            .insert(ApprovalConfig::new(policy).with_unknown(Verdict::Safe));
+
+        let out = run("rm -rf x", ctx.clone()).await;
+        assert!(
+            out.is_error,
+            "U=safe must not allow an unknown command off-sandbox"
+        );
+        assert!(
+            out.content
+                .starts_with("command refused by approval policy")
+        );
+        // The explicitly-safe command still runs.
+        let out = run("echo hi", ctx).await;
+        assert!(!out.is_error);
+    }
+
+    #[tokio::test]
+    async fn a_refusal_cites_the_offending_command_not_a_safe_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy::load([ProgramRules::new(
+            "echo",
+            [Rule::new([Matcher::Rest], Verdict::Safe).justified("echo is safe")],
+        )])
+        .unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions.insert(ApprovalConfig::new(policy));
+
+        // `rm` is the reason; the message must name it and NOT parrot "echo is
+        // safe" (the allowed sibling segment).
+        let out = run("echo hi && rm x", ctx).await;
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("rm"),
+            "should cite rm: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("echo is safe"),
+            "must not cite the safe sibling: {}",
+            out.content
+        );
+    }
 }

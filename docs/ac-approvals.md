@@ -1,6 +1,21 @@
 # RFC: The approval model — pre-flight intent classification
 
-**Status:** design of record — accepted, not yet implemented (2026-07-21).
+**Status:** machinery implemented — specification of record (2026-07-22). The kit-owned
+machinery of §5 ships as the `ac-approvals` crate: the verdict lattice and join (§2), lowering
+into simple commands with wrapper-unwrap and unknown fallback (§2, I3/I4), the role-typed
+policy with full-vector matching and load-time example validation (§2), the role-containment
+check delegated through a `RoleContainment` adapter over the tool contract's path policy, the
+classification engine with the unknown default `U`, the permission-mode floor, and the
+generalization guard (§3). Recognition is wired into the shell tool: a host-installed
+`ApprovalConfig` (carried through the tool context's typed extensions) classifies each command
+line before any process exists — a `forbidden` verdict refuses as tool-output data (I1/R3),
+composing with, never replacing, the path-policy and sandbox layers (I5). The **interactive
+approval channel** of §3 — suspending a call, emitting the approval request on the event
+stream, awaiting a human answer, and the "don't ask again" amendment's persistence — is the
+integration layer a host wires over this machinery; until one exists the shell tool applies the
+kit's `without_channel` rule (`prompt` → `forbidden`, §3). The permission-mode floor for
+*dedicated* tools is machinery in place but not yet consulted by the loop (its gate is the
+loop's tool-dispatch integration).
 **Requires:** [ac-tools.md](ac-tools.md) (the capability axis of the tool contract).
 **Interacts with:** [ac-sandbox.md](ac-sandbox.md) (kernel containment, the layer beneath this
 one), [ac-mcp.md](ac-mcp.md) (capability of wire-registered tools),
@@ -120,6 +135,18 @@ host's policy as an allow rule for the exact matched prefix. The kit supplies th
 mechanics and one guard: prefixes that name an interpreter or wrapper escape (`sh -c`,
 `python -c`, `env`, and kin) are unrulable as allow — such a rule would allow everything, so
 the engine MUST refuse to create it. Persistence and scope of amendments are host territory.
+
+The **escape set** — the "and kin" above — is the same set lowering consults: a program whose
+arguments can request arbitrary code execution, an arbitrary-path write, or sandbox escape in
+ways the role taxonomy cannot distinguish from benign use (a POSIX or non-POSIX shell's `-c`;
+`awk`/`sed` scripts; `find -exec`/`-delete`; `make` recipes; language runtimes; `docker`/`ssh`
+and other exec/transfer wrappers). Each lowers to unknown (never classified under its name,
+I3) and is unrulable as allow. The set is a **floor, deliberately non-exhaustive** — it names
+the clear escapes, and the kernel sandbox ([ac-sandbox.md](ac-sandbox.md), I5) is the ultimate
+containment for anything it misses. A program whose danger lives in one flag the host can
+exclude by full consumption (`curl -o`, `rg --pre`) is deliberately *not* an escape — the host
+writes a precise rule for it. Recognizing dangerous argv *shapes* within an otherwise-rulable
+program is the separate, deferred heuristic of §6.
 
 A verdict decides prompting and nothing else. `safe` does not widen the path policy, does not
 relax the sandbox, does not skip capability accounting — the layers compose by conjunction,

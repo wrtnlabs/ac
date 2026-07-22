@@ -6,6 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+ac-approvals = { workspace = true }
 ac-tool = { workspace = true }
 futures = { workspace = true }
 globset = { workspace = true }
