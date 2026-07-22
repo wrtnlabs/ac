@@ -5,9 +5,11 @@
 mod content;
 mod error;
 mod event;
+mod marker;
 mod tool;
 
 pub use content::{ContentPart, Message, Role, ToolResult, ToolUse};
 pub use error::CompletionError;
 pub use event::{Citation, CompletionEvent, StopReason, TokenUsage};
+pub use marker::INTERRUPTION_MARKER;
 pub use tool::ToolSpec;

@@ -84,7 +84,7 @@ append-only **log** ([ac-fork.md](ac-fork.md)) that makes branching, rewind, and
 
 | Document | Subject |
 | --- | --- |
-| [ac-fork.md](ac-fork.md) | the append-only session log; forking and rewind |
+| [ac-fork.md](ac-fork.md) | the append-only session log; forking and rewind *(implemented: `ac-rollout`)* |
 | [ac-compaction.md](ac-compaction.md) | context compaction as an agent-to-agent handoff |
 | [ac-queue-steer.md](ac-queue-steer.md) | mid-turn input steering *(implemented)* |
 | [ac-approvals.md](ac-approvals.md) | pre-flight intent classification and approval routing |

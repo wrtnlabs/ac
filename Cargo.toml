@@ -22,6 +22,7 @@ ac-mcp = { path = "crates/ac-mcp" }
 ac-sandbox = { path = "crates/ac-sandbox" }
 ac-acp = { path = "crates/ac-acp" }
 ac-cli = { path = "crates/ac-cli" }
+ac-rollout = { path = "crates/ac-rollout" }
 ac-store = { path = "crates/ac-store" }
 ac-web = { path = "crates/ac-web" }
 
@@ -50,5 +51,5 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 walkdir = "2"

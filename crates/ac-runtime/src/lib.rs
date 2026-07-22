@@ -18,12 +18,7 @@ pub use steer::{SteerError, SteerHandle, SteerInput, TurnClass};
 
 use steer::SteerState;
 
-/// Recorded into history when a turn is cancelled on purpose, so the next
-/// turn's model reads the interruption as deliberate — not an anomaly to
-/// re-attempt — and knows partial effects may have landed
-/// ([docs/ac-queue-steer.md] §5, [docs/ac-fork.md] I6).
-pub const INTERRUPTION_MARKER: &str = "The previous turn was interrupted on purpose. Any commands or tools it had started may \
-     have partially executed; do not assume its work completed.";
+pub use ac_types::INTERRUPTION_MARKER;
 
 /// Deactivates the active turn when the turn's scope ends, on every exit path
 /// including a panic unwind — so a stale active turn never outlives its

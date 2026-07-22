@@ -51,6 +51,12 @@ ac-sandbox                 LIVE (v1): kernel-enforced OS sandbox for the shell t
                            Filesystem containment + syscall restriction + resource caps + network
                            on/off; fail-closed strict|degraded|off envelope; native Windows honestly
                            off. Domain-egress allowlist is the deferred v2. See docs/ac-sandbox.md
+ac-rollout                 LIVE: the append-only session-log substrate ([docs/ac-fork.md]) —
+                           type-tagged events (message/turn-boundary/compaction/rewind), the
+                           pure projection E(L), canonical cut points, fork (copy-truncated-prefix
+                           + lineage + ragged-edge interruption marker), rewind (appended marker),
+                           JSONL with per-line fault tolerance + first-head-canonical. Depends on
+                           ac-types only.
 ac-store                   LIVE: rusqlite session+message store — opaque or caller-adopted ids,
                            host-owned meta JSON, seq-ordered message log (seq-CAS append);
                            pairs with Session::resume for reload recovery

@@ -121,6 +121,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ac-rollout"
+version = "0.1.0"
+dependencies = [
+ "ac-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "ac-runtime"
 version = "0.1.0"
 dependencies = [

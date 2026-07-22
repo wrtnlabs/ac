@@ -1,6 +1,9 @@
 # RFC: The session log, forking, and rewind
 
-**Status:** design of record — accepted, not yet implemented (2026-07-21).
+**Status:** implemented — specification of record (2026-07-22). The substrate (the
+append-only log, the projection `E(L)`, cut points, `fork`, and `rewind`) ships as the
+`ac-rollout` crate; the compaction *lifecycle* that produces `κ` records lands with
+[ac-compaction.md](ac-compaction.md).
 **Requires:** [ac-queue-steer.md](ac-queue-steer.md) (step atomicity, the interruption marker).
 **Required by:** [ac-compaction.md](ac-compaction.md) (compaction is an event in this log),
 [ac-context.md](ac-context.md), [ac-hooks.md](ac-hooks.md), [ac-serving.md](ac-serving.md).
