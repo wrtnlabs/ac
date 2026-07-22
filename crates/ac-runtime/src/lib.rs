@@ -9,6 +9,7 @@
 
 mod compaction;
 mod fragments;
+mod hooks;
 mod steer;
 
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 pub use compaction::{
     CompactionConfig, CompactionError, CompactionOutcome, CompactionStrategy, CompactionTrigger,
 };
+pub use hooks::{ForcedChainHook, HookRegistry, Observation, ObservationHook, StepPrepareHook};
 pub use steer::{SteerError, SteerHandle, SteerInput, TurnClass};
 
 use steer::SteerState;
@@ -120,12 +122,6 @@ pub enum AgentEvent {
     Error(String),
 }
 
-/// Hook invoked before each model round-trip; may swap model, filter tools,
-/// edit the system prompt, or set the tool choice.
-pub trait StepHook: Send + Sync {
-    fn prepare(&self, iteration: usize, request: &mut CompletionRequest);
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error("completion failed: {0}")]
@@ -147,7 +143,7 @@ pub struct Session {
     registry: Arc<ToolRegistry>,
     ctx: Arc<ToolCtx>,
     config: AgentConfig,
-    hooks: Vec<Arc<dyn StepHook>>,
+    hooks: HookRegistry,
     rollout: Rollout,
     /// The most recent server-reported usage — the source of truth for `τ`.
     last_usage: TokenUsage,
@@ -171,7 +167,7 @@ impl Session {
             registry,
             ctx,
             config,
-            hooks: Vec::new(),
+            hooks: HookRegistry::new(),
             rollout: Rollout::create(),
             last_usage: TokenUsage::default(),
             turn_counter: 0,
@@ -238,10 +234,18 @@ impl Session {
         session
     }
 
-    /// Install a step hook. Hooks compose: each runs in registration order on
-    /// every model round-trip, each seeing the previous hooks' edits.
-    pub fn add_hook(&mut self, hook: Arc<dyn StepHook>) {
-        self.hooks.push(hook);
+    /// Install a step-prepare hook ([docs/ac-hooks.md]). They compose: each runs
+    /// in registration order on every model round-trip, each seeing the previous
+    /// hooks' edits.
+    pub fn add_step_hook(&mut self, hook: Arc<dyn StepPrepareHook>) {
+        self.hooks.add_step_prepare(hook);
+    }
+
+    /// Install an observation hook — it watches tool traffic and contributes
+    /// nothing (I4/I6). Registration order is fixed but nothing model-visible may
+    /// depend on it.
+    pub fn add_observation_hook(&mut self, hook: Arc<dyn ObservationHook>) {
+        self.hooks.add_observation(hook);
     }
 
     /// The effective history `E(L)` — the messages the model would be given if a
@@ -392,7 +396,7 @@ impl Session {
             req.tools = self.registry.specs();
             req.server_tools = self.config.server_tools.clone();
 
-            for hook in &self.hooks {
+            for hook in self.hooks.step_prepare() {
                 hook.prepare(iteration, &mut req);
             }
 
@@ -514,6 +518,10 @@ impl Session {
                     name: tu.name.clone(),
                     input: tu.input.clone(),
                 });
+                self.hooks.observe(&Observation::ToolStart {
+                    id: tu.id.clone(),
+                    name: tu.name.clone(),
+                });
                 let registry = self.registry.clone();
                 let ctx = self.ctx.clone();
                 let name = tu.name.clone();
@@ -528,6 +536,11 @@ impl Session {
                     Ok(out) => (out.content, out.is_error),
                     Err(e) => (format!("tool '{name}' panicked: {e}"), true),
                 };
+                self.hooks.observe(&Observation::ToolFinish {
+                    id: id.clone(),
+                    name: name.clone(),
+                    is_error,
+                });
                 let _ = sink.send(AgentEvent::ToolResult {
                     id: id.clone(),
                     name,

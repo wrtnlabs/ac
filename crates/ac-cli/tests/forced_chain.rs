@@ -8,17 +8,16 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use ac_provider::{CompletionRequest, ToolChoice};
+use ac_provider::ToolChoice;
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
-use ac_runtime::{AgentConfig, AgentEvent, Session, StepHook};
+use ac_runtime::{AgentConfig, AgentEvent, ForcedChainHook, Session};
 use ac_tool::{
     Capability, PathPolicy, ReadOnlyPolicy, SplitPolicy, SubtreePolicy, SwapPolicy, Tool, ToolCtx,
     ToolOutput, ToolRegistry,
 };
 use ac_tools::{ReadFile, WriteFile};
-use ac_types::StopReason;
+use ac_types::{ContentPart, Message, Role, StopReason, ToolResult, ToolUse};
 use futures::future::BoxFuture;
 use serde_json::json;
 
@@ -29,7 +28,6 @@ use serde_json::json;
 struct BindWorkdir {
     swap: Arc<SwapPolicy>,
     workspace: PathBuf,
-    bound: Arc<AtomicBool>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -89,23 +87,8 @@ impl Tool for BindWorkdir {
                 ));
             }
             self.swap.swap(Arc::new(SplitPolicy { read, write }));
-            self.bound.store(true, Ordering::SeqCst);
             ToolOutput::ok(format!("working directory bound to {dir}"))
         })
-    }
-}
-
-/// Pins the step order: force `bind_workdir` until the bind tool has run,
-/// then leave the choice free. The bound flag is set by the tool itself.
-struct ChainHook {
-    bound: Arc<AtomicBool>,
-}
-
-impl StepHook for ChainHook {
-    fn prepare(&self, _iteration: usize, request: &mut CompletionRequest) {
-        if !self.bound.load(Ordering::SeqCst) {
-            request.tool_choice = ToolChoice::Force("bind_workdir".to_string());
-        }
     }
 }
 
@@ -127,13 +110,10 @@ async fn forced_chain_binds_then_frees_and_the_policy_floor_holds() {
     let swap = Arc::new(SwapPolicy::new(Arc::new(ReadOnlyPolicy::new(initial))));
     let ctx = Arc::new(ToolCtx::new(swap.clone() as Arc<dyn PathPolicy>));
 
-    let bound = Arc::new(AtomicBool::new(false));
-
     let mut registry = ToolRegistry::new();
     registry.register(BindWorkdir {
         swap: swap.clone(),
         workspace: workspace.clone(),
-        bound: bound.clone(),
     });
     registry.register(ReadFile);
     registry.register(WriteFile);
@@ -191,8 +171,12 @@ async fn forced_chain_binds_then_frees_and_the_policy_floor_holds() {
         system: Some("generic test host".to_string()),
         ..Default::default()
     };
+    // The kit's stateless forced chain: it forces `bind_workdir` until the
+    // history shows a SUCCESSFUL bind — derived from the request's messages, not
+    // a flag — so it is resume- and fork-correct by construction ([ac-hooks.md]
+    // §3). No bound flag anywhere.
     let mut session = Session::new(Arc::new(provider.clone()), Arc::new(registry), ctx, config);
-    session.add_hook(Arc::new(ChainHook { bound }));
+    session.add_step_hook(Arc::new(ForcedChainHook::new("bind_workdir")));
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let driver = tokio::spawn(async move { session.run_turn("do the work".to_string(), tx).await });
@@ -288,5 +272,72 @@ async fn forced_chain_binds_then_frees_and_the_policy_floor_holds() {
     assert!(
         sibling_out.contains("sibling ground truth"),
         "the sibling read must carry the file's content: {sibling_out}"
+    );
+}
+
+/// The payoff of stateless derivation ([ac-hooks.md] §3, I5): a session resumed
+/// from a history that already shows a successful bind does NOT re-force the
+/// chain. A flag-based hook would reset to "unbound" on resume and wrongly force
+/// `bind_workdir` again; the E(L)-derived hook reads the bind out of history and
+/// stays free.
+#[tokio::test]
+async fn a_resumed_session_does_not_re_force_a_completed_chain() {
+    let workspace = tempfile::tempdir().unwrap();
+
+    // A prior session's history: bind_workdir was called and SUCCEEDED.
+    let history = vec![
+        Message::text(Role::User, "do the work".to_string()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentPart::ToolUse(ToolUse {
+                id: "c-bind".to_string(),
+                name: "bind_workdir".to_string(),
+                input: json!({ "dir": "proj" }),
+            })],
+            cache: false,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentPart::ToolResult(ToolResult {
+                tool_use_id: "c-bind".to_string(),
+                content: "working directory bound to proj".to_string(),
+                is_error: false,
+            })],
+            cache: false,
+        },
+        Message::text(Role::Assistant, "earlier work".to_string()),
+    ];
+
+    let ctx = Arc::new(ToolCtx::new(
+        Arc::new(SubtreePolicy::new(workspace.path()).unwrap()) as Arc<dyn PathPolicy>,
+    ));
+    let provider = MockProvider::new(vec![vec![text("done"), stop_end()]]);
+    let config = AgentConfig {
+        model: "mock/model".to_string(),
+        ..Default::default()
+    };
+    let mut session = Session::resume(
+        Arc::new(provider.clone()),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        config,
+        history,
+    );
+    session.add_step_hook(Arc::new(ForcedChainHook::new("bind_workdir")));
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let driver = tokio::spawn(async move { session.run_turn("continue".to_string(), tx).await });
+    while rx.recv().await.is_some() {}
+    driver.await.expect("join").expect("turn ok");
+
+    let choices: Vec<ToolChoice> = provider
+        .requests()
+        .iter()
+        .map(|r| r.tool_choice.clone())
+        .collect();
+    assert_eq!(
+        choices,
+        vec![ToolChoice::Auto],
+        "a resumed session whose history shows the bind must not re-force it"
     );
 }

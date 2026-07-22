@@ -90,7 +90,7 @@ through a store (the flat view) or the log itself; mid-turn input
 | [ac-queue-steer.md](ac-queue-steer.md) | mid-turn input steering *(implemented)* |
 | [ac-approvals.md](ac-approvals.md) | pre-flight intent classification and approval routing *(machinery implemented: `ac-approvals`)* |
 | [ac-context.md](ac-context.md) | marked fragments, injection cadence, budgeted rendering *(machinery implemented: `ac-context`)* |
-| [ac-hooks.md](ac-hooks.md) | the lifecycle-phase taxonomy for extension seams |
+| [ac-hooks.md](ac-hooks.md) | the lifecycle-phase taxonomy for extension seams *(machinery implemented: step-prepare + observation)* |
 
 **Doctrine — in force:**
 

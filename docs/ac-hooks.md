@@ -1,6 +1,20 @@
 # RFC: The lifecycle-phase taxonomy
 
-**Status:** design of record — accepted, not yet implemented (2026-07-21).
+**Status:** machinery implemented — specification of record (2026-07-22). The single step
+hook is now one phase of a `HookRegistry` (frozen at session construction, ordered per phase,
+R5). Two phases ship wired into the loop: **step-prepare** (the live request-editing hook,
+unchanged in authority — §2) and **observation** (tool start/finish, immutable input and no
+return, so it cannot mutate what it watches — I4/I6). The runtime ships the RFC's worked
+**stateless forced chain** (`ForcedChainHook`): it forces a tool until the *effective history*
+(`request.messages`) shows a successful result of it, deriving the verdict from `E(L)` and
+never from a process-local flag — so resume and fork are correct for free (§3, I5), proven by
+an integration test that resumes past the bind and does not re-force. The two **contributing**
+phases — *session-context* (durable per-window fragments) and *turn-input* (per-turn mention
+injections) — are deferred: their contributions enter history as *marked* fragments
+([ac-context.md](ac-context.md) R1), so they land with ac-context's window/turn cadence drivers
+(deferred there for the same reason) and a concrete host consumer; the **lifecycle** phase
+lands with its first consumer. Defining a phase ahead of a caller would be authority without a
+use — the taxonomy's value is authority-by-shape at the point of use.
 **Requires:** [ac-loop.md](ac-loop.md) (the live step hook this generalizes);
 [ac-fork.md](ac-fork.md) §3 (the effective-history projection verdicts derive from).
 **Required by:** nothing yet. **Interacts with:** [ac-provider.md](ac-provider.md) §3

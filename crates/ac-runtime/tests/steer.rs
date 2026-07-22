@@ -146,7 +146,7 @@ struct SteerOnceHook {
     message: String,
 }
 
-impl ac_runtime::StepHook for SteerOnceHook {
+impl ac_runtime::StepPrepareHook for SteerOnceHook {
     fn prepare(&self, iteration: usize, _request: &mut ac_provider::CompletionRequest) {
         use std::sync::atomic::Ordering;
         if iteration == 0 && !self.fired.swap(true, Ordering::SeqCst) {
@@ -178,7 +178,7 @@ async fn a_pending_steer_extends_an_otherwise_final_text_step() {
         AgentConfig::default(),
     );
     handle_cell.set(session.steer_handle()).ok().unwrap();
-    session.add_hook(Arc::new(SteerOnceHook {
+    session.add_step_hook(Arc::new(SteerOnceHook {
         handle: handle_cell,
         fired: std::sync::atomic::AtomicBool::new(false),
         message: "MORE-4423".to_string(),

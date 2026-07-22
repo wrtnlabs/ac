@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
-use ac_runtime::{AgentConfig, AgentEvent, RuntimeError, Session, StepHook};
+use ac_runtime::{
+    AgentConfig, AgentEvent, Observation, ObservationHook, RuntimeError, Session, StepPrepareHook,
+};
 use ac_tool::{Capability, SubtreePolicy, Tool, ToolCtx, ToolOutput, ToolRegistry};
 use ac_types::StopReason;
 use serde::Deserialize;
@@ -195,7 +197,7 @@ async fn max_iterations() {
 }
 
 struct SwapHook;
-impl StepHook for SwapHook {
+impl StepPrepareHook for SwapHook {
     fn prepare(&self, iteration: usize, request: &mut ac_provider::CompletionRequest) {
         if iteration == 0 {
             request.model = "swapped".into();
@@ -216,7 +218,7 @@ async fn step_hook() {
         ctx,
         AgentConfig::default(),
     );
-    session.add_hook(Arc::new(SwapHook));
+    session.add_step_hook(Arc::new(SwapHook));
 
     let (tx, _rx) = mpsc::unbounded_channel();
     session.run_turn("go".into(), tx).await.unwrap();
@@ -231,7 +233,7 @@ async fn step_hook() {
 
 /// Hooks compose in registration order, each seeing the previous edits.
 struct AppendHook(&'static str);
-impl StepHook for AppendHook {
+impl StepPrepareHook for AppendHook {
     fn prepare(&self, _iteration: usize, request: &mut ac_provider::CompletionRequest) {
         let mut model = request.model.clone();
         model.push_str(self.0);
@@ -249,8 +251,8 @@ async fn hooks_compose_in_registration_order() {
         ctx,
         AgentConfig::default(),
     );
-    session.add_hook(Arc::new(AppendHook("-first")));
-    session.add_hook(Arc::new(AppendHook("-second")));
+    session.add_step_hook(Arc::new(AppendHook("-first")));
+    session.add_step_hook(Arc::new(AppendHook("-second")));
 
     let (tx, _rx) = mpsc::unbounded_channel();
     session.run_turn("go".into(), tx).await.unwrap();
@@ -260,6 +262,54 @@ async fn hooks_compose_in_registration_order() {
         reqs[0].model.ends_with("-first-second"),
         "later hooks must see earlier hooks' edits: {}",
         reqs[0].model
+    );
+}
+
+/// The observation phase fires at tool start and finish, in dispatch order, and
+/// sees the outcome — while contributing nothing model-visible (I4/I6).
+#[tokio::test]
+async fn observation_hooks_see_tool_traffic() {
+    use std::sync::Mutex;
+
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+    impl ObservationHook for Recorder {
+        fn observe(&self, event: &Observation) {
+            let line = match event {
+                Observation::ToolStart { name, .. } => format!("start:{name}"),
+                Observation::ToolFinish { name, is_error, .. } => {
+                    format!("finish:{name}:{is_error}")
+                }
+            };
+            self.0.lock().unwrap().push(line);
+        }
+    }
+
+    let provider = MockProvider::new(vec![
+        vec![
+            tool_use("c1", "echo", serde_json::json!({ "text": "hi" })),
+            stop_tool_use(),
+        ],
+        vec![text("done"), stop_end()],
+    ]);
+    let (ctx, _dir) = make_ctx();
+    let mut registry = ToolRegistry::new();
+    registry.register(Echo);
+    let mut session = Session::new(
+        Arc::new(provider.clone()),
+        Arc::new(registry),
+        ctx,
+        AgentConfig::default(),
+    );
+    let log = Arc::new(Mutex::new(Vec::new()));
+    session.add_observation_hook(Arc::new(Recorder(log.clone())));
+
+    let (tx, _rx) = mpsc::unbounded_channel();
+    session.run_turn("go".into(), tx).await.unwrap();
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["start:echo".to_string(), "finish:echo:false".to_string()],
+        "the observer must see the echo call start then finish successfully"
     );
 }
 
