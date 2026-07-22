@@ -89,7 +89,7 @@ through a store (the flat view) or the log itself; mid-turn input
 | [ac-compaction.md](ac-compaction.md) | context compaction as an agent-to-agent handoff *(implemented)* |
 | [ac-queue-steer.md](ac-queue-steer.md) | mid-turn input steering *(implemented)* |
 | [ac-approvals.md](ac-approvals.md) | pre-flight intent classification and approval routing |
-| [ac-context.md](ac-context.md) | marked fragments, injection cadence, budgeted rendering |
+| [ac-context.md](ac-context.md) | marked fragments, injection cadence, budgeted rendering *(machinery implemented: `ac-context`)* |
 | [ac-hooks.md](ac-hooks.md) | the lifecycle-phase taxonomy for extension seams |
 
 **Doctrine — in force:**

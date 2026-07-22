@@ -1,6 +1,15 @@
 # RFC: The context architecture
 
-**Status:** design of record — accepted, not yet implemented (2026-07-21).
+**Status:** machinery implemented — specification of record (2026-07-22). The kit-owned
+machinery of §8 ships as the `ac-context` crate: fragment classes, the recognition registry
+and `injected(t)` (§2–§3, I1), the reactive change-detection primitive `emit(s)` (§5), and the
+budgeted-catalog renderer with the D0–D3 ladder, reports, and host warnings (§6, I3–I4).
+Recognition is wired into compaction — the handoff and the interruption marker are registered
+fragment classes, filtered from the verbatim user set `U` (§3.1), replacing the earlier
+one-off. The live **cadence drivers** (§4: window-establishment injection, per-turn mention
+injection, per-turn reactive evaluation against real sections) are the integration layer a host
+wires over this machinery (§8) and land with a concrete host consumer; **dominance** (§6) and
+snapshot persistence (§9) remain deferred.
 **Requires:** [ac-compaction.md](ac-compaction.md) §3 (`context′`; its R2 verbatim-user rule
 depends on the recognition predicate below). **Interacts with:** [ac-skills.md](ac-skills.md)
 (catalog and body injections instantiate 𝒲 and 𝒯; deferred catalog budgeting is §6 here);
@@ -127,9 +136,19 @@ monopolize `B`. Degradation is then a total order; the renderer takes the *first
   fits the budget remaining; the walk continues past a miss, so one oversized minimum line
   cannot blank every entry ranked after it.
 
-Every rendering yields a **report** ⟨total, included, omitted, truncated-chars⟩. Any level
-below D0 MUST surface a host-visible warning naming what was lost (R4) — the actionable
-remedy, disabling unused entries, belongs to a user who cannot act on what was hidden.
+Every rendering yields a **report** ⟨total, included, omitted, truncated-chars⟩ and, whenever
+*any* content was lost — a level below D0 **or** a per-entry-cap truncation at D0 — a
+host-visible warning naming what was lost (R4, I4): the actionable remedy, disabling unused
+entries, belongs to a user who cannot act on what was hidden.
+
+**Rank priority vs. monotonicity at the D3 boundary.** The D3 walk honors strict rank priority.
+As the budget crosses the point where a large high-ranked entry first fits, that entry is
+included — and MAY displace several smaller lower-ranked entries a tighter budget had shown. At
+that single boundary the rank-order rule (the explicit construction above) takes precedence over
+I3's monotonicity SHOULD: the *level* still improves monotonically with budget, and the omission
+rule still holds, but the *entry count* is not monotone. Preserving both would require abandoning
+rank priority in the degraded regime; the catalog's whole point is that rank encodes what matters
+most, so priority wins.
 
 **Dominance.** Alternative complete renderings of one catalog MAY exist (e.g. a compact
 locator encoding via an alias table versus absolute locators): considered only when the

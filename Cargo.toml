@@ -23,6 +23,7 @@ ac-sandbox = { path = "crates/ac-sandbox" }
 ac-acp = { path = "crates/ac-acp" }
 ac-cli = { path = "crates/ac-cli" }
 ac-rollout = { path = "crates/ac-rollout" }
+ac-context = { path = "crates/ac-context" }
 ac-store = { path = "crates/ac-store" }
 ac-web = { path = "crates/ac-web" }
 

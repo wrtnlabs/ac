@@ -8,11 +8,13 @@
 //! fork reproduce a pre- or post-compaction view for free.
 
 mod compaction;
+mod fragments;
 mod steer;
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use ac_context::FragmentRegistry;
 use ac_provider::{CompletionRequest, Provider, ServerTool};
 use ac_rollout::Rollout;
 use ac_tool::{ToolCtx, ToolRegistry};
@@ -151,6 +153,9 @@ pub struct Session {
     last_usage: TokenUsage,
     /// Session-monotonic turn numbering (fork cut points).
     turn_counter: u64,
+    /// Recognizes the runtime's own machine-injected fragments ([docs/ac-context.md]),
+    /// so they are filtered from user input rather than promoted to instructions.
+    fragments: FragmentRegistry,
     steer: Arc<SteerState>,
 }
 
@@ -170,6 +175,7 @@ impl Session {
             rollout: Rollout::create(),
             last_usage: TokenUsage::default(),
             turn_counter: 0,
+            fragments: fragments::runtime_registry(),
             steer: Arc::new(SteerState::new()),
         }
     }
@@ -619,7 +625,7 @@ impl Session {
             }
         };
 
-        let u = compaction::survivors(&view, cfg.per_message_cap_tokens);
+        let u = compaction::survivors(&view, cfg.per_message_cap_tokens, &self.fragments);
         let replacement = compaction::build_replacement(u, &summary, cfg.strategy);
         let tokens_after = compaction::estimate_tokens(&replacement);
 

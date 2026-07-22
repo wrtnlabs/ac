@@ -10,6 +10,7 @@
 //! record) lives on `Session` in `lib.rs`, since it needs the loop and the
 //! provider.
 
+use ac_context::FragmentRegistry;
 use ac_provider::{CompletionRequest, ToolChoice};
 use ac_types::{ContentPart, Message, Role, TokenUsage};
 
@@ -150,10 +151,16 @@ Do not restate the conversation. Do not add preamble or sign-off. Write only the
 handoff.";
 
 /// Prepended to `σ` so the receiving model reads it as another agent's work to
-/// build on, not its own prior statement.
+/// build on, not its own prior statement. Also the **open marker** of the
+/// handoff fragment class ([docs/ac-context.md]) — see [`crate::fragments`].
 pub const HANDOFF_PREAMBLE: &str = "\
 [The following is a handoff from a previous agent that worked on this task. \
 Continue from where it leaves off; do not restart or repeat completed work.]";
+
+/// The **close marker** of the handoff fragment class: appended after `σ` so the
+/// handoff is recognizable from its text alone (open ∧ close) and therefore
+/// filtered from a later window's user input `U` instead of accumulating (I5).
+pub const HANDOFF_CLOSE: &str = "[End of handoff.]";
 
 /// The final user turn appended to the summary request, so the model emits the
 /// handoff as its response.
@@ -205,12 +212,9 @@ fn part_len(p: &ContentPart) -> usize {
 /// Whether a message is genuine user input (R2): a user-role message that is not
 /// tool traffic. Tool-result messages are user-role on the wire but are the agent
 /// traffic `σ` compresses, so they are excluded; everything else a user sends —
-/// text, images, or both — is preserved.
-///
-/// Note: this does not yet exclude runtime-injected user fragments beyond the
-/// handoff (the interruption marker, future context fragments) — the general
-/// recognition predicate of ac-context.md owns that and is deferred with it.
-/// The handoff `σ` *is* excluded from `U`, via [`is_injected_summary`].
+/// text, images, or both — is preserved. Machine-injected fragments (the handoff,
+/// the interruption marker) are user-role too but are filtered separately, by the
+/// recognition registry ([docs/ac-context.md] §3) — see [`survivors`].
 pub(crate) fn is_user_input(m: &Message) -> bool {
     m.role == Role::User
         && !m
@@ -219,17 +223,18 @@ pub(crate) fn is_user_input(m: &Message) -> bool {
             .any(|p| matches!(p, ContentPart::ToolResult(_)))
 }
 
-/// Whether a message is a handoff `σ` this module injected on a prior compaction
-/// — a user-role message whose text opens with [`HANDOFF_PREAMBLE`]. Such a
-/// message is agent output, not user input, so it MUST NOT survive verbatim into
-/// the next `U` (or repeated compaction accumulates every past summary, breaking
-/// I5). It is still summarized *into* the next `σ`, since the summary request
-/// sees the whole view.
-pub(crate) fn is_injected_summary(m: &Message) -> bool {
-    m.role == Role::User
-        && m.content
-            .iter()
-            .any(|p| matches!(p, ContentPart::Text { text } if text.starts_with(HANDOFF_PREAMBLE)))
+/// The item text of a message — its text parts concatenated — for the recognition
+/// predicate ([docs/ac-context.md]), which decides `injected(t)` from text alone.
+/// A rendered fragment is a single text part, so this reconstructs exactly what
+/// the class markers bracket.
+fn message_text(m: &Message) -> String {
+    m.content
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Truncate a message's text parts to the per-message cap (R2). Non-text parts
@@ -256,12 +261,17 @@ pub(crate) fn cap_message(m: &Message, cap_tokens: u64) -> Message {
     }
 }
 
-/// `U`: the user inputs of `H`, verbatim, each capped (R2). Prior injected
-/// handoffs are excluded — they are agent output that folds into the new `σ`,
-/// not user input to carry forward.
-pub(crate) fn survivors(view: &[Message], cap_tokens: u64) -> Vec<Message> {
+/// `U`: the user inputs of `H`, verbatim, each capped (R2). Machine-injected
+/// fragments recognized by `fragments` are excluded despite their user role
+/// ([docs/ac-context.md] §3.1) — a prior handoff, for one, is agent output that
+/// folds into the new `σ` rather than user input to carry forward (I5).
+pub(crate) fn survivors(
+    view: &[Message],
+    cap_tokens: u64,
+    fragments: &FragmentRegistry,
+) -> Vec<Message> {
     view.iter()
-        .filter(|m| is_user_input(m) && !is_injected_summary(m))
+        .filter(|m| is_user_input(m) && !fragments.injected(&message_text(m)))
         .map(|m| cap_message(m, cap_tokens))
         .collect()
 }
@@ -277,7 +287,7 @@ pub(crate) fn build_replacement(
     if strategy == CompactionStrategy::Summarize {
         u.push(Message::text(
             Role::User,
-            format!("{HANDOFF_PREAMBLE}\n\n{summary}"),
+            format!("{HANDOFF_PREAMBLE}\n\n{summary}\n\n{HANDOFF_CLOSE}"),
         ));
     }
     u
@@ -347,20 +357,59 @@ mod tests {
 
     #[test]
     fn a_prior_handoff_is_recognized_and_excluded_from_survivors() {
+        let registry = crate::fragments::runtime_registry();
         let sigma = build_replacement(vec![], "PRIOR SUMMARY", CompactionStrategy::Summarize)
             .pop()
             .unwrap();
-        assert!(is_injected_summary(&sigma), "the handoff σ is recognized");
-        assert!(!is_injected_summary(&user("just a user message")));
+        assert!(
+            registry.injected(&message_text(&sigma)),
+            "the handoff σ is recognized by the registry"
+        );
+        assert!(!registry.injected("just a user message"));
         // A view that mixes a real user message with a prior σ: only the real
         // one survives, so repeated compaction cannot accumulate summaries (I5).
         let view = vec![user("real input"), sigma, assistant("work")];
-        let u = survivors(&view, 4096);
+        let u = survivors(&view, 4096, &registry);
         assert_eq!(u.len(), 1, "the prior σ is dropped from U");
         match &u[0].content[0] {
             ContentPart::Text { text } => assert_eq!(text, "real input"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn the_interruption_marker_is_filtered_from_user_input() {
+        // The documented over-inclusion, now closed: the marker is user-role text
+        // but a recognized fragment, so it is excluded from U (guarded at the
+        // survivors level, not just the registry level).
+        let registry = crate::fragments::runtime_registry();
+        let marker = Message::text(Role::User, ac_types::INTERRUPTION_MARKER);
+        assert!(is_user_input(&marker), "it is user-role text");
+        assert!(
+            registry.injected(&message_text(&marker)),
+            "but recognized as an injected fragment"
+        );
+        let view = vec![user("real"), marker, assistant("work")];
+        let u = survivors(&view, 4096, &registry);
+        assert_eq!(u.len(), 1, "the interruption marker is excluded from U");
+        match &u[0].content[0] {
+            ContentPart::Text { text } => assert_eq!(text, "real"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn an_empty_summary_handoff_is_still_recognized() {
+        // A degenerate empty σ still produces a well-formed handoff (open ∧ close),
+        // so it is recognized and excluded rather than mistaken for user input.
+        let registry = crate::fragments::runtime_registry();
+        let sigma = build_replacement(vec![], "", CompactionStrategy::Summarize)
+            .pop()
+            .unwrap();
+        assert!(
+            registry.injected(&message_text(&sigma)),
+            "an empty-σ handoff is still recognized"
+        );
     }
 
     #[test]
@@ -372,7 +421,7 @@ mod tests {
             tool_result("drop"),
             user(&big),
         ];
-        let u = survivors(&view, 5); // cap 5 tokens → 20 chars
+        let u = survivors(&view, 5, &crate::fragments::runtime_registry()); // cap 5 tokens → 20 chars
         assert_eq!(u.len(), 2, "only the two user-text messages survive");
         match &u[0].content[0] {
             ContentPart::Text { text } => assert_eq!(text, "keep"),

@@ -187,14 +187,17 @@ async fn mid_turn_compaction_checkpoints_and_continues_the_same_turn() {
         Some(("mid_turn", "HANDOFF-SUMMARY-7788"))
     );
 
-    // σ is the terminal item of the replacement (I4) — it is the last thing the
-    // final step built on, and the turn's final assistant text follows in the log.
+    // σ is the terminal item of the replacement (I4): the last message the final
+    // step built on is the handoff fragment — it carries the summary and closes
+    // with the handoff marker.
+    let last = requests[2].messages.last().expect("a message");
     assert!(
-        joined(&requests[2].messages).ends_with("HANDOFF-SUMMARY-7788")
-            || requests[2]
-                .messages
-                .last()
-                .is_some_and(|m| text_of(m).contains("HANDOFF-SUMMARY-7788"))
+        text_of(last).contains("HANDOFF-SUMMARY-7788"),
+        "the handoff σ is the terminal item"
+    );
+    assert!(
+        text_of(last).trim_end().ends_with("[End of handoff.]"),
+        "the handoff fragment closes with its marker"
     );
 }
 
