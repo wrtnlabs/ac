@@ -175,6 +175,16 @@ fn render(event: AgentEvent, usage: &mut Option<TokenUsage>) {
             eprintln!("\x1b[2m  🔎 {label} {url}\x1b[0m");
         }
         AgentEvent::Usage(u) => *usage = Some(u),
+        AgentEvent::Compacted {
+            trigger,
+            tokens_before,
+            tokens_after,
+            ..
+        } => {
+            eprintln!(
+                "\x1b[2m· compacted context ({trigger}): ~{tokens_before} → ~{tokens_after} tokens\x1b[0m"
+            );
+        }
         AgentEvent::TurnComplete { .. } => {}
         AgentEvent::Error(e) => {
             eprintln!("\x1b[31m✗ {e}\x1b[0m");

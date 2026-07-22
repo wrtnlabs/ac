@@ -145,9 +145,17 @@ impl Rollout {
     }
 
     /// Record a compaction: the effective view becomes `replacement` from here.
-    pub fn compact(&mut self, summary: impl Into<String>, replacement: Vec<Message>) {
+    /// `trigger` is audit metadata naming which trigger fired ([docs/ac-compaction.md]
+    /// §4); the projection ignores it.
+    pub fn compact(
+        &mut self,
+        summary: impl Into<String>,
+        trigger: impl Into<String>,
+        replacement: Vec<Message>,
+    ) {
         self.append(RolloutItem::Compacted {
             summary: summary.into(),
+            trigger: trigger.into(),
             replacement,
         });
     }
@@ -304,19 +312,34 @@ impl Rollout {
     /// positions currently in view (used for rewind).
     fn fold(&self) -> Fold {
         let mut messages: Vec<Message> = Vec::new();
-        // (turn number, index into `messages`) for turns still in the view.
+        // Index into `messages` where each in-view turn starts (the rewind
+        // stack). One entry per TurnStarted since the last baseline.
         let mut turn_starts: Vec<usize> = Vec::new();
+        // Net open turns, so a compaction that fires *inside* a turn knows that
+        // turn continues past it.
+        let mut open_depth: usize = 0;
         for item in self.items() {
             match item {
                 RolloutItem::Meta(_) => {}
                 RolloutItem::Message(m) => messages.push(m.clone()),
-                RolloutItem::TurnStarted { .. } => turn_starts.push(messages.len()),
-                RolloutItem::TurnEnded { .. } => {}
+                RolloutItem::TurnStarted { .. } => {
+                    turn_starts.push(messages.len());
+                    open_depth += 1;
+                }
+                RolloutItem::TurnEnded { .. } => open_depth = open_depth.saturating_sub(1),
                 RolloutItem::Compacted { replacement, .. } => {
                     // The replacement is a fresh baseline with no internal turn
-                    // boundaries; a later TurnStarted adds the next.
+                    // boundaries; a later TurnStarted adds the next. But a
+                    // compaction that fired *mid-turn* leaves the containing turn
+                    // open — its continuation is rewindable back to this
+                    // checkpoint, so re-seed its start at the new baseline's end.
+                    // Without this, `turn_starts.clear()` erases the open turn and
+                    // rewind silently counts fewer turns than asked.
                     messages = replacement.clone();
                     turn_starts.clear();
+                    if open_depth > 0 {
+                        turn_starts.push(messages.len());
+                    }
                 }
                 RolloutItem::RolledBack { turns } => {
                     let n = turn_starts.len();

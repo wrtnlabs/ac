@@ -218,7 +218,8 @@ async fn cancellation_records_the_marker_and_discards_pending_steers() {
 
     // The interruption marker is the last message, so the next turn's model
     // reads the cut as deliberate.
-    let last = session.messages().last().expect("a message");
+    let messages = session.messages();
+    let last = messages.last().expect("a message");
     assert_eq!(last.role, Role::User);
     assert!(
         last.content

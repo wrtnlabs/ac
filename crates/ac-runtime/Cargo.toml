@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 ac-provider = { workspace = true }
+ac-rollout = { workspace = true }
 ac-tool = { workspace = true }
 ac-types = { workspace = true }
 async-stream = { workspace = true }

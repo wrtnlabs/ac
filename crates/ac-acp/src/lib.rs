@@ -457,14 +457,18 @@ async fn run_prompt(
             Err(RuntimeError::MaxIterations(_)) => {
                 Ok(PromptResponse::new(StopReason::MaxTurnRequests))
             }
-            Err(e @ (RuntimeError::Timeout | RuntimeError::Completion(_))) => Err(e.to_string()),
+            Err(
+                e @ (RuntimeError::Timeout
+                | RuntimeError::Completion(_)
+                | RuntimeError::Compaction(_)),
+            ) => Err(e.to_string()),
         }
     };
 
     // A cancelled token can't be reset: rebuild the session from its own
     // history with a fresh context so the next prompt works.
     if matches!(result, Err(RuntimeError::Cancelled)) {
-        let history = entry.session.messages().to_vec();
+        let history = entry.session.messages();
         let persisted = entry.persisted;
         let cwd = entry.cwd.clone();
         drop(entry);
@@ -580,8 +584,12 @@ fn event_update(event: AgentEvent, context_window: u64) -> Option<SessionUpdate>
             )))
         }
         // The stop reason rides the PromptResponse; errors ride the JSON-RPC
-        // error response. Neither is a session update.
-        AgentEvent::TurnComplete { .. } | AgentEvent::Error(_) => None,
+        // error response. Neither is a session update. Compaction is recorded in
+        // the session log and surfaced live on other transports; an ACP-native
+        // notice for it is a deferred follow-up, not a conversational message.
+        AgentEvent::TurnComplete { .. } | AgentEvent::Error(_) | AgentEvent::Compacted { .. } => {
+            None
+        }
     }
 }
 

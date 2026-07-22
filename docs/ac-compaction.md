@@ -1,6 +1,13 @@
 # RFC: Context compaction
 
-**Status:** design of record — accepted, not yet implemented (2026-07-21).
+**Status:** implemented — specification of record (2026-07-22). The lifecycle
+ships in the runtime's run loop over the append-only session log of
+[ac-fork.md](ac-fork.md): the manual, pre-turn, and mid-turn triggers and the
+*summarize* and *fresh-window* strategies are built, each appending a `κ` record
+that carries `σ` and its trigger. The **model-switch** trigger is realized as
+host-invoked manual compaction before a swap (context-compatibility is host and
+provider knowledge, not the runtime's — §4); the **delegated** strategy remains
+deferred (§7).
 **Requires:** [ac-fork.md](ac-fork.md) (compaction is an event in the session log).
 **Required by:** [ac-context.md](ac-context.md), [ac-hooks.md](ac-hooks.md).
 **Interacts with:** [ac-queue-steer.md](ac-queue-steer.md) §4 (post-compaction drain deferral).
@@ -91,6 +98,13 @@ on two orthogonal axes.
 stable cached prefix from `τ` — a large invariant prefix (cached at the provider) consumes no
 marginal cost and ought not trigger compaction.
 
+`τ` is measured from **provider-reported usage** (the authoritative token count of the last
+round-trip), never client-side tokenization. Where a server figure does not yet exist — the
+instant *after* a transformation, and on resume before the first round-trip — an intrinsic
+size estimate stands in for `τ`. The estimate serves two bounded purposes only: it prevents a
+stale pre-compaction figure from re-firing a trigger before the next real usage lands, and it
+backs the R3 effectiveness check. It never overrides a real measurement.
+
 **Strategies** (how `σ` is produced):
 
 | Strategy | `σ` | Use |
@@ -113,8 +127,14 @@ re-establish its interrupted work against `H′` before new user intent lands, o
 interpreted against a context the model has not yet re-entered. This is the single coupling
 between the two designs, and it lives in the run loop's drain discipline, not in `C`.
 
-Compaction turns are **non-steerable** ([ac-queue-steer.md](ac-queue-steer.md) §3): user
-intent cannot coherently join a history transformation in progress.
+The steerability of a compaction depends on whether it *is* a turn or is *inside* one. A
+**dedicated** compaction turn — a manual compaction, which is a turn in its own right — is
+**non-steerable** ([ac-queue-steer.md](ac-queue-steer.md) §3): user intent cannot coherently
+join a history transformation that constitutes the whole turn, so a steer is refused. An
+**in-flight** compaction (pre-turn or mid-turn) is a phase *within* a regular, steerable turn;
+a steer submitted while it runs is not refused but **deferred** by the rule above — it lands
+against `H′`, once, after the model has re-established. Both readings share the same guarantee:
+new user intent never lands on a half-transformed history.
 
 ## 6. Invariants
 
@@ -133,10 +153,22 @@ intent cannot coherently join a history transformation in progress.
 
 - The delegated strategy's transport — a service contract, reserved lifecycle slot, no design
   needed yet.
+- The **injected-fragment recognition predicate** (R2). Until [ac-context.md](ac-context.md)
+  supplies it, `U` is the set of user-role messages that carry text and no tool result — which
+  correctly excludes tool traffic but also retains any runtime-injected user-role fragment (an
+  interruption marker, a future context fragment) verbatim. A benign over-inclusion: such
+  fragments are small and re-established per window anyway. The predicate lands with the context
+  design that owns the persistent/reactive distinction.
 - A metrics taxonomy (trigger/phase/strategy/outcome) — adopt the shape when a metrics seam
   exists; a telemetry dependency is not justified by it.
 - Mid-stream reduction of individual oversized tool outputs — a different problem (bounded
   capture at the tool layer already addresses its worst case); revisit with evidence.
+- **A single user input larger than the whole budget.** When the history is *only* user input
+  (no agent traffic to summarize), compaction has nothing to do and the turn proceeds
+  uncompacted — even if one pasted input alone exceeds `β`. The per-message cap (R2) that would
+  bound it is not applied in this degenerate case, because "cap a lone user message" is a
+  different operation from "compact a task," with its own fidelity cost. Rare in practice; the
+  provider's own context-overflow error is the backstop. Revisit if it shows up.
 
 ---
 *Provenance: this design distills the compaction system of a production agent runtime

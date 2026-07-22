@@ -177,6 +177,26 @@ impl ChunkEncoder {
                     }
                 }));
             }
+            // A context compaction is a transient notification, not part of the
+            // message the client keeps — it rides a `data-*` part with
+            // `transient: true` so a client can surface "context compacted"
+            // without it entering the persisted message.
+            AgentEvent::Compacted {
+                trigger,
+                tokens_before,
+                tokens_after,
+                ..
+            } => {
+                out.push(json!({
+                    "type": "data-compaction",
+                    "data": {
+                        "trigger": trigger,
+                        "tokensBefore": tokens_before,
+                        "tokensAfter": tokens_after,
+                    },
+                    "transient": true,
+                }));
+            }
             // The turn outcome rides finish(); a mid-turn error becomes an
             // error chunk so the client surfaces it. Close any open part first
             // so the stream stays well-formed.

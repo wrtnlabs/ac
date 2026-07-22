@@ -42,7 +42,7 @@ async fn a_session_survives_a_process_boundary() {
         assert!(matches!(stop, StopReason::EndTurn));
 
         store
-            .append_messages(&record.id, session.messages(), None)
+            .append_messages(&record.id, &session.messages(), None)
             .unwrap();
         record.id
         // store, session, provider all drop here — the "process" is gone.

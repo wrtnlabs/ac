@@ -37,7 +37,15 @@ pub enum RolloutItem {
     /// history that becomes the effective view from here
     /// ([docs/ac-compaction.md]).
     Compacted {
+        /// The handoff summary `σ` (empty for a fresh-window compaction).
         summary: String,
+        /// Which trigger fired this compaction — the *one* field that
+        /// distinguishes compactions ([docs/ac-compaction.md] §4, R4). Audit
+        /// metadata; the projection ignores it. `#[serde(default)]` so logs
+        /// written before this field parse back (user data — compat allowed).
+        #[serde(default)]
+        trigger: String,
+        /// The replacement history `H′` that becomes the effective view.
         replacement: Vec<Message>,
     },
     /// A rewind marker `ρ(k)`: the last `turns` turns are dropped from the

@@ -55,9 +55,10 @@ containment, reinforced at the kernel by the **sandbox** ([ac-sandbox.md](ac-san
 code. Everything the agent does is emitted as one typed **event stream**
 ([ac-events.md](ac-events.md)), off which every **serving adapter**
 ([ac-serving.md](ac-serving.md)) is a thin, logic-free map — clients speak a wire protocol and
-never link the runtime. Sessions persist through a store today and, by accepted design, an
+never link the runtime. Sessions are backed in the runtime by an
 append-only **log** ([ac-fork.md](ac-fork.md)) that makes branching, rewind, and
-**compaction** ([ac-compaction.md](ac-compaction.md)) pure projections; mid-turn input
+**compaction** ([ac-compaction.md](ac-compaction.md)) pure projections of it, and persist
+through a store (the flat view) or the log itself; mid-turn input
 **steers** the running turn ([ac-queue-steer.md](ac-queue-steer.md)).
 
 ## 5. Reading order
@@ -85,7 +86,7 @@ append-only **log** ([ac-fork.md](ac-fork.md)) that makes branching, rewind, and
 | Document | Subject |
 | --- | --- |
 | [ac-fork.md](ac-fork.md) | the append-only session log; forking and rewind *(implemented: `ac-rollout`)* |
-| [ac-compaction.md](ac-compaction.md) | context compaction as an agent-to-agent handoff |
+| [ac-compaction.md](ac-compaction.md) | context compaction as an agent-to-agent handoff *(implemented)* |
 | [ac-queue-steer.md](ac-queue-steer.md) | mid-turn input steering *(implemented)* |
 | [ac-approvals.md](ac-approvals.md) | pre-flight intent classification and approval routing |
 | [ac-context.md](ac-context.md) | marked fragments, injection cadence, budgeted rendering |

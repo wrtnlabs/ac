@@ -138,6 +138,7 @@ version = "0.1.0"
 dependencies = [
  "ac-provider",
  "ac-provider-mock",
+ "ac-rollout",
  "ac-tool",
  "ac-types",
  "async-stream",

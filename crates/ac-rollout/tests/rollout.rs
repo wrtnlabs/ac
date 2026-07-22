@@ -46,7 +46,11 @@ fn projection_accumulates_messages_and_ignores_boundaries() {
 fn compaction_replaces_the_view_but_keeps_the_record() {
     let mut log = Rollout::create();
     turn(&mut log, 1, &[user("long q"), assistant("long a")]);
-    log.compact("handoff summary", vec![user("q1"), assistant("SUMMARY")]);
+    log.compact(
+        "handoff summary",
+        "manual",
+        vec![user("q1"), assistant("SUMMARY")],
+    );
     turn(&mut log, 2, &[user("q2")]);
 
     // The effective view is the replacement plus what followed — the
@@ -79,6 +83,42 @@ fn rewind_drops_the_last_turns_from_the_view_only() {
     // A subsequent turn builds on the rewound view.
     turn(&mut log, 4, &[user("q4")]);
     assert_eq!(texts(&log.project()), vec!["q1", "a1", "q4"]);
+}
+
+#[test]
+fn rewind_after_a_mid_turn_compaction_counts_the_compacted_turn() {
+    // A compaction can fire *inside* an open turn (the mid-turn trigger). The
+    // fold must not let that erase the turn's rewind boundary.
+    let mut log = Rollout::create();
+    turn(&mut log, 1, &[user("q1"), assistant("a1")]);
+    log.start_turn(2);
+    log.record_message(user("q2"));
+    log.record_message(assistant("tool"));
+    log.compact(
+        "summary",
+        "mid_turn",
+        vec![user("q1"), assistant("SUMMARY")],
+    );
+    log.record_message(assistant("continued"));
+    log.end_turn(2);
+    turn(&mut log, 3, &[user("q3"), assistant("a3")]);
+
+    assert_eq!(
+        texts(&log.project()),
+        vec!["q1", "SUMMARY", "continued", "q3", "a3"]
+    );
+
+    // Rewind one turn → turn 3 gone; the compacted turn 2 remains.
+    let mut r1 = log.clone();
+    r1.rewind(1).unwrap();
+    assert_eq!(texts(&r1.project()), vec!["q1", "SUMMARY", "continued"]);
+
+    // Rewind two turns → turn 3 and turn 2's continuation gone, back to the
+    // compaction checkpoint. (Regression: recording κ inside the open turn used
+    // to erase turn 2's boundary, making this rewind stop short at "continued".)
+    let mut r2 = log.clone();
+    r2.rewind(2).unwrap();
+    assert_eq!(texts(&r2.project()), vec!["q1", "SUMMARY"]);
 }
 
 #[test]
@@ -169,7 +209,7 @@ fn forking_the_whole_log_on_a_clean_boundary_needs_no_marker() {
 fn fork_before_a_compaction_yields_the_pre_compaction_view() {
     let mut log = Rollout::create();
     turn(&mut log, 1, &[user("q1"), assistant("a1")]);
-    log.compact("summary", vec![user("q1"), assistant("SUMMARY")]);
+    log.compact("summary", "manual", vec![user("q1"), assistant("SUMMARY")]);
     turn(&mut log, 2, &[user("q2")]);
 
     // Fork before turn 2 — the prefix includes the compaction, so the branch
@@ -186,7 +226,7 @@ fn fork_before_a_compaction_yields_the_pre_compaction_view() {
 fn jsonl_round_trips_and_is_fault_tolerant_and_first_head_canonical() {
     let mut log = Rollout::create();
     turn(&mut log, 1, &[user("q1"), assistant("a1")]);
-    log.compact("s", vec![user("baseline")]);
+    log.compact("s", "manual", vec![user("baseline")]);
     let jsonl = log.to_jsonl();
 
     let loaded = Rollout::from_jsonl(&jsonl).unwrap();
