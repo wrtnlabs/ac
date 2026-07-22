@@ -98,6 +98,12 @@ append-only **log** ([ac-fork.md](ac-fork.md)) that makes branching, rewind, and
 | [ac-security.md](ac-security.md) | the threat model and the boundary register |
 | [ac-testing.md](ac-testing.md) | the proof classes and their obligations |
 
+**Reference — explainers, not commitments:**
+
+| Document | Subject |
+| --- | --- |
+| [ac-ultra.md](ac-ultra.md) | effort vs. "ultra": reasoning budget (a model parameter) vs. orchestration (a harness mode) |
+
 ## 6. Standing doctrine (the short list)
 
 - **Errors are data.** A tool's failure is a result the model reads and recovers from;
@@ -120,5 +126,6 @@ append-only **log** ([ac-fork.md](ac-fork.md)) that makes branching, rewind, and
 
 - A UI, a product, or opinions about either.
 - A plugin marketplace or dynamic code loading; skills are text, extensions are compiled.
+- Multi-agent orchestration (sub-agent spawn/delegate) — deliberately unspecced; see [ac-ultra.md](ac-ultra.md). It earns its own document if and when adopted, not before.
 - Multi-tenant service duty: the kit assumes it acts *for one user on their machine*; hosts
   that serve many users own that isolation.
