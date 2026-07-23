@@ -11,15 +11,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ac_provider::{Provider, ServerTool};
-use ac_runtime::{AgentConfig, Session};
+use ac_runtime::{AgentConfig, ReferenceSpawner, Session};
 use ac_skills::{
     Skill, SkillLayer, SkillsResolver, build_skill_injections, catalog_markdown,
     extract_skill_mentions, select_skills_for_mentions,
 };
 use ac_tool::{
-    GrantedReadPolicy, NetworkMode, PathPolicy, ReadGrants, SandboxPolicy, SubtreePolicy, ToolCtx,
-    ToolRegistry,
+    AgentDefinition, GrantedReadPolicy, NetworkMode, PathPolicy, ReadGrants, ReadOnlyPolicy,
+    SandboxPolicy, SpawnRequest, SubtreePolicy, ToolCtx, ToolRegistry, ToolScope, as_dyn,
 };
+use ac_tools::{EditFile, Fetch, Glob, Grep, ListFiles, ReadFile, Shell, Task, WriteFile};
+use tokio_util::sync::CancellationToken;
 
 /// Build the OS-sandbox policy for the generic host: writes contained to the
 /// workspace, reads to the workspace, the mandatory secret set denied, and
@@ -59,6 +61,87 @@ pub fn generic_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     ac_tools::register_builtins(&mut registry);
     registry
+}
+
+/// The sub-agent definitions the generic host ships when delegation is enabled
+/// ([docs/ac-subagents.md]): a read-only researcher and a full-toolset worker.
+/// These are host content — the kit ships only the [`AgentDefinition`] shape.
+pub fn subagent_definitions() -> Vec<AgentDefinition> {
+    vec![
+        AgentDefinition::new(
+            "explore",
+            "Read-only researcher: reads, lists, searches files and fetches URLs, but cannot \
+             write or run shell. Delegate investigation to it so it spends its own context, not \
+             yours, and returns a synthesis.",
+        )
+        .with_prompt(
+            "You are a read-only research sub-agent. Investigate exactly what you were asked \
+             using only read, list, glob, grep, and fetch — you cannot write files or run shell. \
+             Return a concise synthesis of what you found.",
+        )
+        .with_tools(ToolScope::Allow(vec![
+            "read_file".into(),
+            "list_files".into(),
+            "glob".into(),
+            "grep".into(),
+            "fetch".into(),
+        ]))
+        .read_only(),
+        AgentDefinition::new(
+            "general",
+            "General worker with the full file and shell toolset. Delegate a self-contained \
+             sub-task and it carries it out end to end and reports the result.",
+        )
+        .with_prompt(SYSTEM_PROMPT)
+        .with_tools(ToolScope::All),
+    ]
+}
+
+/// A child's tool surface, built from its definition: the built-ins the
+/// definition admits, and never the delegation tool (which is not a built-in —
+/// the recursion guard). A read-only definition narrows the *policy* below; its
+/// `ToolScope` already lists only read tools.
+fn child_registry(def: &AgentDefinition) -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    if def.tools.admits("read_file") {
+        r.register(ReadFile);
+    }
+    if def.tools.admits("write_file") {
+        r.register(WriteFile);
+    }
+    if def.tools.admits("edit_file") {
+        r.register(EditFile);
+    }
+    if def.tools.admits("list_files") {
+        r.register(ListFiles);
+    }
+    if def.tools.admits("glob") {
+        r.register(Glob);
+    }
+    if def.tools.admits("grep") {
+        r.register(Grep);
+    }
+    if def.tools.admits("shell") {
+        r.register(Shell);
+    }
+    if def.tools.admits("fetch") {
+        r.register(Fetch);
+    }
+    r
+}
+
+/// The sub-agent catalog appended to the parent's system prompt, so the model
+/// knows whom it can delegate to via the `task` tool.
+fn agents_catalog(defs: &[AgentDefinition]) -> String {
+    let mut s = String::from(
+        "## Sub-agents\n\nYou may delegate a scoped, self-contained sub-task to a sub-agent with \
+         the `task` tool (pass `agent` and a `prompt`). The sub-agent runs in its own context and \
+         returns only its result. Available agents:\n",
+    );
+    for d in defs {
+        s.push_str(&format!("- `{}` — {}\n", d.name, d.description));
+    }
+    s
 }
 
 /// The host's skills wiring, codex-style: a resolver over the skills root
@@ -105,6 +188,11 @@ pub struct HostOptions {
     /// kernel guarantee of no egress (the strong exfil gate); on keeps
     /// network-using commands (git, package managers) working.
     pub sandbox_network: bool,
+    /// Enable sub-agent delegation ([docs/ac-subagents.md]): register the `task`
+    /// tool, install a [`ReferenceSpawner`] that runs children (the `explore`
+    /// and `general` definitions) contained to the same workspace, and append
+    /// the agent catalog to the system prompt. Off by default.
+    pub subagents: bool,
 }
 
 /// Compose the actual turn input from the user's prompt: extract `$name`
@@ -253,8 +341,57 @@ pub fn build_host(
         }
         tool_ctx = tool_ctx.with_sandbox(Arc::new(ac_sandbox::OsSandbox::new(sandbox_policy)));
     }
+
+    // Sub-agent delegation: install a reference spawner that runs children
+    // contained to the same workspace, and advertise the agents in the prompt.
+    // The child assembler builds each child with NO spawner (the recursion
+    // guard) and a cancellation token derived from the parent's.
+    if options.subagents {
+        let defs = subagent_definitions();
+        system.push_str("\n\n");
+        system.push_str(&agents_catalog(&defs));
+
+        let child_provider = provider.clone();
+        let child_dir = canonical.clone();
+        let base_model = model.clone();
+        let assemble = move |req: &SpawnRequest, cancel: CancellationToken| -> Option<Session> {
+            let def = defs.iter().find(|d| d.name == req.agent)?;
+            let base = SubtreePolicy::new(&child_dir).ok()?;
+            let policy: Arc<dyn PathPolicy> = if def.read_only {
+                Arc::new(ReadOnlyPolicy::new(Arc::new(base)))
+            } else {
+                Arc::new(base)
+            };
+            // No `.with_spawner(...)` — the omission is the recursion guard.
+            let child_ctx = ToolCtx::new(policy).with_cancel(cancel);
+            let child_config = AgentConfig {
+                model: req
+                    .model
+                    .clone()
+                    .or_else(|| def.model.clone())
+                    .unwrap_or_else(|| base_model.clone()),
+                system: def.prompt.clone(),
+                max_iterations: MAX_ITERATIONS,
+                ..Default::default()
+            };
+            Some(Session::new(
+                child_provider.clone(),
+                Arc::new(child_registry(def)),
+                Arc::new(child_ctx),
+                child_config,
+            ))
+        };
+        tool_ctx = tool_ctx.with_spawner(as_dyn(ReferenceSpawner::new(assemble)));
+    }
+
     let ctx = Arc::new(tool_ctx);
-    let registry = Arc::new(generic_registry());
+    let registry = Arc::new({
+        let mut r = generic_registry();
+        if options.subagents {
+            r.register(Task);
+        }
+        r
+    });
 
     let mut server_tools = Vec::new();
     if options.web_search {

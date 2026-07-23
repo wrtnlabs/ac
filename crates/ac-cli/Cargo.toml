@@ -26,9 +26,11 @@ anyhow = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 ac-provider-mock = { workspace = true }
+ac-provider-openrouter = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }

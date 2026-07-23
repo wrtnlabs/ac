@@ -21,6 +21,7 @@ struct Args {
     skill: Option<String>,
     sandbox: bool,
     sandbox_network: bool,
+    subagents: bool,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -34,6 +35,7 @@ fn parse_args() -> anyhow::Result<Args> {
     // opts out; `--sandbox-no-network` keeps the sandbox but cuts egress.
     let mut sandbox = true;
     let mut sandbox_network = true;
+    let mut subagents = false;
     let mut rest: Vec<String> = Vec::new();
 
     let mut it = std::env::args().skip(1);
@@ -53,6 +55,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--web-search" => web_search = true,
             "--no-sandbox" => sandbox = false,
             "--sandbox-no-network" => sandbox_network = false,
+            "--subagents" => subagents = true,
             "--skills" => {
                 let v = it
                     .next()
@@ -73,7 +76,7 @@ fn parse_args() -> anyhow::Result<Args> {
     if prompt.trim().is_empty() {
         anyhow::bail!(
             "usage: ac [--model <id>] [--dir <path>] [--web-search] [--skills <dir>] \
-             [--skill <name>] [--no-sandbox] [--sandbox-no-network] <prompt...>"
+             [--skill <name>] [--no-sandbox] [--sandbox-no-network] [--subagents] <prompt...>"
         );
     }
 
@@ -91,6 +94,7 @@ fn parse_args() -> anyhow::Result<Args> {
         skill,
         sandbox,
         sandbox_network,
+        subagents,
     })
 }
 
@@ -114,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         skill: args.skill,
         sandbox: args.sandbox,
         sandbox_network: args.sandbox_network,
+        subagents: args.subagents,
     };
     let host = build_host(provider, &args.dir, args.model, options)?;
     // Skill mentions ($name) and the --skill selection inject SKILL.md bodies
