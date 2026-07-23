@@ -6,10 +6,12 @@ and `injected(t)` (§2–§3, I1), the reactive change-detection primitive `emit
 budgeted-catalog renderer with the D0–D3 ladder, reports, and host warnings (§6, I3–I4).
 Recognition is wired into compaction — the handoff and the interruption marker are registered
 fragment classes, filtered from the verbatim user set `U` (§3.1), replacing the earlier
-one-off. The live **cadence drivers** (§4: window-establishment injection, per-turn mention
-injection, per-turn reactive evaluation against real sections) are the integration layer a host
-wires over this machinery (§8) and land with a concrete host consumer; **dominance** (§6) and
-snapshot persistence (§9) remain deferred.
+one-off. The **reactive (ℛ) cadence driver** (§4–§5) is now implemented and wired into the loop
+(`ReactiveSection` + the runtime's step-boundary `drive_reactive`), with its prior derived from
+`E(L)` so a compaction strip re-injects and resume/fork continue the logged value — its first
+consumer is the delegation-mode injection of [ac-ultra.md](ac-ultra.md) §4. The remaining live
+drivers (§4 window-establishment and per-turn mention injection), **dominance** (§6), and snapshot
+persistence (§9) stay deferred until their own consumers arrive.
 **Requires:** [ac-compaction.md](ac-compaction.md) §3 (`context′`; its R2 verbatim-user rule
 depends on the recognition predicate below). **Interacts with:** [ac-skills.md](ac-skills.md)
 (catalog and body injections instantiate 𝒲 and 𝒯; deferred catalog budgeting is §6 here);

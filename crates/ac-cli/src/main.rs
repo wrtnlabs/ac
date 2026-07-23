@@ -23,6 +23,7 @@ struct Args {
     sandbox_network: bool,
     subagents: bool,
     effort: Option<Effort>,
+    ultra: bool,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -38,6 +39,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut sandbox_network = true;
     let mut subagents = false;
     let mut effort: Option<Effort> = None;
+    let mut ultra = false;
     let mut rest: Vec<String> = Vec::new();
 
     let mut it = std::env::args().skip(1);
@@ -58,6 +60,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--no-sandbox" => sandbox = false,
             "--sandbox-no-network" => sandbox_network = false,
             "--subagents" => subagents = true,
+            "--ultra" => ultra = true,
             "--effort" => {
                 let v = it
                     .next()
@@ -87,7 +90,7 @@ fn parse_args() -> anyhow::Result<Args> {
         anyhow::bail!(
             "usage: ac [--model <id>] [--dir <path>] [--web-search] [--skills <dir>] \
              [--skill <name>] [--no-sandbox] [--sandbox-no-network] [--subagents] \
-             [--effort <low|medium|high|max>] <prompt...>"
+             [--effort <low|medium|high|max>] [--ultra] <prompt...>"
         );
     }
 
@@ -107,6 +110,7 @@ fn parse_args() -> anyhow::Result<Args> {
         sandbox_network,
         subagents,
         effort,
+        ultra,
     })
 }
 
@@ -132,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
         sandbox_network: args.sandbox_network,
         subagents: args.subagents,
         effort: args.effort,
+        ultra: args.ultra,
     };
     let host = build_host(provider, &args.dir, args.model, options)?;
     // Skill mentions ($name) and the --skill selection inject SKILL.md bodies

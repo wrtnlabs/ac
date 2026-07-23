@@ -92,7 +92,7 @@ through a store (the flat view) or the log itself; mid-turn input
 | [ac-context.md](ac-context.md) | marked fragments, injection cadence, budgeted rendering *(machinery implemented: `ac-context`)* |
 | [ac-hooks.md](ac-hooks.md) | the lifecycle-phase taxonomy for extension seams *(machinery implemented: step-prepare + observation)* |
 | [ac-subagents.md](ac-subagents.md) | delegation as an injected spawn capability; the child as a fresh session *(design of record — proposed)* |
-| [ac-ultra.md](ac-ultra.md) | effort as a request parameter + a delegation-mode injection; "ultra" as a host composition over the seam *(design of record — proposed)* |
+| [ac-ultra.md](ac-ultra.md) | effort as a request parameter + a delegation-mode injection; "ultra" as a host composition over the seam *(implemented + live-proven; host composition)* |
 
 **Doctrine — in force:**
 

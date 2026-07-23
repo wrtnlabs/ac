@@ -54,6 +54,7 @@ version = "0.1.0"
 name = "ac-cli"
 version = "0.1.0"
 dependencies = [
+ "ac-context",
  "ac-provider",
  "ac-provider-mock",
  "ac-provider-openrouter",

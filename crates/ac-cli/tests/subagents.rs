@@ -212,3 +212,109 @@ async fn live_parent_delegates_to_a_child_that_writes_a_file() {
     );
     eprintln!("live sub-agent proof: proof.txt = {contents:?}");
 }
+
+#[tokio::test]
+async fn ultra_injects_proactive_delegation_and_max_effort_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![vec![text("ok"), stop_end()]]);
+    let handle = provider.clone();
+    let host = build_host(
+        Arc::new(provider),
+        dir.path(),
+        "mock/model".to_string(),
+        HostOptions {
+            ultra: true,
+            ..Default::default()
+        },
+    )
+    .expect("build_host with ultra");
+
+    // Ultra exposes the mid-session flip handle.
+    assert!(
+        host.delegation_mode.is_some(),
+        "ultra exposes the flip handle"
+    );
+
+    let (result, _events) = run(host.session, "do the work").await;
+    assert_eq!(result.unwrap(), StopReason::EndTurn);
+
+    let reqs = handle.requests();
+    // The parent's request carries the PROACTIVE delegation instruction, injected
+    // at session start by the reactive driver.
+    let proactive = reqs[0].messages.iter().any(|m| {
+        m.content.iter().any(
+            |p| matches!(p, ac_types::ContentPart::Text { text } if text.contains("PROACTIVELY")),
+        )
+    });
+    assert!(proactive, "ultra must inject the proactive delegation mode");
+    // ...and effort defaults to Max (an explicit --effort would win).
+    assert_eq!(
+        reqs[0].effort,
+        Some(Effort::Max),
+        "ultra defaults effort to Max"
+    );
+}
+
+/// The ultra payoff, live: under `--ultra` a real model — told NOTHING about
+/// delegating — proactively fans a parallelizable task out to sub-agents, which
+/// do the work on disk. This is the whole feature end to end (seam + effort +
+/// proactive-mode injection).
+///
+/// Run: OPENROUTER_API_KEY=sk-or-... cargo test -p ac-cli --test subagents -- --ignored
+#[tokio::test]
+#[ignore = "hits the live OpenRouter API; requires OPENROUTER_API_KEY"]
+async fn live_ultra_proactively_delegates() {
+    use ac_provider_openrouter::OpenRouter;
+
+    let api_key = std::env::var("OPENROUTER_API_KEY")
+        .expect("set OPENROUTER_API_KEY to run the live ultra proof");
+    let model =
+        std::env::var("AC_LIVE_MODEL").unwrap_or_else(|_| "anthropic/claude-sonnet-5".to_string());
+
+    let dir = tempfile::tempdir().unwrap();
+    let host = build_host(
+        Arc::new(OpenRouter::new(api_key)),
+        dir.path(),
+        model,
+        HostOptions {
+            ultra: true,
+            ..Default::default()
+        },
+    )
+    .expect("build_host with ultra");
+
+    // Three independent jobs. The prompt does NOT mention sub-agents or the task
+    // tool — proactive delegation must come from the injected standing mode.
+    let prompt = "I have three independent, self-contained jobs. Job 1: create a file `alpha.txt` \
+                  in the working directory containing exactly the word ALPHA. Job 2: create \
+                  `beta.txt` containing exactly BETA. Job 3: create `gamma.txt` containing exactly \
+                  GAMMA. The three jobs do not depend on each other.";
+    let (result, events) = run(host.session, prompt).await;
+    assert_eq!(
+        result.expect("the live ultra turn must complete"),
+        StopReason::EndTurn
+    );
+
+    // The whole point: under the proactive mode the model delegated, unprompted.
+    assert!(
+        saw_task_call(&events),
+        "ultra's proactive delegation mode should have induced a task-tool call"
+    );
+    // And the sub-agents actually did the work.
+    for (file, word) in [
+        ("alpha.txt", "ALPHA"),
+        ("beta.txt", "BETA"),
+        ("gamma.txt", "GAMMA"),
+    ] {
+        let got = std::fs::read_to_string(dir.path().join(file)).unwrap_or_default();
+        assert!(
+            got.contains(word),
+            "{file} must contain {word}, got {got:?}"
+        );
+    }
+    let delegations = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "task"))
+        .count();
+    eprintln!("live ultra proof: {delegations} proactive delegation(s); all three files written");
+}

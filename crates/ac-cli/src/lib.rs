@@ -8,8 +8,9 @@
 //! contained to a directory. It must never grow app-specific behavior.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use ac_context::{Cadence, FragmentClass, ReactiveSection};
 use ac_provider::{Provider, ServerTool};
 use ac_runtime::{AgentConfig, ReferenceSpawner, Session};
 use ac_skills::{
@@ -146,6 +147,69 @@ fn agents_catalog(defs: &[AgentDefinition]) -> String {
     s
 }
 
+/// The delegation policy the parent agent is told to follow ([docs/ac-ultra.md]
+/// §4). Flipping it emits a superseding standing-instruction fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationMode {
+    /// Delegate only when the user asks (the baseline).
+    OnRequest,
+    /// Delegate proactively whenever parallel work helps (the "ultra" policy).
+    Proactive,
+}
+
+/// A reactive section that injects the current delegation-mode standing
+/// instruction ([docs/ac-ultra.md] §4). The prose here is host content; the kit
+/// owns the reactive driver and the fragment recognition. The shared handle lets
+/// the host flip the mode mid-session — the next turn boundary emits the change.
+pub struct DelegationModeSection {
+    class: FragmentClass,
+    mode: Arc<Mutex<DelegationMode>>,
+}
+
+impl DelegationModeSection {
+    pub fn new(mode: Arc<Mutex<DelegationMode>>) -> Self {
+        Self {
+            // Markers improbable in organic text; the reactive driver registers
+            // this class so the fragment is recognized (stripped on compaction,
+            // filtered from user input).
+            class: FragmentClass::new(
+                "delegation-mode",
+                ac_types::Role::User,
+                "[[delegation-mode]]",
+                "[[/delegation-mode]]",
+                Some(Cadence::Reactive),
+                4096,
+            ),
+            mode,
+        }
+    }
+}
+
+impl ReactiveSection for DelegationModeSection {
+    fn class(&self) -> &FragmentClass {
+        &self.class
+    }
+    fn body(&self) -> Option<String> {
+        Some(
+            match *self.mode.lock().expect("delegation-mode lock poisoned") {
+                DelegationMode::OnRequest => {
+                    "Delegation policy: delegate to a sub-agent only when the user explicitly asks."
+                        .to_string()
+                }
+                DelegationMode::Proactive => {
+                    "Delegation policy: delegate PROACTIVELY. When a task \
+                     has independent parts that parallel sub-agents could do faster or better, use \
+                     the `task` tool to fan them out concurrently in one step, then synthesize \
+                     their results. Do not do serially what you can delegate in parallel; spend \
+                     sub-agents' context on research and self-contained sub-tasks rather than your \
+                     own."
+                        .to_string()
+                }
+            },
+        )
+    }
+}
+
 /// The host's skills wiring, codex-style: a resolver over the skills root
 /// plus any skills selected up front (the `--skill` flag — the structured
 /// equivalent of a `$mention`). There is no skill tool; the catalog sits in
@@ -162,6 +226,9 @@ pub struct GenericHost {
     pub session: Session,
     pub ctx: Arc<ToolCtx>,
     pub skills: Option<HostSkills>,
+    /// The delegation-mode flip handle, present under `--ultra`: a host may set
+    /// it mid-session and the next turn emits the change ([docs/ac-ultra.md] §5).
+    pub delegation_mode: Option<Arc<Mutex<DelegationMode>>>,
 }
 
 /// Options for [`build_host`] beyond the required provider/dir/model.
@@ -199,6 +266,11 @@ pub struct HostOptions {
     /// applied to every request and to children that neither the spawn request
     /// nor the agent definition overrides. `None` uses the provider's default.
     pub effort: Option<Effort>,
+    /// "Ultra" ([docs/ac-ultra.md] §5) — the host composition: force sub-agents
+    /// on, default the effort to `Max`, and inject the *proactive* delegation
+    /// mode. This is a host switch, not a kit primitive; the kit never maps
+    /// effort to a delegation policy.
+    pub ultra: bool,
 }
 
 /// Compose the actual turn input from the user's prompt: extract `$name`
@@ -244,6 +316,15 @@ pub fn build_host(
     let subtree = SubtreePolicy::new(dir)
         .map_err(|e| anyhow::anyhow!("cannot use directory {}: {e}", dir.display()))?;
     let canonical = subtree.root();
+
+    // "Ultra" ([docs/ac-ultra.md] §5) is a host composition: it forces sub-agents
+    // on, defaults effort to Max (an explicit `--effort` still wins), and injects
+    // the proactive delegation mode (installed after the session is built). The
+    // kit is untouched — this is all host policy.
+    let subagents = options.subagents || options.ultra;
+    let effort = options
+        .effort
+        .or_else(|| options.ultra.then_some(Effort::Max));
 
     // Resolve skills before containment is assembled: the catalog advertises
     // each skill's CANONICAL SKILL.md path, so the read grants below must
@@ -352,7 +433,7 @@ pub fn build_host(
     // contained to the same workspace, and advertise the agents in the prompt.
     // The child assembler builds each child with NO spawner (the recursion
     // guard) and a cancellation token derived from the parent's.
-    if options.subagents {
+    if subagents {
         let defs = subagent_definitions();
         system.push_str("\n\n");
         system.push_str(&agents_catalog(&defs));
@@ -360,7 +441,7 @@ pub fn build_host(
         let child_provider = provider.clone();
         let child_dir = canonical.clone();
         let base_model = model.clone();
-        let base_effort = options.effort;
+        let base_effort = effort;
         let assemble = move |req: &SpawnRequest, cancel: CancellationToken| -> Option<Session> {
             let def = defs.iter().find(|d| d.name == req.agent)?;
             let base = SubtreePolicy::new(&child_dir).ok()?;
@@ -396,7 +477,7 @@ pub fn build_host(
     let ctx = Arc::new(tool_ctx);
     let registry = Arc::new({
         let mut r = generic_registry();
-        if options.subagents {
+        if subagents {
             r.register(Task);
         }
         r
@@ -424,15 +505,26 @@ pub fn build_host(
         system: Some(system),
         max_iterations: MAX_ITERATIONS,
         server_tools,
-        effort: options.effort,
+        effort,
         ..Default::default()
     };
 
-    let session = Session::new(provider, registry, ctx.clone(), config);
+    let mut session = Session::new(provider, registry, ctx.clone(), config);
+
+    // Under ultra, inject the proactive delegation mode as a reactive section and
+    // hand the flip handle back so the host can change it mid-session (§4/§5).
+    let delegation_mode = if options.ultra {
+        let handle = Arc::new(Mutex::new(DelegationMode::Proactive));
+        session.add_reactive_section(Arc::new(DelegationModeSection::new(handle.clone())));
+        Some(handle)
+    } else {
+        None
+    };
 
     Ok(GenericHost {
         session,
         ctx,
         skills,
+        delegation_mode,
     })
 }

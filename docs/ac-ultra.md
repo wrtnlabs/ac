@@ -1,11 +1,12 @@
 # RFC: Effort and "ultra" — the reasoning dial, the orchestration dial, and their assembly
 
-**Status:** design of record — proposed (2026-07-23). Supersedes the earlier explainer anchor;
-the conceptual split it recorded (§1–§2 below) is unchanged, and this document now specifies what
-to build. The **sub-agent seam** ultra rides is already implemented and live-proven
-([ac-subagents.md](ac-subagents.md)); the two missing ingredients — an **effort request
-parameter** (§3) and a **delegation-mode standing injection** (§4) — plus the **host assembly**
-(§5) are proposed here. Decisions are locked pending review sign-off; implementation has not begun.
+**Status:** implemented — specification of record (2026-07-23), and **live-proven**: under a host
+`--ultra` switch, a real model told nothing about delegating fanned a parallelizable task out to
+sub-agents on its own, at max effort. All three ingredients ship: the **effort request parameter**
+(§3, in `ac-types`/`ac-provider`/the OpenRouter crate), the **delegation-mode standing injection**
+over ac-context's reactive cadence driver (§4, in `ac-context`/`ac-runtime`), and the **host
+assembly** (§5, the reference host's `--ultra`). The kit stays agnostic — it maps no effort tier to
+a delegation policy; ultra is composed entirely host-side.
 **Requires:** [ac-provider.md](ac-provider.md) (the completion contract effort extends),
 [ac-context.md](ac-context.md) (the reactive-injection cadence the mode fragment rides),
 [ac-hooks.md](ac-hooks.md) (effort as a step-prepare edit; the reactive phase the driver wires),

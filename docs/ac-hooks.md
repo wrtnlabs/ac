@@ -185,7 +185,10 @@ that seam ([ac-tools.md](ac-tools.md)); step-prepare only filters and forces.
 - **Output post-processing** — an ordered contributor mutating parsed output items before
   emission. The studied runtime has one; no consumer here yet — evidence first.
 - **Change-detected re-rendering** — diffing a durable section against its previous snapshot,
-  emitting only deltas. An optimization of session-context; adopt when measured.
+  emitting only deltas. Now landed as ac-context's reactive (ℛ) cadence driver
+  ([ac-context.md](ac-context.md) §5), fired at the step boundary (its prior derived from `E(L)`,
+  not a retained snapshot); its first consumer is the delegation-mode injection of
+  [ac-ultra.md](ac-ultra.md) §4. The window/turn *contributing* phases above remain deferred.
 - **A config-changed phase** — reserved; today configuration is fixed at construction.
 
 ---
