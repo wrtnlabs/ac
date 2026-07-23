@@ -41,6 +41,17 @@ pub enum StoreError {
         expected: u64,
         actual: u64,
     },
+    /// The store was stamped by a newer schema than this build understands.
+    /// Old code refuses newer stores cleanly instead of mis-reading them —
+    /// version skew is a crash window too: upgrades happen between runs.
+    #[error(
+        "store schema is from the future: found user_version {found}, supported up to {supported}"
+    )]
+    FutureSchema { found: u32, supported: u32 },
+    /// The integrity probe at open failed. A corrupt store is reported at
+    /// the door, not discovered mid-session; carries the first check line.
+    #[error("store failed the integrity check: {0}")]
+    Corrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -82,6 +93,10 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 ";
 
+/// Bumped when the on-disk schema changes shape. Opening a store stamped
+/// higher fails with [`StoreError::FutureSchema`].
+const SCHEMA_VERSION: u32 = 1;
+
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         if let Some(parent) = path.as_ref().parent()
@@ -92,7 +107,16 @@ impl SqliteStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
+        // Another process sharing the file waits briefly instead of getting
+        // an instant SQLITE_BUSY on write contention.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::quick_check(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // WAL + NORMAL is durable at every commit against process death; an
+        // OS-level power loss may lose the final commits but never corrupts.
+        // Explicit, not a default relied on silently; the power-loss tier
+        // (synchronous=FULL) is a deferred opt-in.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         Self::init(conn)
     }
 
@@ -100,12 +124,36 @@ impl SqliteStore {
         Self::init(Connection::open_in_memory()?)
     }
 
+    /// The self-check at the door: cheap (`quick_check`, not
+    /// `integrity_check`) and typed — a corrupt store fails open, not a
+    /// session mid-use.
+    fn quick_check(conn: &Connection) -> Result<()> {
+        // A store the probe itself cannot even run over is equally corrupt.
+        let line: String = conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        if line != "ok" {
+            return Err(StoreError::Corrupt(line));
+        }
+        Ok(())
+    }
+
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        // Another process sharing the file waits briefly instead of getting
-        // an instant SQLITE_BUSY on write contention.
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let found: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if found > SCHEMA_VERSION {
+            return Err(StoreError::FutureSchema {
+                found,
+                supported: SCHEMA_VERSION,
+            });
+        }
         conn.execute_batch(SCHEMA)?;
+        if found < SCHEMA_VERSION {
+            // Fresh store, or one from before versioning existed (tables
+            // present, user_version 0) — both take the current stamp; the
+            // upgrade is idempotent.
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })

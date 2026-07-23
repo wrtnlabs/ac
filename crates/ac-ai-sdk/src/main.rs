@@ -14,7 +14,9 @@
 //! --allow-origin <origin> (repeatable; the Vite dev origin is allowed by
 //! default), --web-search, --image-gen (register the image_gen host tool;
 //! reuses OPENROUTER_API_KEY), --image-model <id> (default
-//! google/gemini-2.5-flash-image).
+//! google/gemini-2.5-flash-image). Env: AC_OPENROUTER_BASE_URL overrides the
+//! provider endpoint (default the real OpenRouter API) so tests can drive the
+//! binary against an offline stub.
 //!
 //! `GET /api/files/{*path}` serves workspace files under the same containment
 //! the tools write through, so the UI can display saved artifacts (e.g.
@@ -84,7 +86,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let store = Arc::new(SqliteStore::open(&abs_db)?);
 
-    let provider: Arc<dyn Provider> = Arc::new(OpenRouter::new(api_key.clone()));
+    let mut openrouter = OpenRouter::new(api_key.clone());
+    if let Ok(base_url) = std::env::var("AC_OPENROUTER_BASE_URL") {
+        openrouter = openrouter.with_base_url(base_url);
+    }
+    let provider: Arc<dyn Provider> = Arc::new(openrouter);
     let mut server_tools = Vec::new();
     if args.web_search {
         let web_search = ServerTool::WebSearch {
@@ -224,6 +230,28 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     };
     let history_len = history.len();
 
+    // Input-first acknowledge point (docs/ac-durability.md §3.1): the user's
+    // message reaches the store BEFORE the turn's first sample, so a crash
+    // mid-turn loses at most the in-flight output — never the input that
+    // provoked it. The message shape is exactly what run_turn records into the
+    // session, so the post-turn batch (which skips it) stays byte-identical to
+    // what a single batched append would have written.
+    let user_message = ac_types::Message::text(ac_types::Role::User, prompt.clone());
+    let input_persisted = match app.store.append_messages(
+        &id,
+        std::slice::from_ref(&user_message),
+        Some(history_len as u64),
+    ) {
+        Ok(_) => true,
+        Err(e) => {
+            // Concurrent turns on one chat id land here as a SeqConflict —
+            // detected, not prevented, same policy as the post-turn batch. The
+            // turn still runs; only its persistence degrades, loudly.
+            eprintln!("ac-ai-sdk: input persist failed for session {id}: {e}");
+            false
+        }
+    };
+
     let policy = match SubtreePolicy::new(&app.dir) {
         Ok(p) => p,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -277,12 +305,22 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         // Drop the last sender so the stream closes and emits [DONE] promptly;
         // persistence below is detached from the response.
         drop(err_tx);
+        // The session's log is history + the user message run_turn recorded +
+        // the turn's output. The user message already landed at the §3.1
+        // acknowledge point, so persist only what follows it (CAS one past the
+        // input); if that append failed, fall back to the full batch so the
+        // input still gets its chance to land.
+        let persisted_len = if input_persisted {
+            history_len + 1
+        } else {
+            history_len
+        };
         let messages = session.messages();
-        if messages.len() > history_len
+        if messages.len() > persisted_len
             && let Err(e) = store.append_messages(
                 &session_id,
-                &messages[history_len..],
-                Some(history_len as u64),
+                &messages[persisted_len..],
+                Some(persisted_len as u64),
             )
         {
             // A lost-update race (concurrent turns on one chat id) surfaces

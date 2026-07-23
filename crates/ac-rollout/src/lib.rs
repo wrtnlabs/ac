@@ -58,6 +58,10 @@ pub enum LoadError {
 pub struct Loaded {
     pub rollout: Rollout,
     pub skipped_lines: usize,
+    /// True when the log ended inside an open turn and load closed it with the
+    /// interruption marker ([docs/ac-durability.md] §4 "log healing", 5.5).
+    /// Healing is loud, never silent (durability I6).
+    pub healed_open_turn: bool,
 }
 
 /// An append-only session log. `lines[0]` is always the canonical metadata
@@ -258,6 +262,10 @@ impl Rollout {
 
     /// Parse newline-delimited JSON, tolerating individually-corrupt lines
     /// (skipped and counted) and taking the first metadata head as canonical.
+    /// A log that ends inside an open turn is healed: the turn is closed with
+    /// the interruption marker, the same mechanism as fork's ragged edge
+    /// ([docs/ac-durability.md] §4, 5.5), and the healing is reported on
+    /// [`Loaded::healed_open_turn`].
     pub fn from_jsonl(text: &str) -> Result<Loaded, LoadError> {
         let mut lines = Vec::new();
         let mut skipped = 0usize;
@@ -278,9 +286,21 @@ impl Rollout {
         if !matches!(lines[0].item, RolloutItem::Meta(_)) {
             return Err(LoadError::NoHead);
         }
+        let mut rollout = Rollout { lines };
+        // A cut inside an open turn leaves a dangling TurnStarted; close it the
+        // way a live cancellation would, so the next turn's model reads the cut
+        // as deliberate and the loaded log is well-formed.
+        let healed_open_turn = if let Some(open) = rollout.open_turn() {
+            rollout.record_message(Message::text(Role::User, INTERRUPTION_MARKER));
+            rollout.end_turn(open);
+            true
+        } else {
+            false
+        };
         Ok(Loaded {
-            rollout: Rollout { lines },
+            rollout,
             skipped_lines: skipped,
+            healed_open_turn,
         })
     }
 

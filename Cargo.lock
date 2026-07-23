@@ -65,6 +65,7 @@ dependencies = [
  "ac-runtime",
  "ac-sandbox",
  "ac-skills",
+ "ac-store",
  "ac-tool",
  "ac-tools",
  "ac-types",
