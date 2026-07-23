@@ -92,6 +92,7 @@ through a store (the flat view) or the log itself; mid-turn input
 | [ac-context.md](ac-context.md) | marked fragments, injection cadence, budgeted rendering *(machinery implemented: `ac-context`)* |
 | [ac-hooks.md](ac-hooks.md) | the lifecycle-phase taxonomy for extension seams *(machinery implemented: step-prepare + observation)* |
 | [ac-subagents.md](ac-subagents.md) | delegation as an injected spawn capability; the child as a fresh session *(design of record — proposed)* |
+| [ac-ultra.md](ac-ultra.md) | effort as a request parameter + a delegation-mode injection; "ultra" as a host composition over the seam *(design of record — proposed)* |
 
 **Doctrine — in force:**
 
@@ -99,12 +100,6 @@ through a store (the flat view) or the log itself; mid-turn input
 | --- | --- |
 | [ac-security.md](ac-security.md) | the threat model and the boundary register |
 | [ac-testing.md](ac-testing.md) | the proof classes and their obligations |
-
-**Reference — explainers, not commitments:**
-
-| Document | Subject |
-| --- | --- |
-| [ac-ultra.md](ac-ultra.md) | effort vs. "ultra": reasoning budget (a model parameter) vs. orchestration (a harness mode) |
 
 ## 6. Standing doctrine (the short list)
 
@@ -128,6 +123,6 @@ through a store (the flat view) or the log itself; mid-turn input
 
 - A UI, a product, or opinions about either.
 - A plugin marketplace or dynamic code loading; skills are text, extensions are compiled.
-- **Proactive** multi-agent orchestration — the harness "ultra" tier that spawns coordinated sub-agents on its own — is unspecced; it is a standing delegation-mode injection over the sub-agent *seam* (specified in [ac-subagents.md](ac-subagents.md)), not a subsystem of its own. See [ac-ultra.md](ac-ultra.md). The seam itself (delegate on request via a `task` tool) is a design of record; background/fire-and-forget delegation is out.
+- **Proactive** multi-agent orchestration — the harness "ultra" tier that spawns coordinated sub-agents on its own — is a **host composition**, specified in [ac-ultra.md](ac-ultra.md): effort as a request parameter plus a standing delegation-mode injection over the sub-agent *seam* ([ac-subagents.md](ac-subagents.md)), not a subsystem of its own and never a kit-level effort→policy mapping. Background/fire-and-forget delegation is out.
 - Multi-tenant service duty: the kit assumes it acts *for one user on their machine*; hosts
   that serve many users own that isolation.
