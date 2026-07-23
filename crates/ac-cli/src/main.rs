@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ac_cli::{HostOptions, build_host};
 use ac_provider_openrouter::OpenRouter;
 use ac_runtime::AgentEvent;
-use ac_types::{StopReason, TokenUsage};
+use ac_types::{Effort, StopReason, TokenUsage};
 use tokio::sync::mpsc;
 
 struct Args {
@@ -22,6 +22,7 @@ struct Args {
     sandbox: bool,
     sandbox_network: bool,
     subagents: bool,
+    effort: Option<Effort>,
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -36,6 +37,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut sandbox = true;
     let mut sandbox_network = true;
     let mut subagents = false;
+    let mut effort: Option<Effort> = None;
     let mut rest: Vec<String> = Vec::new();
 
     let mut it = std::env::args().skip(1);
@@ -56,6 +58,14 @@ fn parse_args() -> anyhow::Result<Args> {
             "--no-sandbox" => sandbox = false,
             "--sandbox-no-network" => sandbox_network = false,
             "--subagents" => subagents = true,
+            "--effort" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--effort needs a value"))?;
+                effort = Some(Effort::parse(&v).ok_or_else(|| {
+                    anyhow::anyhow!("--effort must be one of low|medium|high|max, got {v:?}")
+                })?);
+            }
             "--skills" => {
                 let v = it
                     .next()
@@ -76,7 +86,8 @@ fn parse_args() -> anyhow::Result<Args> {
     if prompt.trim().is_empty() {
         anyhow::bail!(
             "usage: ac [--model <id>] [--dir <path>] [--web-search] [--skills <dir>] \
-             [--skill <name>] [--no-sandbox] [--sandbox-no-network] [--subagents] <prompt...>"
+             [--skill <name>] [--no-sandbox] [--sandbox-no-network] [--subagents] \
+             [--effort <low|medium|high|max>] <prompt...>"
         );
     }
 
@@ -95,6 +106,7 @@ fn parse_args() -> anyhow::Result<Args> {
         sandbox,
         sandbox_network,
         subagents,
+        effort,
     })
 }
 
@@ -119,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         sandbox: args.sandbox,
         sandbox_network: args.sandbox_network,
         subagents: args.subagents,
+        effort: args.effort,
     };
     let host = build_host(provider, &args.dir, args.model, options)?;
     // Skill mentions ($name) and the --skill selection inject SKILL.md bodies

@@ -5,7 +5,8 @@
 
 use ac_provider::{CompletionRequest, EventStream, Provider, ServerTool, ToolChoice};
 use ac_types::{
-    Citation, CompletionError, CompletionEvent, ContentPart, Role, StopReason, TokenUsage, ToolUse,
+    Citation, CompletionError, CompletionEvent, ContentPart, Effort, Role, StopReason, TokenUsage,
+    ToolUse,
 };
 use async_stream::try_stream;
 use eventsource_stream::Eventsource;
@@ -141,6 +142,17 @@ fn build_body(request: &CompletionRequest) -> Value {
     }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
+    }
+    // Reasoning effort → OpenRouter's `reasoning.effort` (low/medium/high). The
+    // agnostic `Max` collapses to `high` — OpenRouter exposes no level above it
+    // ([docs/ac-ultra.md] §3, "the top tier collapses to max at the wire").
+    if let Some(effort) = request.effort {
+        let level = match effort {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High | Effort::Max => "high",
+        };
+        body["reasoning"] = json!({ "effort": level });
     }
     body
 }
@@ -484,6 +496,29 @@ mod tests {
         let body = build_body(&request);
         assert_eq!(body["plugins"][0]["id"], json!("web"));
         assert_eq!(body["plugins"][0]["max_results"], json!(3));
+    }
+
+    // --- reasoning effort ([docs/ac-ultra.md] §3) ---
+    #[test]
+    fn effort_encodes_reasoning_and_max_collapses_to_high() {
+        // Absent effort adds nothing.
+        let request = CompletionRequest::new("test/model");
+        assert!(build_body(&request).get("reasoning").is_none());
+
+        for (effort, level) in [
+            (Effort::Low, "low"),
+            (Effort::Medium, "medium"),
+            (Effort::High, "high"),
+            (Effort::Max, "high"), // the wire collapse — OpenRouter exposes three
+        ] {
+            let mut request = CompletionRequest::new("test/model");
+            request.effort = Some(effort);
+            assert_eq!(
+                build_body(&request)["reasoning"]["effort"],
+                json!(level),
+                "{effort:?} must map to {level}"
+            );
+        }
     }
 
     #[test]

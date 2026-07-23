@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use ac_types::Effort;
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
@@ -36,10 +37,9 @@ pub struct SpawnRequest {
     pub description: Option<String>,
     /// Per-child model override; `None` inherits the definition's default.
     pub model: Option<String>,
-    /// Per-child reasoning-effort override, referencing the agnostic provider
-    /// tier. Reserved and inert until effort lands as a request parameter (§6);
-    /// carried now so adopting it later reopens nothing.
-    pub effort: Option<String>,
+    /// Per-child reasoning-effort override ([docs/ac-ultra.md] §3). Precedence:
+    /// this override → the agent definition's default → the parent run's effort.
+    pub effort: Option<Effort>,
     /// The parent's cancellation signal. A spawner MUST *derive* the child's
     /// token from this (`cancel.child_token()`), not share it, so parent-cancel
     /// propagates down while a child abort never bubbles up (§4, I5).
@@ -89,6 +89,10 @@ pub struct AgentDefinition {
     pub tools: ToolScope,
     /// Default model for this agent; a [`SpawnRequest`] may override.
     pub model: Option<String>,
+    /// Default reasoning-effort for this agent ([docs/ac-ultra.md] §3), so a
+    /// cheap researcher stays cheap under an expensive parent without every
+    /// spawn site repeating it; a [`SpawnRequest`] may override.
+    pub effort: Option<Effort>,
     /// Narrow the child's containment to reads only (§4).
     pub read_only: bool,
 }
@@ -101,6 +105,7 @@ impl AgentDefinition {
             prompt: None,
             tools: ToolScope::All,
             model: None,
+            effort: None,
             read_only: false,
         }
     }
@@ -117,6 +122,11 @@ impl AgentDefinition {
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_effort(mut self, effort: Effort) -> Self {
+        self.effort = Some(effort);
         self
     }
 

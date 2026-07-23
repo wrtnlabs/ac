@@ -17,8 +17,9 @@ use ac_skills::{
     extract_skill_mentions, select_skills_for_mentions,
 };
 use ac_tool::{
-    AgentDefinition, GrantedReadPolicy, NetworkMode, PathPolicy, ReadGrants, ReadOnlyPolicy,
-    SandboxPolicy, SpawnRequest, SubtreePolicy, ToolCtx, ToolRegistry, ToolScope, as_dyn,
+    AgentDefinition, Effort, GrantedReadPolicy, NetworkMode, PathPolicy, ReadGrants,
+    ReadOnlyPolicy, SandboxPolicy, SpawnRequest, SubtreePolicy, ToolCtx, ToolRegistry, ToolScope,
+    as_dyn,
 };
 use ac_tools::{EditFile, Fetch, Glob, Grep, ListFiles, ReadFile, Shell, Task, WriteFile};
 use tokio_util::sync::CancellationToken;
@@ -86,6 +87,7 @@ pub fn subagent_definitions() -> Vec<AgentDefinition> {
             "grep".into(),
             "fetch".into(),
         ]))
+        .with_effort(Effort::Low)
         .read_only(),
         AgentDefinition::new(
             "general",
@@ -193,6 +195,10 @@ pub struct HostOptions {
     /// and `general` definitions) contained to the same workspace, and append
     /// the agent catalog to the system prompt. Off by default.
     pub subagents: bool,
+    /// Default reasoning-effort tier for the session ([docs/ac-ultra.md] §3),
+    /// applied to every request and to children that neither the spawn request
+    /// nor the agent definition overrides. `None` uses the provider's default.
+    pub effort: Option<Effort>,
 }
 
 /// Compose the actual turn input from the user's prompt: extract `$name`
@@ -354,6 +360,7 @@ pub fn build_host(
         let child_provider = provider.clone();
         let child_dir = canonical.clone();
         let base_model = model.clone();
+        let base_effort = options.effort;
         let assemble = move |req: &SpawnRequest, cancel: CancellationToken| -> Option<Session> {
             let def = defs.iter().find(|d| d.name == req.agent)?;
             let base = SubtreePolicy::new(&child_dir).ok()?;
@@ -372,6 +379,8 @@ pub fn build_host(
                     .unwrap_or_else(|| base_model.clone()),
                 system: def.prompt.clone(),
                 max_iterations: MAX_ITERATIONS,
+                // Effort precedence: spawn override → definition default → parent.
+                effort: req.effort.or(def.effort).or(base_effort),
                 ..Default::default()
             };
             Some(Session::new(
@@ -415,6 +424,7 @@ pub fn build_host(
         system: Some(system),
         max_iterations: MAX_ITERATIONS,
         server_tools,
+        effort: options.effort,
         ..Default::default()
     };
 

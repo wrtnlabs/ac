@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use ac_tool::{Capability, SpawnRequest, SpawnStatus, Tool, ToolCtx, ToolOutput};
+use ac_tool::{Capability, Effort, SpawnRequest, SpawnStatus, Tool, ToolCtx, ToolOutput};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
@@ -69,7 +69,9 @@ impl Tool for Task {
                     prompt: input.prompt,
                     description: input.description,
                     model: input.model,
-                    effort: input.effort,
+                    // The model writes a tier name; an unknown one is ignored
+                    // (treated as no override), never a fault.
+                    effort: input.effort.as_deref().and_then(Effort::parse),
                     // The parent's token; the spawner derives the child's via
                     // `child_token()` so cancel flows down, not up.
                     cancel: ctx.cancel.clone(),

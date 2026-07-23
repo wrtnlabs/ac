@@ -2,7 +2,7 @@
 //! Wire crates (ac-provider-openrouter, …) implement [`Provider`] and map
 //! their native wire events into [`ac_types::CompletionEvent`].
 
-use ac_types::{CompletionError, CompletionEvent, Message, ToolSpec};
+use ac_types::{CompletionError, CompletionEvent, Effort, Message, ToolSpec};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,11 @@ pub struct CompletionRequest {
     pub server_tools: Vec<ServerTool>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Agnostic reasoning-effort tier ([docs/ac-ultra.md] §3). The wire crate
+    /// maps it to the provider's reasoning control; `None` means the provider's
+    /// default, and a provider without reasoning control ignores it (a hint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
 }
 
 /// A capability the provider runs on its own infrastructure, surfacing results
@@ -67,6 +72,7 @@ impl CompletionRequest {
             server_tools: Vec::new(),
             max_tokens: None,
             temperature: None,
+            effort: None,
         }
     }
 }

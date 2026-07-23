@@ -21,7 +21,8 @@ use ac_provider::{CompletionRequest, Provider, ServerTool};
 use ac_rollout::Rollout;
 use ac_tool::{ToolCtx, ToolRegistry};
 use ac_types::{
-    CompletionEvent, ContentPart, Message, Role, StopReason, TokenUsage, ToolResult, ToolUse,
+    CompletionEvent, ContentPart, Effort, Message, Role, StopReason, TokenUsage, ToolResult,
+    ToolUse,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -67,6 +68,10 @@ pub struct AgentConfig {
     /// Context-compaction budget and policy ([docs/ac-compaction.md]). `None`
     /// disables compaction: no trigger fires and manual `compact` is refused.
     pub compaction: Option<CompactionConfig>,
+    /// Default reasoning-effort tier applied to every request ([docs/ac-ultra.md]
+    /// §3). A default, not a freeze — a step-prepare hook may override it per
+    /// step. `None` uses the provider's default.
+    pub effort: Option<Effort>,
 }
 
 impl Default for AgentConfig {
@@ -78,6 +83,7 @@ impl Default for AgentConfig {
             server_tools: Vec::new(),
             idle_timeout: Some(Duration::from_secs(300)),
             compaction: None,
+            effort: None,
         }
     }
 }
@@ -397,7 +403,10 @@ impl Session {
             req.messages = self.rollout.project();
             req.tools = self.registry.specs();
             req.server_tools = self.config.server_tools.clone();
+            req.effort = self.config.effort;
 
+            // Step-prepare hooks fold last, so a hook MAY override the effort
+            // default per step ([docs/ac-ultra.md] §3, [docs/ac-hooks.md]).
             for hook in self.hooks.step_prepare() {
                 hook.prepare(iteration, &mut req);
             }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use ac_cli::{HostOptions, build_host};
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
 use ac_runtime::{AgentEvent, Session};
-use ac_types::StopReason;
+use ac_types::{Effort, StopReason};
 use serde_json::json;
 
 fn subagent_options() -> HostOptions {
@@ -105,6 +105,60 @@ async fn parent_delegates_to_a_child_that_writes_a_real_file_offline() {
     assert!(
         !child_leak,
         "the child's write turns must not enter the parent's context"
+    );
+}
+
+#[tokio::test]
+async fn effort_flows_to_the_parent_and_a_child_overrides_via_its_definition() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Session default effort = high; the read-only `explore` agent declares
+    // itself Low, so it must run cheap even under the high-effort parent.
+    let provider = MockProvider::new(vec![
+        // Parent step 0: delegate to explore.
+        vec![
+            tool_use(
+                "c1",
+                "task",
+                json!({ "agent": "explore", "prompt": "look around" }),
+            ),
+            stop_tool_use(),
+        ],
+        // Child (explore) — one request, returns text (read-only, no writes).
+        vec![text("explored"), stop_end()],
+        // Parent step 1: finish.
+        vec![text("done"), stop_end()],
+    ]);
+    let handle = provider.clone();
+
+    let host = build_host(
+        Arc::new(provider),
+        dir.path(),
+        "mock/model".to_string(),
+        HostOptions {
+            subagents: true,
+            effort: Some(Effort::High),
+            ..Default::default()
+        },
+    )
+    .expect("build_host");
+
+    let (result, _events) = run(host.session, "explore via a sub-agent").await;
+    assert_eq!(result.unwrap(), StopReason::EndTurn);
+
+    let reqs = handle.requests();
+    // Parent's request carries the session default (config → request).
+    assert_eq!(
+        reqs[0].effort,
+        Some(Effort::High),
+        "parent uses the session default"
+    );
+    // The child's request (the second) carries the explore definition's default,
+    // overriding the parent's high — the cheap-child / expensive-parent split.
+    assert_eq!(
+        reqs[1].effort,
+        Some(Effort::Low),
+        "explore's definition-default effort must override the parent's"
     );
 }
 
