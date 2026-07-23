@@ -1,6 +1,9 @@
 # RFC: MCP integration — wire-discovered tools in the same registry
 
-**Status:** implemented — specification of record (2026-07-21).
+**Status:** implemented — specification of record (2026-07-21). **Amended 2026-07-23:** §8
+(server configuration format) records the de-facto `mcpServers` JSON object as the host contract
+to follow — the kit stays format-agnostic (it takes connections, not files), and other tools'
+native configs are one-way importers, never the contract.
 **Requires:** [ac-tools.md](ac-tools.md) (the tool registry, the raw (runtime-described) registration
 path, errors-as-data), [ac-provider.md](ac-provider.md) (tool specs ride every sampling request —
 the exposure that motivates the name floor defined in §2). **Required by:** nothing yet. **Interacts with:**
@@ -167,8 +170,39 @@ arguments. The model sees a failed tool; the session continues.
 | Permission decisions over capability ([ac-approvals.md](ac-approvals.md)) | host |
 | Refresh policy — when to re-discover, rebuild vs. mutate | host |
 | Surfacing skips and transport death to the operator | host |
+| Server-definition config format; importers from other tools | host (§8) |
 
-## 8. Deferred
+## 8. Server configuration format
+
+The kit takes a **connection**, not a file: a host builds each connection from a name and a
+transport (§2) and never hands the kit a config path or document. Where server definitions come
+from is therefore host policy — but the choice is not free, because a portable definition is one
+a user can move between tools unchanged. MCP the protocol standardizes the wire, not the config;
+the standard to follow is the *de-facto* one the ecosystem converged on, not any single tool's.
+
+- **The de-facto shape.** A host SHOULD read and write server definitions as the `mcpServers`
+  JSON object: a map from server name to either a stdio definition
+  `{ "command": string, "args"?: string[], "env"?: { [k]: string } }` or a remote definition
+  `{ "url": string, "headers"?: { [k]: string } }` (a host MAY tag the transport with a `type`
+  discriminant). This is the shape desktop MCP hosts, editors, and coding agents already emit, so
+  a user can paste a server block from any of them; adopting it is the difference between a config
+  a user already has and one they must translate.
+- **Not a bespoke application table.** Embedding the same fields inside a host's own application
+  config (a TOML `[mcp_servers.…]` table, say) is a valid host choice but a worse default: it
+  couples the definition to one tool's config syntax, home directory, and surrounding keys, and
+  loses the paste-portability the JSON shape exists for. A host that keeps a broader config file
+  SHOULD still accept the standalone `mcpServers` JSON alongside it.
+- **Other tools' configs are importers, not the contract.** A host MAY read another tool's native
+  config — a JSON `mcpServers` file, or a foreign application config carrying an equivalent table
+  — and fold the definitions into its own store as a one-way convenience. Such an import is host
+  policy over untrusted input: names are re-validated against the floor (§2) and unmodeled keys
+  are dropped, never adopted. The kit sees only the resulting connections.
+- **Transport reach.** The stdio definition maps onto the child-process connect path; the remote
+  `url` definition maps onto the transport-generic connect seam but rides streamable HTTP,
+  deferred (§9). Until that lands a host honors the stdio form and reports a remote definition as
+  skipped with a stated reason (R5) — never silently.
+
+## 9. Deferred
 
 - **Resources, prompts, sampling** — the non-tool MCP primitives. Tools are the seam the run
   loop needs; the rest is host surface until evidence says otherwise.
