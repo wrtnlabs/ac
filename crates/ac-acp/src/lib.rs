@@ -583,6 +583,9 @@ fn event_update(event: AgentEvent, context_window: u64) -> Option<SessionUpdate>
                 context_window,
             )))
         }
+        // Mapping streamed argument fragments onto ACP's tool-call update shape
+        // is a follow-up; the assembled ToolCall above carries the full input.
+        AgentEvent::ToolInputDelta { .. } => None,
         // The stop reason rides the PromptResponse; errors ride the JSON-RPC
         // error response. Neither is a session update. Compaction is recorded in
         // the session log and surfaced live on other transports; an ACP-native

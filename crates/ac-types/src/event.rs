@@ -19,6 +19,16 @@ pub enum CompletionEvent {
         signature: Option<String>,
     },
     ToolUse(ToolUse),
+    /// A raw fragment of a tool call's arguments as the provider streams them.
+    /// Stream-only progress: the assembled [`ToolUse`] that follows is still
+    /// the single authoritative call — consumers that ignore deltas lose
+    /// nothing. Concatenating every `args_delta` for an `id` yields exactly
+    /// the final assembled arguments string.
+    ToolCallDelta {
+        id: String,
+        name: String,
+        args_delta: String,
+    },
     /// A source citation surfaced by a provider-executed server tool (e.g. web
     /// search). These arrive inline as annotations, not as tool results — there
     /// is no local execution and nothing to feed back — so they ride their own
@@ -80,6 +90,11 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({ "path": "a.txt" }),
             }),
+            CompletionEvent::ToolCallDelta {
+                id: "c1".into(),
+                name: "read_file".into(),
+                args_delta: "{\"pa".into(),
+            },
             CompletionEvent::Citation(Citation {
                 url: "https://example.com".into(),
                 title: None,

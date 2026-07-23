@@ -291,6 +291,21 @@ where
                             slot.arguments.push_str(&arguments);
                         }
                     }
+                    // Stream newly-arrived argument bytes as a delta once the
+                    // call is identified, so a client can render tool input as
+                    // it forms. `emitted` is a byte cursor into `arguments`
+                    // (which only ever grows via push_str), so each byte is sent
+                    // in exactly one delta, in order: the concatenation of every
+                    // args_delta for an id equals the final assembled arguments.
+                    // Fragments arriving before id+name are known buffer here and
+                    // flush as one delta the moment the call is identified.
+                    if !slot.id.is_empty() && !slot.name.is_empty() && slot.emitted < slot.arguments.len() {
+                        let args_delta = slot.arguments[slot.emitted..].to_string();
+                        slot.emitted = slot.arguments.len();
+                        let id = slot.id.clone();
+                        let name = slot.name.clone();
+                        yield CompletionEvent::ToolCallDelta { id, name, args_delta };
+                    }
                 }
                 if let Some(reason) = choice.finish_reason {
                     finish = Some(reason);
@@ -322,6 +337,9 @@ struct PendingToolCall {
     id: String,
     name: String,
     arguments: String,
+    /// Byte cursor into `arguments`: how much has already been emitted as a
+    /// [`CompletionEvent::ToolCallDelta`]. Guarantees each byte streams once.
+    emitted: usize,
 }
 
 #[derive(Deserialize)]
@@ -594,5 +612,95 @@ mod tests {
         assert!(stopped, "stream must still terminate cleanly");
         assert_eq!(citations.len(), 1, "only the well-formed citation surfaces");
         assert_eq!(citations[0].url, "https://ok.example");
+    }
+
+    fn frame(data: &str) -> Result<eventsource_stream::Event, std::convert::Infallible> {
+        Ok(eventsource_stream::Event {
+            data: data.into(),
+            ..Default::default()
+        })
+    }
+
+    // The load-bearing invariant: concatenating every args_delta emitted for an
+    // id equals the final assembled arguments string — no bytes dropped,
+    // duplicated, or reordered across arbitrary fragment boundaries, including an
+    // empty fragment. The terminal ToolUse still carries the full parsed input.
+    #[tokio::test]
+    async fn tool_call_argument_fragments_stream_as_deltas() {
+        let frames = vec![
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"pa"}}]}}]}"#,
+            ),
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}"#,
+            ),
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a."}}]}}]}"#,
+            ),
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"txt\"}"}}]}}]}"#,
+            ),
+            frame(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+        ];
+
+        let mut stream = map_events(futures::stream::iter(frames));
+        let mut deltas: Vec<(String, String)> = Vec::new();
+        let mut tool_use: Option<ToolUse> = None;
+        while let Some(item) = stream.next().await {
+            match item.expect("no frame should error the stream") {
+                CompletionEvent::ToolCallDelta { id, args_delta, .. } => {
+                    deltas.push((id, args_delta))
+                }
+                CompletionEvent::ToolUse(tu) => tool_use = Some(tu),
+                _ => {}
+            }
+        }
+        // The empty fragment produces no delta: 3 non-empty fragments → 3 deltas.
+        assert_eq!(
+            deltas.len(),
+            3,
+            "one delta per non-empty fragment, none for the empty one"
+        );
+        assert!(deltas.iter().all(|(id, _)| id == "c1"));
+        let concat: String = deltas.iter().map(|(_, d)| d.as_str()).collect();
+        assert_eq!(
+            concat, r#"{"path":"a.txt"}"#,
+            "delta concat must equal the assembled arguments"
+        );
+        let tu = tool_use.expect("the assembled ToolUse still fires");
+        assert_eq!(tu.id, "c1");
+        assert_eq!(tu.name, "read_file");
+        assert_eq!(tu.input, json!({ "path": "a.txt" }));
+    }
+
+    // Fragments that arrive before the call's id/name are known must buffer and
+    // flush as a single delta the moment the call is identified — never dropped.
+    #[tokio::test]
+    async fn fragments_before_id_buffer_and_flush_on_identification() {
+        let frames = vec![
+            // First chunk carries argument bytes but no id/name yet.
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1"}}]}}]}"#,
+            ),
+            // Identification arrives with the rest of the arguments.
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c9","function":{"name":"tool","arguments":"}"}}]}}]}"#,
+            ),
+            frame(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+        ];
+
+        let mut stream = map_events(futures::stream::iter(frames));
+        let mut deltas: Vec<String> = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(CompletionEvent::ToolCallDelta { args_delta, .. }) = item {
+                deltas.push(args_delta);
+            }
+        }
+        assert_eq!(
+            deltas.len(),
+            1,
+            "buffered prefix flushes as one delta at identification"
+        );
+        assert_eq!(deltas[0], r#"{"x":1}"#, "the buffered prefix is not lost");
     }
 }

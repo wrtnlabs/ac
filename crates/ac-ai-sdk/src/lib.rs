@@ -1,7 +1,7 @@
 //! The Vercel AI SDK adapter: AC's turn stream ⇆ the AI SDK **UI Message
 //! Stream Protocol** (v5). This is the seam that lets a stock `useChat` React
 //! app render an AC agent with zero custom client code — the same shape any
-//! host on the AI SDK's client half (Canvas included) already speaks.
+//! host on the AI SDK's client half already speaks.
 //!
 //! It is the sibling of `ac-acp`: both are thin, mechanical adapters off the
 //! one canonical [`AgentEvent`] stream. Neither is stacked on the other — a
@@ -38,6 +38,9 @@ pub struct ChunkEncoder {
     message_id: String,
     part_seq: u64,
     open: Option<OpenPart>,
+    /// Tool call ids already announced via `tool-input-start` (the streaming
+    /// path), so the assembled call doesn't emit a duplicate start.
+    announced: std::collections::HashSet<String>,
 }
 
 #[derive(PartialEq)]
@@ -52,6 +55,7 @@ impl ChunkEncoder {
             message_id: message_id.into(),
             part_seq: 0,
             open: None,
+            announced: std::collections::HashSet::new(),
         }
     }
 
@@ -110,16 +114,38 @@ impl ChunkEncoder {
                 };
                 out.push(json!({ "type": "reasoning-delta", "id": id, "delta": delta }));
             }
+            AgentEvent::ToolInputDelta { id, name, delta } => {
+                if let Some(end) = self.close_open() {
+                    out.push(end);
+                }
+                if self.announced.insert(id.clone()) {
+                    out.push(json!({
+                        "type": "tool-input-start",
+                        "toolCallId": id,
+                        "toolName": name,
+                        "dynamic": true,
+                    }));
+                }
+                out.push(json!({
+                    "type": "tool-input-delta",
+                    "toolCallId": id,
+                    "inputTextDelta": delta,
+                }));
+            }
             AgentEvent::ToolCall { id, name, input } => {
                 if let Some(end) = self.close_open() {
                     out.push(end);
                 }
-                out.push(json!({
-                    "type": "tool-input-start",
-                    "toolCallId": id,
-                    "toolName": name,
-                    "dynamic": true,
-                }));
+                // Streamed deltas already announced this call; only the start
+                // is skippable — the available chunk is always authoritative.
+                if !self.announced.contains(&id) {
+                    out.push(json!({
+                        "type": "tool-input-start",
+                        "toolCallId": id,
+                        "toolName": name,
+                        "dynamic": true,
+                    }));
+                }
                 out.push(json!({
                     "type": "tool-input-available",
                     "toolCallId": id,
@@ -387,6 +413,83 @@ mod tests {
             .collect();
         assert_eq!(text_ids[0], text_ids[1]);
         assert_ne!(text_ids[0], text_ids[2]);
+    }
+
+    #[test]
+    fn streamed_tool_input_announces_once_then_deltas_then_available() {
+        let mut enc = ChunkEncoder::new("m1");
+        let mut all = enc.start();
+        all.extend(enc.encode(AgentEvent::Text("thinking".into())));
+        all.extend(enc.encode(AgentEvent::ToolInputDelta {
+            id: "c1".into(),
+            name: "read_file".into(),
+            delta: "{\"pa".into(),
+        }));
+        all.extend(enc.encode(AgentEvent::ToolInputDelta {
+            id: "c1".into(),
+            name: "read_file".into(),
+            delta: "th\":\"a.txt\"}".into(),
+        }));
+        all.extend(enc.encode(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            input: json!({ "path": "a.txt" }),
+        }));
+        all.extend(enc.finish());
+
+        assert_eq!(
+            types(&all),
+            vec![
+                "start",
+                "start-step",
+                "text-start",
+                "text-delta",
+                "text-end", // closed when the first delta arrives
+                "tool-input-start",
+                "tool-input-delta",
+                "tool-input-delta",
+                "tool-input-available", // no duplicate tool-input-start
+                "finish-step",
+                "finish",
+            ]
+        );
+        let start = all
+            .iter()
+            .find(|c| c["type"] == "tool-input-start")
+            .unwrap();
+        assert_eq!(start["toolCallId"], "c1");
+        assert_eq!(start["toolName"], "read_file");
+        let deltas: Vec<_> = all
+            .iter()
+            .filter(|c| c["type"] == "tool-input-delta")
+            .collect();
+        assert!(deltas.iter().all(|c| c["toolCallId"] == "c1"));
+        let concat: String = deltas
+            .iter()
+            .map(|c| c["inputTextDelta"].as_str().unwrap())
+            .collect();
+        assert_eq!(concat, r#"{"path":"a.txt"}"#);
+        let available = all
+            .iter()
+            .find(|c| c["type"] == "tool-input-available")
+            .unwrap();
+        assert_eq!(available["input"], json!({ "path": "a.txt" }));
+    }
+
+    #[test]
+    fn tool_call_without_prior_deltas_still_emits_start_and_available() {
+        // The no-streaming path (e.g. a mock provider) is unchanged: the
+        // assembled call announces itself.
+        let mut enc = ChunkEncoder::new("m1");
+        let chunks = enc.encode(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            input: json!({ "path": "a.txt" }),
+        });
+        assert_eq!(
+            types(&chunks),
+            vec!["tool-input-start", "tool-input-available"]
+        );
     }
 
     #[test]

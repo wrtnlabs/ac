@@ -12,7 +12,13 @@
 //! Flags: --dir <sandbox root>, --model <id>, --port <u16> (default 8790),
 //! --db <path> (default ~/.ac/ac-ai-sdk/<hash>.db — never inside --dir),
 //! --allow-origin <origin> (repeatable; the Vite dev origin is allowed by
-//! default), --web-search.
+//! default), --web-search, --image-gen (register the image_gen host tool;
+//! reuses OPENROUTER_API_KEY), --image-model <id> (default
+//! google/gemini-2.5-flash-image).
+//!
+//! `GET /api/files/{*path}` serves workspace files under the same containment
+//! the tools write through, so the UI can display saved artifacts (e.g.
+//! generated images) straight from disk.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -32,6 +38,8 @@ use axum::routing::{get, post};
 use axum::{Router, body::Bytes};
 use tokio::sync::mpsc;
 
+mod tools;
+
 struct App {
     store: Arc<SqliteStore>,
     provider: Arc<dyn Provider>,
@@ -39,6 +47,9 @@ struct App {
     model: String,
     dir: PathBuf,
     allowed_origins: Vec<String>,
+    api_key: String,
+    image_gen: bool,
+    image_model: String,
 }
 
 #[tokio::main]
@@ -73,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let store = Arc::new(SqliteStore::open(&abs_db)?);
 
-    let provider: Arc<dyn Provider> = Arc::new(OpenRouter::new(api_key));
+    let provider: Arc<dyn Provider> = Arc::new(OpenRouter::new(api_key.clone()));
     let mut server_tools = Vec::new();
     if args.web_search {
         let web_search = ServerTool::WebSearch {
@@ -100,6 +111,9 @@ async fn main() -> anyhow::Result<()> {
         model: args.model,
         dir,
         allowed_origins,
+        api_key,
+        image_gen: args.image_gen,
+        image_model: args.image_model,
     });
 
     let router = Router::new()
@@ -108,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{id}", get(session_messages))
         .route("/api/chat", post(chat))
+        .route("/api/files/{*path}", get(file))
         .with_state(app.clone());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
@@ -216,16 +231,30 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     let ctx = Arc::new(ToolCtx::new(Arc::new(policy)));
     let cancel = ctx.cancel.clone();
 
+    let mut registry = ac_cli::generic_registry();
+    let mut system = ac_cli::SYSTEM_PROMPT.to_string();
+    if app.image_gen {
+        registry.register(tools::ImageGen::new(
+            app.api_key.clone(),
+            app.image_model.clone(),
+        ));
+        system.push_str(
+            " An image_gen tool is available: it generates an image from a text prompt and \
+             saves it under generated/ in the workspace; refer to the image by the path it \
+             returns.",
+        );
+    }
+
     let config = AgentConfig {
         model: app.model.clone(),
-        system: Some(ac_cli::SYSTEM_PROMPT.to_string()),
+        system: Some(system),
         max_iterations: ac_cli::MAX_ITERATIONS,
         server_tools: app.server_tools.clone(),
         ..Default::default()
     };
     let mut session = Session::resume(
         app.provider.clone(),
-        Arc::new(ac_cli::generic_registry()),
+        Arc::new(registry),
         ctx,
         config,
         history,
@@ -298,6 +327,49 @@ fn sse_frame(chunk: &serde_json::Value) -> Result<Bytes, std::io::Error> {
     Ok(Bytes::from(format!("data: {chunk}\n\n")))
 }
 
+async fn file(State(app): State<Arc<App>>, AxPath(path): AxPath<String>) -> Response {
+    let policy = match SubtreePolicy::new(&app.dir) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let served = match tools::resolve_served_file(&policy, &path) {
+        Ok(s) => s,
+        Err(tools::ServeError::Forbidden) => {
+            return (StatusCode::FORBIDDEN, "path not allowed").into_response();
+        }
+        Err(tools::ServeError::NotFound) => {
+            return (StatusCode::NOT_FOUND, "not found").into_response();
+        }
+        Err(tools::ServeError::TooLarge) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "file exceeds the serving cap",
+            )
+                .into_response();
+        }
+    };
+    let bytes = match tokio::fs::read(&served.path).await {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::NOT_FOUND, "not found").into_response(),
+    };
+    // Re-checked after the read: the file may have grown since the stat.
+    if bytes.len() as u64 > tools::SERVE_CAP {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file exceeds the serving cap",
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, served.content_type),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 struct Args {
     dir: PathBuf,
     model: String,
@@ -305,6 +377,8 @@ struct Args {
     db: Option<PathBuf>,
     allow_origin: Vec<String>,
     web_search: bool,
+    image_gen: bool,
+    image_model: String,
 }
 
 impl Args {
@@ -316,6 +390,8 @@ impl Args {
             db: None,
             allow_origin: Vec::new(),
             web_search: false,
+            image_gen: false,
+            image_model: "google/gemini-2.5-flash-image".to_string(),
         };
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -325,6 +401,8 @@ impl Args {
                 "--db" => parsed.db = Some(required(&arg, args.next())?.into()),
                 "--allow-origin" => parsed.allow_origin.push(required(&arg, args.next())?),
                 "--web-search" => parsed.web_search = true,
+                "--image-gen" => parsed.image_gen = true,
+                "--image-model" => parsed.image_model = required(&arg, args.next())?,
                 other => anyhow::bail!("unknown flag: {other}"),
             }
         }

@@ -1,6 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport, type UIMessage, type UIMessagePart } from "ai";
+import { Chat } from "@/components/chat";
+import { Button } from "@/components/ui/button";
+import { timeAgo } from "@/lib/format";
+import { cn } from "@/lib/utils";
+import type { UIMessage } from "ai";
+import { PlusIcon } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 // This whole app is a STOCK @ai-sdk/react client. Nothing here knows about AC,
 // ACP, or Rust — it speaks the AI SDK UI Message Stream Protocol to `/api/chat`
@@ -17,9 +21,13 @@ export function App() {
   const [initialMessages, setInitialMessages] = useState<UIMessage[]>([]);
 
   const refreshSessions = useCallback(async () => {
-    const res = await fetch("/api/sessions");
-    const json = await res.json();
-    setSessions(json.sessions ?? []);
+    try {
+      const res = await fetch("/api/sessions");
+      const json = await res.json();
+      setSessions(json.sessions ?? []);
+    } catch {
+      // host not up yet — keep whatever we have
+    }
   }, []);
 
   useEffect(() => {
@@ -42,221 +50,68 @@ export function App() {
 
   const openSession = useCallback(async (id: string) => {
     const token = ++openToken.current;
-    const res = await fetch(`/api/sessions/${id}`);
-    const json = await res.json();
-    if (token !== openToken.current) return; // a newer open superseded this one
-    setInitialMessages((json.messages ?? []) as UIMessage[]);
-    setActiveId(id);
+    try {
+      const res = await fetch(`/api/sessions/${id}`);
+      const json = await res.json();
+      if (token !== openToken.current) return; // a newer open superseded this one
+      setInitialMessages((json.messages ?? []) as UIMessage[]);
+      setActiveId(id);
+    } catch {
+      // hydration failed — stay on the current chat
+    }
   }, []);
 
   return (
-    <div className="app">
-      <aside>
-        <header>
-          <h1>
-            AC <span>react demo</span>
+    <div className="flex h-full overflow-hidden bg-background text-foreground">
+      <aside className="flex w-64 shrink-0 flex-col border-r">
+        <header className="border-b p-4">
+          <h1 className="font-semibold text-base">
+            AC <span className="font-normal text-muted-foreground">showcase</span>
           </h1>
-          <div className="sub">a stock @ai-sdk/react client</div>
+          <p className="text-muted-foreground text-xs">
+            a stock @ai-sdk/react client
+          </p>
         </header>
-        <button className="new-chat" onClick={newChat}>
-          ＋ New chat
-        </button>
-        <div className="sessions">
+        <div className="p-3">
+          <Button className="w-full" onClick={newChat} variant="outline">
+            <PlusIcon className="size-4" />
+            New chat
+          </Button>
+        </div>
+        <nav className="flex-1 space-y-1 overflow-y-auto px-3 pb-3">
           {sessions.map((s) => (
             <button
+              className={cn(
+                "flex w-full flex-col gap-0.5 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-muted/50",
+                s.id === activeId && "bg-accent text-accent-foreground",
+              )}
               key={s.id}
-              className={"session" + (s.id === activeId ? " active" : "")}
               onClick={() => openSession(s.id)}
+              type="button"
             >
-              <span className="title">{s.title || s.id.slice(0, 8) + "…"}</span>
-              <span className="when">{new Date(s.updatedAtMs).toLocaleString()}</span>
+              <span className="truncate">
+                {s.title || s.id.slice(0, 8) + "…"}
+              </span>
+              <span className="text-muted-foreground text-xs">
+                {timeAgo(s.updatedAtMs)}
+              </span>
             </button>
           ))}
-        </div>
+          {sessions.length === 0 && (
+            <p className="px-3 py-2 text-muted-foreground text-xs">
+              No chats yet
+            </p>
+          )}
+        </nav>
       </aside>
       {/* key=activeId remounts useChat cleanly when switching chats */}
       <Chat
-        key={activeId}
         chatId={activeId}
         initialMessages={initialMessages}
+        key={activeId}
         model={model}
         onTurnEnd={refreshSessions}
       />
     </div>
   );
-}
-
-function Chat({
-  chatId,
-  initialMessages,
-  model,
-  onTurnEnd,
-}: {
-  chatId: string;
-  initialMessages: UIMessage[];
-  model: string;
-  onTurnEnd: () => void;
-}) {
-  const transport = useMemo(
-    () =>
-      new DefaultChatTransport({
-        api: "/api/chat",
-        // Send only the latest message + the chat id: the AC host owns history
-        // (the AI SDK "message persistence" pattern), so ac-store is the source
-        // of truth and resume works.
-        prepareSendMessagesRequest({ id, messages, trigger, messageId }) {
-          return {
-            body: { id, message: messages[messages.length - 1], trigger, messageId },
-          };
-        },
-      }),
-    [],
-  );
-
-  const { messages, sendMessage, status, stop, error } = useChat({
-    id: chatId,
-    messages: initialMessages,
-    transport,
-    onFinish: onTurnEnd,
-  });
-
-  const [input, setInput] = useState("");
-  const busy = status === "submitted" || status === "streaming";
-  const transcriptRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const el = transcriptRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, status]);
-
-  const submit = () => {
-    const text = input.trim();
-    if (!text || busy) return;
-    setInput("");
-    sendMessage({ text });
-  };
-
-  return (
-    <main>
-      <div className="topbar">
-        <span className={"dot " + status} />
-        <span className="mono">{model}</span>
-        <span className="mono id">{chatId.slice(0, 8)}…</span>
-      </div>
-      <div className="transcript" ref={transcriptRef}>
-        <div className="lane">
-          {messages.map((m) => (
-            <MessageView key={m.id} message={m} />
-          ))}
-          {error && <div className="errblock">✗ {error.message}</div>}
-        </div>
-      </div>
-      <div className="composer">
-        <div className="lane row">
-          <textarea
-            value={input}
-            placeholder="Ask the agent — it works inside the sandbox directory"
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                submit();
-              }
-            }}
-          />
-          {busy ? (
-            <button className="act stop" onClick={stop}>
-              Stop
-            </button>
-          ) : (
-            <button className="act" onClick={submit}>
-              Send
-            </button>
-          )}
-        </div>
-      </div>
-    </main>
-  );
-}
-
-function MessageView({ message }: { message: UIMessage }) {
-  const who = message.role === "user" ? "you" : "agent";
-  return (
-    <div className={"block " + message.role}>
-      <div className="who">{who}</div>
-      {message.role === "user" ? (
-        <div className="bubble">{textOf(message)}</div>
-      ) : (
-        message.parts.map((part, i) => <PartView key={i} part={part} />)
-      )}
-    </div>
-  );
-}
-
-function PartView({ part }: { part: UIMessagePart<any, any> }) {
-  if (part.type === "text") {
-    return <div className="text">{part.text}</div>;
-  }
-  if (part.type === "reasoning") {
-    return (
-      <details className="thought">
-        <summary>thinking</summary>
-        <div className="t">{part.text}</div>
-      </details>
-    );
-  }
-  if (part.type === "source-url") {
-    // Provider-controlled URL — only render web schemes so a javascript: URL
-    // can't execute in this origin.
-    let href: string | null = null;
-    try {
-      const u = new URL(part.url);
-      if (u.protocol === "http:" || u.protocol === "https:") href = u.href;
-    } catch {
-      href = null;
-    }
-    if (!href) return null;
-    return (
-      <a className="citation" href={href} target="_blank" rel="noreferrer">
-        🔎 {part.title || part.url}
-      </a>
-    );
-  }
-  if (part.type === "dynamic-tool" || part.type.startsWith("tool-")) {
-    return <ToolView part={part} />;
-  }
-  return null;
-}
-
-function ToolView({ part }: { part: any }) {
-  const name: string = part.toolName ?? part.type.replace(/^tool-/, "");
-  const state: string = part.state ?? "input-available";
-  const output = state === "output-available" ? part.output : undefined;
-  const error = state === "output-error" ? part.errorText : undefined;
-  const status = error ? "failed" : output !== undefined ? "completed" : "running";
-  return (
-    <div className="tool">
-      <div className="head">
-        <span className="name">{name}</span>
-        <span className={"chip " + status}>{status}</span>
-      </div>
-      {part.input !== undefined && (
-        <pre>{JSON.stringify(part.input, null, 1)}</pre>
-      )}
-      {output !== undefined && <pre>{render(output)}</pre>}
-      {error !== undefined && <pre className="err">{error}</pre>}
-    </div>
-  );
-}
-
-function render(value: unknown): string {
-  const s = typeof value === "string" ? value : JSON.stringify(value, null, 1);
-  return s.length > 4000 ? s.slice(0, 4000) + "\n…" : s;
-}
-
-function textOf(message: UIMessage): string {
-  return message.parts
-    .filter((p): p is Extract<typeof p, { type: "text" }> => p.type === "text")
-    .map((p) => p.text)
-    .join("");
 }

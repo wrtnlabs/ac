@@ -36,9 +36,13 @@ ac-store.workspace = true
 ac-tool.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+base64 = "0.22"
 futures.workspace = true
+reqwest = { workspace = true }
+schemars.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
 ac-provider-mock.workspace = true
+tempfile.workspace = true

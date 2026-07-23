@@ -184,6 +184,9 @@ fn render(event: AgentEvent, usage: &mut Option<TokenUsage>) {
             let _ = std::io::stdout().flush();
         }
         AgentEvent::Thinking(_) => {}
+        // The assembled ToolCall line below renders the full input; streaming
+        // fragments adds nothing to a terminal.
+        AgentEvent::ToolInputDelta { .. } => {}
         AgentEvent::ToolCall { name, input, .. } => {
             eprintln!("\x1b[2m· {name}({})\x1b[0m", compact(&input));
         }

@@ -103,6 +103,15 @@ pub enum AgentEvent {
         name: String,
         input: serde_json::Value,
     },
+    /// A raw fragment of a tool call's arguments, streamed as the provider
+    /// emits them. Stream-only (like `Thinking`, the stream carries strictly
+    /// more than history): it never enters the rollout, and the assembled
+    /// `ToolCall` that follows remains the single authoritative call.
+    ToolInputDelta {
+        id: String,
+        name: String,
+        delta: String,
+    },
     ToolResult {
         id: String,
         name: String,
@@ -512,6 +521,17 @@ impl Session {
                     CompletionEvent::ToolUse(tu) => {
                         tool_uses.push(tu);
                     }
+                    CompletionEvent::ToolCallDelta {
+                        id,
+                        name,
+                        args_delta,
+                    } => {
+                        let _ = sink.send(AgentEvent::ToolInputDelta {
+                            id,
+                            name,
+                            delta: args_delta,
+                        });
+                    }
                     CompletionEvent::Citation(c) => {
                         let _ = sink.send(AgentEvent::Citation {
                             url: c.url,
@@ -798,6 +818,11 @@ mod tests {
                 id: "c1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({ "path": "a.txt" }),
+            },
+            AgentEvent::ToolInputDelta {
+                id: "c1".into(),
+                name: "read_file".into(),
+                delta: "{\"pa".into(),
             },
             AgentEvent::ToolResult {
                 id: "c1".into(),
