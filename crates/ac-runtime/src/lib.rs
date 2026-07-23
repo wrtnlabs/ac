@@ -16,7 +16,7 @@ mod steer;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ac_context::FragmentRegistry;
+use ac_context::{FragmentRegistry, ReactiveSection, reactive_fragment};
 use ac_provider::{CompletionRequest, Provider, ServerTool};
 use ac_rollout::Rollout;
 use ac_tool::{ToolCtx, ToolRegistry};
@@ -160,6 +160,10 @@ pub struct Session {
     /// Recognizes the runtime's own machine-injected fragments ([docs/ac-context.md]),
     /// so they are filtered from user input rather than promoted to instructions.
     fragments: FragmentRegistry,
+    /// Host-registered reactive context sections ([docs/ac-context.md] §5,
+    /// [docs/ac-ultra.md] §4): each emits a marked fragment at a boundary only
+    /// when its render differs from the last one recognized in `E(L)`.
+    reactive: Vec<Arc<dyn ReactiveSection>>,
     steer: Arc<SteerState>,
 }
 
@@ -180,6 +184,7 @@ impl Session {
             last_usage: TokenUsage::default(),
             turn_counter: 0,
             fragments: fragments::runtime_registry(),
+            reactive: Vec::new(),
             steer: Arc::new(SteerState::new()),
         }
     }
@@ -254,6 +259,36 @@ impl Session {
     /// depend on it.
     pub fn add_observation_hook(&mut self, hook: Arc<dyn ObservationHook>) {
         self.hooks.add_observation(hook);
+    }
+
+    /// Install a reactive context section ([docs/ac-context.md] §5,
+    /// [docs/ac-ultra.md] §4). Its fragment class is registered so the section's
+    /// emissions are recognized (stripped on compaction, filtered from user
+    /// input); the driver then evaluates it at each turn boundary and window
+    /// re-establishment, appending its fragment only when it changed.
+    pub fn add_reactive_section(&mut self, section: Arc<dyn ReactiveSection>) {
+        self.fragments.register(section.class().clone());
+        self.reactive.push(section);
+    }
+
+    /// Drive every reactive section against the current effective history,
+    /// appending the fragment of any whose render differs from the last one
+    /// recognized in `E(L)`. Prior is read from the log, so a compaction strip
+    /// re-injects the section into the new window and a resume/fork continues the
+    /// logged value — no retained snapshot.
+    fn drive_reactive(&mut self) {
+        if self.reactive.is_empty() {
+            return;
+        }
+        let sections = self.reactive.clone();
+        for section in sections {
+            let history = self.rollout.project();
+            let texts: Vec<String> = history.iter().map(compaction::message_text).collect();
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            if let Some(fragment) = reactive_fragment(section.as_ref(), &refs) {
+                self.record(Message::text(Role::User, fragment));
+            }
+        }
     }
 
     /// The effective history `E(L)` — the messages the model would be given if a
@@ -396,6 +431,13 @@ impl Session {
                 }
             }
             defer_drain_once = false;
+
+            // Reactive sections fire at the step boundary (the same point the
+            // steer queue drains): each appends its marked fragment only when its
+            // render differs from the last recognized in the log — so a mode
+            // injects at session start, re-injects after a compaction stripped
+            // it, and emits once on a mid-turn flip, staying silent otherwise.
+            self.drive_reactive();
 
             let mut req = CompletionRequest::new(&self.config.model);
             req.system = self.config.system.clone();

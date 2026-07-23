@@ -18,10 +18,12 @@
 
 mod catalog;
 mod fragment;
+mod reactive;
 mod registry;
 mod state;
 
 pub use catalog::{CatalogEntry, CatalogRender, CatalogReport, DegradationLevel, render_catalog};
 pub use fragment::{Cadence, FragmentClass, Rendered};
+pub use reactive::{ReactiveSection, reactive_fragment};
 pub use registry::FragmentRegistry;
 pub use state::{Decision, Prior, decide};

@@ -227,7 +227,7 @@ pub(crate) fn is_user_input(m: &Message) -> bool {
 /// predicate ([docs/ac-context.md]), which decides `injected(t)` from text alone.
 /// A rendered fragment is a single text part, so this reconstructs exactly what
 /// the class markers bracket.
-fn message_text(m: &Message) -> String {
+pub(crate) fn message_text(m: &Message) -> String {
     m.content
         .iter()
         .filter_map(|p| match p {
