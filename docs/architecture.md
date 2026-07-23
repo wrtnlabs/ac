@@ -93,6 +93,7 @@ through a store (the flat view) or the log itself; mid-turn input
 | [ac-hooks.md](ac-hooks.md) | the lifecycle-phase taxonomy for extension seams *(machinery implemented: step-prepare + observation)* |
 | [ac-subagents.md](ac-subagents.md) | delegation as an injected spawn capability; the child as a fresh session *(design of record — proposed)* |
 | [ac-ultra.md](ac-ultra.md) | effort as a request parameter + a delegation-mode injection; "ultra" as a host composition over the seam *(implemented + live-proven; host composition)* |
+| [ac-goals.md](ac-goals.md) | bounded autonomous objectives; a goal as a composition over a lifecycle trigger + idle continuation, packaged as an opt-in extension *(design of record — proposed)* |
 
 **Doctrine — in force:**
 
