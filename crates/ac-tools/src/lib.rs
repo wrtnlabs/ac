@@ -30,7 +30,7 @@ pub use files::{
     WriteFileInput,
 };
 pub use search::{Glob, GlobInput, Grep, GrepInput};
-pub use shell::{Shell, ShellInput};
+pub use shell::{Shell, ShellInput, ShellSpillDir};
 pub use task::{Task, TaskInput};
 
 use ac_tool::ToolRegistry;

@@ -1,6 +1,8 @@
 # RFC: The tool system — typed and raw tools, capability, and the path-policy algebra
 
-**Status:** implemented — specification of record (2026-07-21). **Requires:** nothing. **Required by:** [ac-mcp.md](ac-mcp.md) (wire tools enter through the raw form), [ac-sandbox.md](ac-sandbox.md)
+**Status:** implemented — specification of record (2026-07-21). **Amended 2026-07-24:** §3.3
+gains the *prefix-remap* and *deny* combinators and single-file grants; the composition laws are
+restated to cover them. **Requires:** nothing. **Required by:** [ac-mcp.md](ac-mcp.md) (wire tools enter through the raw form), [ac-sandbox.md](ac-sandbox.md)
 (implements the launcher seam carried here). **Interacts with:** [ac-skills.md](ac-skills.md) (hosts admit skill roots as read grants), [ac-loop.md](ac-loop.md) (every
 call dispatches through the registry), [ac-approvals.md](ac-approvals.md) (capability is the hook a
 read-only permission mode gates on).
@@ -105,13 +107,30 @@ rendered by a leaf — so a property proven at the leaves survives composition:
   to a split policy writing one chosen subtree — and every tool observes the new policy on its next
   resolution, with zero runtime changes.
 - **granted(P, G)** — reads that `P` refuses fall back to `G`, a shared grow-only set of read
-  grants; writes go to `P` alone. Each grant is itself a subtree policy, canonicalized when granted
+  grants; writes go to `P` alone. A grant is a subtree policy, canonicalized when granted
   — the target MUST exist then, else a symlink planted later could redirect it — and resolved
-  symlink-safely on use. Only absolute names reach the grants.
+  symlink-safely on use; or a **single file**, denoting exactly one directory entry (parent
+  canonicalized at grant, and the entry itself resolved on use — a symlinked entry that leaves
+  the granted directory, or lands on an ungranted sibling, is refused). Only absolute names
+  reach the grants.
+- **prefix-remap(P, {name ↦ Mᵢ})** — mounts other policies under virtual leading segments. A
+  relative name whose first segment (after folding `.` — spelling must not change what a name
+  denotes) equals a mount name strips it and is judged wholly by that mount's policy; every other
+  name — absolute names included — delegates to `P` untouched, so a mount never shadows a real
+  path. Lets a host expose side trees under stable virtual names without them living inside the
+  primary root.
+- **deny(P, D_read, D_write)** — a restricting post-check: after `P` fully resolves, the realized
+  path is refused if it lies under a denied entry (per access kind). Judging the *realized* path
+  means a symlink resolving into a denied subtree is caught though its lexical name looks clean.
+  A deny entry that cannot itself be resolved fails **closed** — an unevaluable deny refuses the
+  access rather than silently leaving the deny set.
 
-Three laws follow (checkable as §5's invariants): every combinator's write resolver factors through
-exactly one inner write resolver or refuses outright; only leaves realize and judge, so R5 proven
-for subtree holds everywhere; exactly one directory anchors relative names under any composition.
+Three laws follow (checkable as §5's invariants), in their post-amendment form: every combinator's
+write resolver factors through exactly one inner write resolver — remap picks exactly one mount or
+the inner policy — or refuses outright; realization happens only at leaves, and a non-leaf may add
+only *restricting* judgment on an already-realized path (deny), never admit what a leaf refused; and
+relative names are anchored deterministically — remap partitions the relative namespace by leading
+segment, and within each partition exactly one directory anchors.
 
 ## 4. Mechanics
 

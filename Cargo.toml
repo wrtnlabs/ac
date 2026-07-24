@@ -34,6 +34,7 @@ agent-client-protocol = "~1.2"
 anyhow = "1"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 eventsource-stream = "0.2"
 futures = "0.3"
 globset = "0.4"

@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ac_tool::{Capability, Tool, ToolCtx, ToolOutput, WriteCheck};
+use ac_tool::{Capability, Tool, ToolCtx, ToolOutput, WriteCheck, WriteObserver};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
@@ -27,6 +27,47 @@ fn rel(root: &Path, p: &Path) -> String {
 
 fn mtime_of(meta: &std::fs::Metadata) -> Option<SystemTime> {
     meta.modified().ok()
+}
+
+fn mtime_ms(t: SystemTime) -> Option<u64> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+/// Snapshot seam (see [`WriteObserver`]): when a host installed an observer and
+/// the target exists, hand it the prior bytes before they are replaced. An
+/// observer `Err` — or failing to read the prior bytes at all — aborts the
+/// write: an installed snapshot hook is a durability promise, and a write that
+/// silently skipped it would lose the prior content.
+async fn observe_overwrite(
+    ctx: &ToolCtx,
+    resolved: &Path,
+    prior: Option<&[u8]>,
+) -> Result<(), ToolOutput> {
+    let Some(observer) = ctx.extensions.get::<Arc<dyn WriteObserver>>() else {
+        return Ok(());
+    };
+    let read;
+    let prior = match prior {
+        Some(bytes) => bytes,
+        None => {
+            read = tokio::fs::read(resolved).await.map_err(|e| {
+                ToolOutput::error(format!(
+                    "cannot snapshot prior contents of {}: {e}",
+                    resolved.display()
+                ))
+            })?;
+            &read
+        }
+    };
+    observer
+        .before_overwrite(resolved, prior)
+        .map_err(|reason| {
+            ToolOutput::error(format!(
+                "write aborted: pre-overwrite snapshot failed: {reason}"
+            ))
+        })
 }
 
 /// Read a UTF-8 text file within the workspace and return its contents.
@@ -119,7 +160,7 @@ async fn read_capped(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Create or overwrite a text file inside the workspace.
+/// Create or overwrite a file inside the workspace.
 ///
 /// An existing file may only be overwritten if it was read this run (via
 /// `read_file`) and has not changed on disk since — otherwise the write is
@@ -128,8 +169,18 @@ async fn read_capped(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
 pub struct WriteFileInput {
     /// Destination path, relative to the workspace root (or absolute inside it).
     pub path: String,
-    /// Full new contents of the file.
-    pub content: String,
+    /// Full new contents as UTF-8 text. Set exactly one of this or
+    /// `content_base64`.
+    pub content: Option<String>,
+    /// Full new contents as base64-encoded bytes, for binary files. Set
+    /// exactly one of this or `content`.
+    pub content_base64: Option<String>,
+    /// Optional optimistic-concurrency guard: when set and the target's
+    /// current modification time in milliseconds differs (or the target no
+    /// longer exists), the write is refused before anything is written and a
+    /// structured conflict (`kind: "conflict"`, carrying both mtimes) is
+    /// returned so the caller can re-read and retry.
+    pub expected_mtime_ms: Option<u64>,
 }
 
 /// Writes a file, enforcing read-before-write on existing files.
@@ -144,9 +195,13 @@ impl Tool for WriteFile {
 
     fn description(&self) -> String {
         "Create a new file or overwrite an existing one inside the workspace. \
-         An existing file must have been read this run (read_file) and be \
-         unchanged on disk, or the write is refused. Parent directories are \
-         created as needed."
+         Provide exactly one of 'content' (UTF-8 text) or 'content_base64' \
+         (base64-encoded bytes, for binary files). An existing file must have \
+         been read this run (read_file) and be unchanged on disk, or the write \
+         is refused. Optionally pass 'expected_mtime_ms': if the target's \
+         current mtime (ms) differs, the write is refused with a structured \
+         conflict ({\"kind\":\"conflict\", ...} carrying both mtimes) so you \
+         can re-read and retry. Parent directories are created as needed."
             .into()
     }
 
@@ -160,6 +215,25 @@ impl Tool for WriteFile {
         ctx: Arc<ToolCtx>,
     ) -> BoxFuture<'static, ToolOutput> {
         Box::pin(async move {
+            use base64::Engine as _;
+            let bytes: Vec<u8> = match (input.content, input.content_base64) {
+                (Some(text), None) => text.into_bytes(),
+                (None, Some(b64)) => {
+                    match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                        Ok(b) => b,
+                        Err(e) => return ToolOutput::error(format!("invalid content_base64: {e}")),
+                    }
+                }
+                (Some(_), Some(_)) => {
+                    return ToolOutput::error(
+                        "set exactly one of content or content_base64, not both",
+                    );
+                }
+                (None, None) => {
+                    return ToolOutput::error("set exactly one of content or content_base64");
+                }
+            };
+
             let resolved = match ctx.policy.resolve_write(Path::new(&input.path)) {
                 Ok(p) => p,
                 Err(e) => return ToolOutput::error(e.to_string()),
@@ -174,6 +248,24 @@ impl Tool for WriteFile {
                 .ok()
                 .and_then(|m| m.modified().ok());
 
+            // Explicit optimistic-concurrency check, before anything is
+            // written. The conflict is STRUCTURED data — the caller reads both
+            // mtimes, re-reads the file, and retries. Composes with (never
+            // replaces) the read-before-write ledger below.
+            if let Some(expected) = input.expected_mtime_ms {
+                let actual = current.and_then(mtime_ms);
+                if actual != Some(expected) {
+                    return ToolOutput::error(
+                        serde_json::json!({
+                            "kind": "conflict",
+                            "expected_mtime_ms": expected,
+                            "actual_mtime_ms": actual,
+                        })
+                        .to_string(),
+                    );
+                }
+            }
+
             match ctx.file_times.check_write(&resolved, current) {
                 WriteCheck::NeverRead => {
                     return ToolOutput::error("must read_file before overwriting an existing file");
@@ -186,14 +278,20 @@ impl Tool for WriteFile {
                 WriteCheck::New | WriteCheck::Fresh => {}
             }
 
+            if current.is_some()
+                && let Err(abort) = observe_overwrite(&ctx, &resolved, None).await
+            {
+                return abort;
+            }
+
             if let Some(parent) = resolved.parent()
                 && let Err(e) = tokio::fs::create_dir_all(parent).await
             {
                 return ToolOutput::error(format!("cannot create parent dirs: {e}"));
             }
 
-            let n = input.content.len();
-            if let Err(e) = tokio::fs::write(&resolved, input.content.as_bytes()).await {
+            let n = bytes.len();
+            if let Err(e) = tokio::fs::write(&resolved, &bytes).await {
                 return ToolOutput::error(format!("cannot write {}: {e}", input.path));
             }
 
@@ -300,6 +398,10 @@ impl Tool for EditFile {
                 ));
             }
 
+            if let Err(abort) = observe_overwrite(&ctx, &resolved, Some(content.as_bytes())).await {
+                return abort;
+            }
+
             let updated = content.replacen(&input.old_string, &input.new_string, 1);
             if let Err(e) = tokio::fs::write(&resolved, updated.as_bytes()).await {
                 return ToolOutput::error(format!("cannot write {}: {e}", input.path));
@@ -386,5 +488,247 @@ impl Tool for ListFiles {
                 ToolOutput::ok(names.join("\n"))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ac_tool::SubtreePolicy;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    fn ctx_in(dir: &Path) -> Arc<ToolCtx> {
+        Arc::new(ToolCtx::new(Arc::new(SubtreePolicy::new(dir).unwrap())))
+    }
+
+    async fn read(ctx: &Arc<ToolCtx>, path: &str) -> ToolOutput {
+        Arc::new(ReadFile)
+            .run(ReadFileInput { path: path.into() }, ctx.clone())
+            .await
+    }
+
+    async fn write(ctx: &Arc<ToolCtx>, input: WriteFileInput) -> ToolOutput {
+        Arc::new(WriteFile).run(input, ctx.clone()).await
+    }
+
+    async fn edit(ctx: &Arc<ToolCtx>, path: &str, old: &str, new: &str) -> ToolOutput {
+        Arc::new(EditFile)
+            .run(
+                EditFileInput {
+                    path: path.into(),
+                    old_string: old.into(),
+                    new_string: new.into(),
+                },
+                ctx.clone(),
+            )
+            .await
+    }
+
+    fn text_input(path: &str, content: &str) -> WriteFileInput {
+        WriteFileInput {
+            path: path.into(),
+            content: Some(content.into()),
+            content_base64: None,
+            expected_mtime_ms: None,
+        }
+    }
+
+    fn disk_mtime_ms(path: &Path) -> u64 {
+        mtime_ms(std::fs::metadata(path).unwrap().modified().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn expected_mtime_conflict_is_structured_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "v1").unwrap();
+        let ctx = ctx_in(dir.path());
+        read(&ctx, "a.txt").await;
+        let expected = disk_mtime_ms(&path);
+
+        // Move the on-disk mtime forward, as an outside writer would.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_modified(later).unwrap();
+        drop(f);
+        let actual = disk_mtime_ms(&path);
+        assert_ne!(expected, actual);
+
+        let out = write(
+            &ctx,
+            WriteFileInput {
+                expected_mtime_ms: Some(expected),
+                ..text_input("a.txt", "v2")
+            },
+        )
+        .await;
+        assert!(out.is_error);
+        let v: serde_json::Value = serde_json::from_str(&out.content).expect("structured conflict");
+        assert_eq!(v["kind"], "conflict");
+        assert_eq!(v["expected_mtime_ms"], expected);
+        assert_eq!(v["actual_mtime_ms"], actual);
+        // Refused BEFORE writing: the prior contents are intact.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
+    }
+
+    #[tokio::test]
+    async fn matching_expected_mtime_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "v1").unwrap();
+        let ctx = ctx_in(dir.path());
+        read(&ctx, "a.txt").await;
+
+        let out = write(
+            &ctx,
+            WriteFileInput {
+                expected_mtime_ms: Some(disk_mtime_ms(&path)),
+                ..text_input("a.txt", "v2")
+            },
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v2");
+    }
+
+    #[tokio::test]
+    async fn content_base64_round_trips_bytes() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        let bytes: Vec<u8> = vec![0, 255, 128, 10, 13, 0, 7];
+
+        let out = write(
+            &ctx,
+            WriteFileInput {
+                path: "bin.dat".into(),
+                content: None,
+                content_base64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                expected_mtime_ms: None,
+            },
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("wrote 7 bytes"));
+        assert_eq!(std::fs::read(dir.path().join("bin.dat")).unwrap(), bytes);
+
+        let bad = write(
+            &ctx,
+            WriteFileInput {
+                path: "bad.dat".into(),
+                content: None,
+                content_base64: Some("not base64!!".into()),
+                expected_mtime_ms: None,
+            },
+        )
+        .await;
+        assert!(bad.is_error);
+        assert!(bad.content.contains("content_base64"));
+    }
+
+    #[tokio::test]
+    async fn exactly_one_content_form_is_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+
+        let both = write(
+            &ctx,
+            WriteFileInput {
+                path: "x.txt".into(),
+                content: Some("a".into()),
+                content_base64: Some("YQ==".into()),
+                expected_mtime_ms: None,
+            },
+        )
+        .await;
+        assert!(both.is_error);
+        assert!(both.content.contains("exactly one"));
+
+        let neither = write(
+            &ctx,
+            WriteFileInput {
+                path: "x.txt".into(),
+                content: None,
+                content_base64: None,
+                expected_mtime_ms: None,
+            },
+        )
+        .await;
+        assert!(neither.is_error);
+        assert!(neither.content.contains("exactly one"));
+
+        assert!(!dir.path().join("x.txt").exists());
+    }
+
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<(PathBuf, Vec<u8>)>>);
+
+    impl WriteObserver for Recording {
+        fn before_overwrite(&self, path: &Path, prior: &[u8]) -> Result<(), String> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), prior.to_vec()));
+            Ok(())
+        }
+    }
+
+    struct Failing;
+
+    impl WriteObserver for Failing {
+        fn before_overwrite(&self, _path: &Path, _prior: &[u8]) -> Result<(), String> {
+            Err("history store unavailable".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_sees_prior_bytes_on_overwrite_and_edit_but_not_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "v1").unwrap();
+        let ctx = ctx_in(dir.path());
+        let recording = Arc::new(Recording::default());
+        ctx.extensions
+            .insert(recording.clone() as Arc<dyn WriteObserver>);
+
+        read(&ctx, "a.txt").await;
+        let overwrote = write(&ctx, text_input("a.txt", "v2")).await;
+        assert!(!overwrote.is_error, "{}", overwrote.content);
+        let edited = edit(&ctx, "a.txt", "v2", "v3").await;
+        assert!(!edited.is_error, "{}", edited.content);
+        // New-file creation must not invoke the observer.
+        let created = write(&ctx, text_input("new.txt", "fresh")).await;
+        assert!(!created.is_error, "{}", created.content);
+
+        let seen = recording.0.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].0.ends_with("a.txt"));
+        assert_eq!(seen[0].1, b"v1");
+        assert_eq!(seen[1].1, b"v2");
+    }
+
+    #[tokio::test]
+    async fn failing_observer_aborts_write_and_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "v1").unwrap();
+        let ctx = ctx_in(dir.path());
+        ctx.extensions
+            .insert(Arc::new(Failing) as Arc<dyn WriteObserver>);
+        read(&ctx, "a.txt").await;
+
+        let out = write(&ctx, text_input("a.txt", "v2")).await;
+        assert!(out.is_error);
+        assert!(out.content.contains("history store unavailable"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
+
+        let out = edit(&ctx, "a.txt", "v1", "v2").await;
+        assert!(out.is_error);
+        assert!(out.content.contains("history store unavailable"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
+
+        // A failing observer never blocks creating a NEW file.
+        let created = write(&ctx, text_input("new.txt", "fresh")).await;
+        assert!(!created.is_error, "{}", created.content);
     }
 }

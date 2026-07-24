@@ -45,34 +45,7 @@ impl SubtreePolicy {
             self.root.join(path)
         };
 
-        // Fold `.`/`..` lexically first so the ancestor walk below never sees
-        // them; the containment verdict comes from the canonicalized result,
-        // so this cannot loosen the check.
-        let normalized = normalize_lexically(&joined)
-            .ok_or_else(|| PolicyError::Invalid(joined.display().to_string()))?;
-
-        // Split into deepest existing ancestor (canonicalized, so symlinks in
-        // it are resolved) + the not-yet-existing tail.
-        let mut existing = normalized.clone();
-        let mut tail: Vec<std::ffi::OsString> = Vec::new();
-        loop {
-            if existing.exists() {
-                break;
-            }
-            match (existing.file_name(), existing.parent()) {
-                (Some(name), Some(parent)) => {
-                    tail.push(name.to_os_string());
-                    existing = parent.to_path_buf();
-                }
-                _ => return Err(PolicyError::Invalid(joined.display().to_string())),
-            }
-        }
-        let mut resolved = existing
-            .canonicalize()
-            .map_err(|e| PolicyError::Invalid(format!("{}: {e}", existing.display())))?;
-        for component in tail.iter().rev() {
-            resolved.push(component);
-        }
+        let resolved = resolve_on_disk(&joined)?;
 
         if !resolved.starts_with(&self.root) {
             return Err(PolicyError::Outside(joined.display().to_string()));
@@ -223,6 +196,16 @@ impl PathPolicy for SwapPolicy {
 #[derive(Default)]
 pub struct ReadGrants {
     roots: RwLock<Vec<SubtreePolicy>>,
+    files: RwLock<Vec<FileGrant>>,
+}
+
+/// A single-file grant: the canonicalized parent directory plus the file name.
+/// Keeping the name un-resolved (only the parent is canonicalized) means the
+/// grant names one directory ENTRY — it matches however the caller spells the
+/// intermediate components (symlinks included) and never widens to siblings.
+struct FileGrant {
+    parent: PathBuf,
+    name: std::ffi::OsString,
 }
 
 impl ReadGrants {
@@ -242,6 +225,38 @@ impl ReadGrants {
         Ok(())
     }
 
+    /// Grant read access to exactly one file — never its siblings, never a
+    /// subtree. The parent directory must exist (it is canonicalized here, the
+    /// same planted-symlink defense as [`grant`](ReadGrants::grant)); the file
+    /// name is kept as spelled, so the grant denotes that directory entry.
+    pub fn grant_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let name = path
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("not a file path: {}", path.display()),
+                )
+            })?
+            .to_os_string();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("file grant needs a parent directory: {}", path.display()),
+                )
+            })?
+            .canonicalize()?;
+        let mut files = self.files.write().expect("read-grants lock poisoned");
+        if !files.iter().any(|g| g.parent == parent && g.name == name) {
+            files.push(FileGrant { parent, name });
+        }
+        Ok(())
+    }
+
     /// The canonicalized roots granted so far, in grant order.
     pub fn roots(&self) -> Vec<PathBuf> {
         self.roots
@@ -253,8 +268,31 @@ impl ReadGrants {
     }
 
     fn resolve_read(&self, path: &Path) -> Option<PathBuf> {
-        let roots = self.roots.read().expect("read-grants lock poisoned");
-        roots.iter().find_map(|p| p.resolve_read(path).ok())
+        {
+            let roots = self.roots.read().expect("read-grants lock poisoned");
+            if let Some(resolved) = roots.iter().find_map(|p| p.resolve_read(path).ok()) {
+                return Some(resolved);
+            }
+        }
+        // File grants: canonicalize the candidate's parent (so any spelling of
+        // the intermediate components lands on the same directory) and compare
+        // the entry name against each grant.
+        let name = path.file_name()?;
+        let parent = path.parent()?.canonicalize().ok()?;
+        let files = self.files.read().expect("read-grants lock poisoned");
+        files
+            .iter()
+            .find(|g| g.parent == parent && g.name == name)
+            .and_then(|g| {
+                // The grant denotes that directory entry, not whatever it may
+                // link to: a symlinked entry would leak an arbitrary target
+                // with zero containment. Resolve the leaf and require the real
+                // file to still be this exact entry.
+                let real = g.parent.join(&g.name).canonicalize().ok()?;
+                (real.parent() == Some(g.parent.as_path())
+                    && real.file_name() == Some(g.name.as_os_str()))
+                .then_some(real)
+            })
     }
 }
 
@@ -298,6 +336,149 @@ impl PathPolicy for GrantedReadPolicy {
     fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
         self.inner.resolve_write(path)
     }
+}
+
+/// Combinator: mount other policies under virtual name prefixes. A RELATIVE
+/// candidate whose leading path segment equals a mount's prefix (full-segment
+/// match — `auxx/f` does not match mount `aux`) has the prefix stripped and
+/// the remainder judged by that mount's policy, whose own containment applies
+/// (`aux/../escape` is the mount's refusal, never a hop into another tree).
+/// Everything else — absolute paths included — delegates to the inner policy
+/// untouched, so a mount never shadows a real path. Lets a host expose side
+/// trees under stable virtual names without them living inside the primary
+/// root. Symlink safety is preserved because resolution is always delegated.
+pub struct PrefixRemapPolicy {
+    pub inner: Arc<dyn PathPolicy>,
+    pub mounts: Vec<(String, Arc<dyn PathPolicy>)>,
+}
+
+impl PrefixRemapPolicy {
+    fn route(&self, path: &Path) -> Option<(&dyn PathPolicy, PathBuf)> {
+        if path.is_absolute() {
+            return None;
+        }
+        // "aux/f" and "./aux/f" must denote the same file: `strip_prefix`
+        // treats a leading `.` as a mismatch, which would silently route the
+        // dotted spelling to the inner tree instead of the mount. Fold CurDir
+        // components before matching.
+        let folded: PathBuf = path
+            .components()
+            .filter(|c| !matches!(c, Component::CurDir))
+            .collect();
+        self.mounts.iter().find_map(|(prefix, policy)| {
+            folded
+                .strip_prefix(prefix)
+                .ok()
+                .map(|rest| (policy.as_ref(), rest.to_path_buf()))
+        })
+    }
+}
+
+impl PathPolicy for PrefixRemapPolicy {
+    fn root(&self) -> PathBuf {
+        self.inner.root()
+    }
+
+    fn resolve_read(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        match self.route(path) {
+            Some((mount, rest)) => mount.resolve_read(&rest),
+            None => self.inner.resolve_read(path),
+        }
+    }
+
+    fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        match self.route(path) {
+            Some((mount, rest)) => mount.resolve_write(&rest),
+            None => self.inner.resolve_write(path),
+        }
+    }
+}
+
+/// Combinator: a deny-list applied AFTER the inner policy resolves — the check
+/// runs on the resolved real path, so a symlink that resolves into a denied
+/// subtree is caught even though its lexical path looks clean. A denied entry
+/// covers itself and its whole subtree. Reads and writes carry separate lists
+/// (denying writes says nothing about reads, and vice versa). Entries are
+/// host-supplied absolute paths, resolved against disk on every check so an
+/// entry that is itself (or contains) a symlink keeps tracking its target.
+pub struct DenyPolicy {
+    pub inner: Arc<dyn PathPolicy>,
+    pub deny_write: Vec<PathBuf>,
+    pub deny_read: Vec<PathBuf>,
+}
+
+impl DenyPolicy {
+    fn check(
+        resolved: PathBuf,
+        denies: &[PathBuf],
+        candidate: &Path,
+    ) -> Result<PathBuf, PolicyError> {
+        for deny in denies {
+            // Fail closed: a deny entry that cannot be resolved (bad spelling,
+            // permission error on an ancestor) must refuse the access, not
+            // silently drop out of the deny set — an unevaluable deny is not
+            // an absent one.
+            let denied = resolve_on_disk(deny).map_err(|e| {
+                PolicyError::Denied(format!(
+                    "deny entry {} could not be resolved (failing closed): {e}",
+                    deny.display()
+                ))
+            })?;
+            if resolved.starts_with(&denied) {
+                return Err(PolicyError::Denied(format!(
+                    "path is on the deny list: {}",
+                    candidate.display()
+                )));
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+impl PathPolicy for DenyPolicy {
+    fn root(&self) -> PathBuf {
+        self.inner.root()
+    }
+
+    fn resolve_read(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        Self::check(self.inner.resolve_read(path)?, &self.deny_read, path)
+    }
+
+    fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        Self::check(self.inner.resolve_write(path)?, &self.deny_write, path)
+    }
+}
+
+/// Resolve `path` against what exists on disk: canonicalize the deepest
+/// existing ancestor (so symlinks in it are followed) and re-append the
+/// not-yet-existing tail. `.`/`..` are folded lexically first so the ancestor
+/// walk never sees them; any verdict a caller takes from the result rests on
+/// the canonicalized ancestor, so the lexical fold cannot loosen a check.
+fn resolve_on_disk(path: &Path) -> Result<PathBuf, PolicyError> {
+    let normalized = normalize_lexically(path)
+        .ok_or_else(|| PolicyError::Invalid(path.display().to_string()))?;
+
+    let mut existing = normalized.clone();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if existing.exists() {
+            break;
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            _ => return Err(PolicyError::Invalid(path.display().to_string())),
+        }
+    }
+    let mut resolved = existing
+        .canonicalize()
+        .map_err(|e| PolicyError::Invalid(format!("{}: {e}", existing.display())))?;
+    for component in tail.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
 }
 
 fn normalize_lexically(path: &Path) -> Option<PathBuf> {
@@ -494,6 +675,303 @@ mod tests {
             granted.resolve_read(&grant_root.join("link/secret")),
             Err(PolicyError::Outside(_))
         ));
+    }
+
+    #[test]
+    fn prefix_remap_routes_reads_and_writes_through_a_mount() {
+        let primary = tempfile::tempdir().unwrap();
+        let mount_dir = tempfile::tempdir().unwrap();
+        std::fs::write(mount_dir.path().join("f.txt"), "m").unwrap();
+        let inner = Arc::new(SubtreePolicy::new(primary.path()).unwrap());
+        let mount = Arc::new(SubtreePolicy::new(mount_dir.path()).unwrap());
+        let mount_root = mount.root();
+        let remap = PrefixRemapPolicy {
+            inner: inner.clone(),
+            mounts: vec![("aux".into(), mount)],
+        };
+
+        assert_eq!(remap.root(), inner.root());
+        assert_eq!(
+            remap.resolve_read(Path::new("aux/f.txt")).unwrap(),
+            mount_root.join("f.txt")
+        );
+        let wrote = remap.resolve_write(Path::new("aux/new.txt")).unwrap();
+        assert!(wrote.starts_with(&mount_root));
+        // The bare prefix denotes the mount root itself.
+        assert_eq!(remap.resolve_read(Path::new("aux")).unwrap(), mount_root);
+    }
+
+    #[test]
+    fn prefix_remap_matches_full_segments_only() {
+        let primary = tempfile::tempdir().unwrap();
+        let mount_dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(SubtreePolicy::new(primary.path()).unwrap());
+        let inner_root = inner.root();
+        let mount = Arc::new(SubtreePolicy::new(mount_dir.path()).unwrap());
+        let remap = PrefixRemapPolicy {
+            inner,
+            mounts: vec![("aux".into(), mount)],
+        };
+
+        // "auxx/f" must NOT match mount "aux" — it is an inner-tree path.
+        let resolved = remap.resolve_write(Path::new("auxx/f.txt")).unwrap();
+        assert!(resolved.starts_with(&inner_root));
+    }
+
+    #[test]
+    fn prefix_remap_escape_via_a_mount_is_refused_by_the_mount() {
+        let primary = tempfile::tempdir().unwrap();
+        let mount_dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(SubtreePolicy::new(primary.path()).unwrap());
+        let mount = Arc::new(SubtreePolicy::new(mount_dir.path()).unwrap());
+        let remap = PrefixRemapPolicy {
+            inner,
+            mounts: vec![("aux".into(), mount)],
+        };
+
+        assert!(matches!(
+            remap.resolve_read(Path::new("aux/../outside.txt")),
+            Err(PolicyError::Outside(_))
+        ));
+        assert!(matches!(
+            remap.resolve_write(Path::new("aux/../outside.txt")),
+            Err(PolicyError::Outside(_))
+        ));
+    }
+
+    #[test]
+    fn prefix_remap_absolute_paths_bypass_the_mounts() {
+        let primary = tempfile::tempdir().unwrap();
+        let mount_dir = tempfile::tempdir().unwrap();
+        std::fs::write(mount_dir.path().join("f.txt"), "m").unwrap();
+        let inner = Arc::new(SubtreePolicy::new(primary.path()).unwrap());
+        let inner_root = inner.root();
+        let mount = Arc::new(SubtreePolicy::new(mount_dir.path()).unwrap());
+        let mount_root = mount.root();
+        let remap = PrefixRemapPolicy {
+            inner,
+            mounts: vec![("aux".into(), mount)],
+        };
+
+        // Absolute inside the inner root: judged (and admitted) by inner.
+        let resolved = remap.resolve_read(&inner_root.join("x.txt")).unwrap();
+        assert!(resolved.starts_with(&inner_root));
+        // Absolute inside the MOUNT's real root: still judged by inner — the
+        // mount only exists under its virtual name.
+        assert!(matches!(
+            remap.resolve_read(&mount_root.join("f.txt")),
+            Err(PolicyError::Outside(_))
+        ));
+    }
+
+    #[test]
+    fn deny_covers_the_entry_and_its_subtree_per_access_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("secret")).unwrap();
+        let inner = Arc::new(SubtreePolicy::new(dir.path()).unwrap());
+        let deny = DenyPolicy {
+            inner: inner.clone(),
+            deny_write: vec![dir.path().join("secret")],
+            deny_read: vec![],
+        };
+
+        assert_eq!(deny.root(), inner.root());
+        // The entry itself and anything under it are write-denied...
+        assert!(matches!(
+            deny.resolve_write(Path::new("secret")),
+            Err(PolicyError::Denied(_))
+        ));
+        assert!(matches!(
+            deny.resolve_write(Path::new("secret/f.txt")),
+            Err(PolicyError::Denied(_))
+        ));
+        // ...while reads (a separate list) and sibling writes pass through.
+        assert!(deny.resolve_read(Path::new("secret/f.txt")).is_ok());
+        assert!(deny.resolve_write(Path::new("ok.txt")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_catches_a_symlink_resolving_into_a_denied_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("secret")).unwrap();
+        std::fs::write(dir.path().join("secret/f.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("secret"), dir.path().join("link")).unwrap();
+        let inner = Arc::new(SubtreePolicy::new(dir.path()).unwrap());
+        let deny = DenyPolicy {
+            inner,
+            deny_write: vec![],
+            deny_read: vec![dir.path().join("secret")],
+        };
+
+        // The lexical path never mentions the denied subtree; the resolved
+        // real path does, and that is what the deny check sees.
+        assert!(matches!(
+            deny.resolve_read(Path::new("link/f.txt")),
+            Err(PolicyError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn prefix_remap_dotted_spelling_routes_identically() {
+        let primary = tempfile::tempdir().unwrap();
+        let mount_dir = tempfile::tempdir().unwrap();
+        std::fs::write(mount_dir.path().join("f.txt"), "m").unwrap();
+        let inner = Arc::new(SubtreePolicy::new(primary.path()).unwrap());
+        let mount = Arc::new(SubtreePolicy::new(mount_dir.path()).unwrap());
+        let mount_root = mount.root();
+        let remap = PrefixRemapPolicy {
+            inner,
+            mounts: vec![("aux".into(), mount)],
+        };
+
+        // One name, one file: a leading `./` must not reroute to the inner
+        // tree (a model spelling difference would otherwise fork the mount).
+        assert_eq!(
+            remap.resolve_read(Path::new("./aux/f.txt")).unwrap(),
+            remap.resolve_read(Path::new("aux/f.txt")).unwrap(),
+        );
+        let wrote = remap.resolve_write(Path::new("./aux/new.txt")).unwrap();
+        assert!(wrote.starts_with(&mount_root));
+    }
+
+    #[test]
+    fn deny_fails_closed_when_an_entry_cannot_be_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        let inner = Arc::new(SubtreePolicy::new(dir.path()).unwrap());
+        // `/..`-prefixed: lexical normalization pops past the root and the
+        // entry cannot be resolved. It must refuse the access, not silently
+        // drop out of the deny set.
+        let bad_entry = Path::new("/..").join(
+            dir.path()
+                .strip_prefix("/")
+                .unwrap_or(dir.path())
+                .join("f.txt"),
+        );
+        let deny = DenyPolicy {
+            inner,
+            deny_write: vec![],
+            deny_read: vec![bad_entry],
+        };
+
+        assert!(matches!(
+            deny.resolve_read(Path::new("f.txt")),
+            Err(PolicyError::Denied(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_grant_refuses_a_symlinked_entry() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("target.txt"), "secret").unwrap();
+        let grant_dir = tempfile::tempdir().unwrap();
+        std::fs::write(grant_dir.path().join("sibling.txt"), "s").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("target.txt"),
+            grant_dir.path().join("link.txt"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            grant_dir.path().join("sibling.txt"),
+            grant_dir.path().join("local-link.txt"),
+        )
+        .unwrap();
+        let (_dir, inner) = policy();
+        let grants = Arc::new(ReadGrants::new());
+        grants
+            .grant_file(grant_dir.path().join("link.txt"))
+            .unwrap();
+        grants
+            .grant_file(grant_dir.path().join("local-link.txt"))
+            .unwrap();
+        let granted = GrantedReadPolicy::new(Arc::new(inner), grants);
+
+        // The grant denotes the entry, not its target: a symlink out of the
+        // directory (or onto an ungranted sibling) must not be followed.
+        assert!(
+            granted
+                .resolve_read(&grant_dir.path().join("link.txt"))
+                .is_err()
+        );
+        assert!(
+            granted
+                .resolve_read(&grant_dir.path().join("local-link.txt"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_file_grant_covers_exactly_that_file() {
+        let (_dir, inner) = policy();
+        let grants = Arc::new(ReadGrants::new());
+        let granted = GrantedReadPolicy::new(Arc::new(inner), grants.clone());
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().canonicalize().unwrap();
+        std::fs::write(outside_root.join("f.txt"), "granted").unwrap();
+        std::fs::write(outside_root.join("sibling.txt"), "not granted").unwrap();
+        std::fs::create_dir(outside_root.join("sub")).unwrap();
+        std::fs::write(outside_root.join("sub/inner.txt"), "not granted").unwrap();
+
+        grants.grant_file(outside_root.join("f.txt")).unwrap();
+
+        // Exactly the granted file resolves...
+        assert_eq!(
+            granted.resolve_read(&outside_root.join("f.txt")).unwrap(),
+            outside_root.join("f.txt")
+        );
+        // ...its sibling does not, nor a file one level down.
+        assert!(
+            granted
+                .resolve_read(&outside_root.join("sibling.txt"))
+                .is_err()
+        );
+        assert!(
+            granted
+                .resolve_read(&outside_root.join("sub/inner.txt"))
+                .is_err()
+        );
+        // A file grant never widens writes.
+        assert!(granted.resolve_write(&outside_root.join("f.txt")).is_err());
+        // The parent directory must exist at grant time.
+        assert!(
+            grants
+                .grant_file(outside_root.join("missing/f.txt"))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_grant_matches_through_symlinked_parent_components() {
+        let (_dir, inner) = policy();
+        let grants = Arc::new(ReadGrants::new());
+        let granted = GrantedReadPolicy::new(Arc::new(inner), grants.clone());
+
+        let real = tempfile::tempdir().unwrap();
+        let real_root = real.path().canonicalize().unwrap();
+        std::fs::write(real_root.join("f.txt"), "granted").unwrap();
+        let link_holder = tempfile::tempdir().unwrap();
+        let link = link_holder.path().join("link");
+        std::os::unix::fs::symlink(&real_root, &link).unwrap();
+
+        // Granted via the symlinked spelling; the canonical parent is stored.
+        grants.grant_file(link.join("f.txt")).unwrap();
+
+        // Both spellings resolve to the same real file...
+        assert_eq!(
+            granted.resolve_read(&link.join("f.txt")).unwrap(),
+            real_root.join("f.txt")
+        );
+        assert_eq!(
+            granted.resolve_read(&real_root.join("f.txt")).unwrap(),
+            real_root.join("f.txt")
+        );
+        // ...and a sibling stays refused through either spelling.
+        std::fs::write(real_root.join("sibling.txt"), "no").unwrap();
+        assert!(granted.resolve_read(&link.join("sibling.txt")).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

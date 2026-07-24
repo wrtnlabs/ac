@@ -5,6 +5,7 @@
 
 mod agent;
 mod ctx;
+mod observer;
 mod policy;
 mod registry;
 mod sandbox;
@@ -16,9 +17,10 @@ pub use agent::{
     ToolScope, as_dyn,
 };
 pub use ctx::{Extensions, FileTimes, PathLocks, ToolCtx, WriteCheck};
+pub use observer::WriteObserver;
 pub use policy::{
-    GrantedReadPolicy, PathPolicy, PolicyError, ReadGrants, ReadOnlyPolicy, SplitPolicy,
-    SubtreePolicy, SwapPolicy,
+    DenyPolicy, GrantedReadPolicy, PathPolicy, PolicyError, PrefixRemapPolicy, ReadGrants,
+    ReadOnlyPolicy, SplitPolicy, SubtreePolicy, SwapPolicy,
 };
 pub use registry::ToolRegistry;
 pub use sandbox::{

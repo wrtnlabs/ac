@@ -11,9 +11,9 @@
 //! says so (`sandbox.mode == "off"`). A host that needs isolation installs a
 //! launcher (see the `ac-sandbox` crate).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ac_approvals::{ApprovalConfig, RoleContainment, Verdict};
@@ -38,8 +38,146 @@ impl RoleContainment for PolicyContainment<'_> {
     }
 }
 
-/// Per-stream capture cap (~32 KiB); output beyond it is dropped and flagged.
+/// Per-stream capture cap (~32 KiB); the envelope's tails stop here. Output
+/// beyond it is flagged AND spilled in full to a log file (see [`SpillSink`]).
 const STREAM_CAP: usize = 32 * 1024;
+/// Full-transcript spill cap (both streams combined); the spill file itself
+/// notes truncation when it is hit.
+const SPILL_CAP: u64 = 8 * 1024 * 1024;
+
+/// Where shell spill files go. A host installs one in `ctx.extensions` to
+/// choose the directory; absent, a subdirectory of the OS temp dir is used.
+/// The directory is created lazily, only when a spill actually happens.
+pub struct ShellSpillDir(pub PathBuf);
+
+/// Lazily-created spill file shared by both stream drains. Until the first
+/// overflow byte the transcript is only buffered in memory (bounded: at most
+/// both in-memory heads plus one read chunk, since overflow triggers
+/// activation); on first overflow the file is created and the buffer flushed,
+/// so the file always carries the FULL transcript from byte 0.
+///
+/// Format: both streams interleaved in arrival order, as a merged terminal
+/// shows them — chunk-granular, so ordering across the two streams is
+/// best-effort. Chosen over sectioning because it needs no second buffering
+/// pass and keeps the file readable top-to-bottom as the command ran.
+///
+/// Spill failures are never tool errors: the in-memory tails still ride the
+/// result; the sink just goes dead (`failed`) so memory stays bounded.
+struct SpillSink {
+    dir: PathBuf,
+    state: Mutex<SpillState>,
+}
+
+#[derive(Default)]
+struct SpillState {
+    prelude: Vec<u8>,
+    file: Option<std::fs::File>,
+    path: Option<PathBuf>,
+    written: u64,
+    capped: bool,
+    failed: bool,
+}
+
+impl SpillSink {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            state: Mutex::new(SpillState::default()),
+        }
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        let mut state = self.state.lock().expect("spill lock poisoned");
+        if state.failed {
+            return;
+        }
+        if state.file.is_some() {
+            Self::append(&mut state, bytes);
+        } else {
+            state.prelude.extend_from_slice(bytes);
+        }
+    }
+
+    /// First overflow byte seen: create the file and flush everything buffered.
+    fn activate(&self) {
+        let mut state = self.state.lock().expect("spill lock poisoned");
+        if state.file.is_some() || state.failed {
+            return;
+        }
+        let created = Self::create_private_dir(&self.dir).and_then(|_| {
+            let path = self.dir.join(format!("{}.log", uuid::Uuid::new_v4()));
+            Self::create_private_file(&path).map(|f| (f, path))
+        });
+        match created {
+            Ok((file, path)) => {
+                state.file = Some(file);
+                state.path = Some(path);
+                let prelude = std::mem::take(&mut state.prelude);
+                Self::append(&mut state, &prelude);
+            }
+            Err(_) => {
+                state.failed = true;
+                state.prelude = Vec::new();
+            }
+        }
+    }
+
+    /// Spill transcripts carry whatever the command printed — routinely
+    /// secrets — and the default dir lives under the world-writable tmp root,
+    /// so on unix the directory is forced to 0700 (tightening a pre-existing
+    /// one; failing if it belongs to someone else) and each file is 0600,
+    /// opened with `create_new` so a pre-planted name can never be followed.
+    fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    }
+
+    fn append(state: &mut SpillState, bytes: &[u8]) {
+        use std::io::Write;
+        if state.capped {
+            return;
+        }
+        let take = bytes.len().min((SPILL_CAP - state.written) as usize);
+        let Some(file) = state.file.as_mut() else {
+            return;
+        };
+        if file.write_all(&bytes[..take]).is_err() {
+            state.failed = true;
+            return;
+        }
+        state.written += take as u64;
+        if take < bytes.len() {
+            state.capped = true;
+            let _ = file.write_all(b"\n[spill truncated: transcript exceeds the spill cap]\n");
+        }
+    }
+
+    /// The spill file's path, iff a spill happened (flushed).
+    fn finish(&self) -> Option<PathBuf> {
+        use std::io::Write;
+        let mut state = self.state.lock().expect("spill lock poisoned");
+        if let Some(file) = state.file.as_mut() {
+            let _ = file.flush();
+        }
+        state.path.clone()
+    }
+}
 /// Hard wall-clock timeout for a command.
 const TIMEOUT: Duration = Duration::from_secs(120);
 /// Grace period to reap the child and collect output after it exits or is
@@ -89,11 +227,14 @@ impl Tool for Shell {
     fn description(&self) -> String {
         "Run a command via 'sh -c' inside the workspace. cwd defaults to the \
          workspace root and must resolve inside it. Output is capped (~32 KiB \
-         per stream); the command and anything it forks are killed after 120s, \
-         on cancel, or when the call returns (no lingering background \
-         processes). When the host has installed an OS sandbox the command is \
-         kernel-contained and the result reports 'sandbox.mode'; otherwise it \
-         runs with the host's own privileges ('sandbox.mode':'off')."
+         per stream); when output overflows the cap, the full transcript (both \
+         streams, in arrival order) is spilled to a log file and the result \
+         carries its path as 'output_path' — read it for the rest. The command \
+         and anything it forks are killed after 120s, on cancel, or when the \
+         call returns (no lingering background processes). When the host has \
+         installed an OS sandbox the command is kernel-contained and the \
+         result reports 'sandbox.mode'; otherwise it runs with the host's own \
+         privileges ('sandbox.mode':'off')."
             .into()
     }
 
@@ -185,10 +326,23 @@ impl Tool for Shell {
             };
             let pid = child.id();
 
+            let spill_dir = ctx
+                .extensions
+                .get::<ShellSpillDir>()
+                .map(|d| d.0.clone())
+                .unwrap_or_else(|| std::env::temp_dir().join("ac-shell-spill"));
+            let spill = Arc::new(SpillSink::new(spill_dir));
+
             let stdout = child.stdout.take();
             let stderr = child.stderr.take();
-            let out_task = tokio::spawn(async move { drain(stdout).await });
-            let err_task = tokio::spawn(async move { drain(stderr).await });
+            let out_task = {
+                let spill = spill.clone();
+                tokio::spawn(async move { drain(stdout, spill).await })
+            };
+            let err_task = {
+                let spill = spill.clone();
+                tokio::spawn(async move { drain(stderr, spill).await })
+            };
 
             let mut killed: Option<&str> = None;
             let mut exit_code: Option<i32> = None;
@@ -233,6 +387,9 @@ impl Tool for Shell {
             if truncated {
                 result["truncated"] = serde_json::Value::Bool(true);
             }
+            if let Some(path) = spill.finish() {
+                result["output_path"] = serde_json::Value::String(path.display().to_string());
+            }
             if let Some(reason) = killed {
                 result["killed"] = serde_json::Value::String(reason.to_string());
             }
@@ -249,10 +406,11 @@ impl Tool for Shell {
     }
 }
 
-/// Read a child pipe to EOF, keeping only the first [`STREAM_CAP`] bytes while
-/// still draining the rest so the child never blocks on a full pipe. Returns
-/// the captured text and whether output was dropped.
-async fn drain<R>(reader: Option<R>) -> (String, bool)
+/// Read a child pipe to EOF, keeping the first [`STREAM_CAP`] bytes in memory
+/// as the envelope's tail while teeing EVERY byte into the shared spill sink;
+/// the sink is activated (file created, buffer flushed) on this stream's first
+/// overflow byte. Returns the captured text and whether output overflowed.
+async fn drain<R>(reader: Option<R>, spill: Arc<SpillSink>) -> (String, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -267,14 +425,17 @@ where
         match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
+                spill.push(&chunk[..n]);
                 if buf.len() < STREAM_CAP {
                     let take = (STREAM_CAP - buf.len()).min(n);
                     buf.extend_from_slice(&chunk[..take]);
-                    if take < n {
+                    if take < n && !truncated {
                         truncated = true;
+                        spill.activate();
                     }
-                } else {
+                } else if !truncated {
                     truncated = true;
+                    spill.activate();
                 }
             }
             Err(_) => break,
@@ -297,6 +458,76 @@ mod tests {
             },
             ctx,
         )
+    }
+
+    #[tokio::test]
+    async fn over_cap_output_spills_the_full_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill_dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions
+            .insert(ShellSpillDir(spill_dir.path().to_path_buf()));
+
+        // ~1.3 MB of stdout — far past the 32 KiB in-memory head.
+        let out = run("seq 1 200000", ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        let v: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(v["truncated"], true);
+
+        // The spill landed in the host-injected directory...
+        let path = std::path::PathBuf::from(v["output_path"].as_str().expect("output_path"));
+        assert!(path.starts_with(spill_dir.path()), "{}", path.display());
+        // ...carries bytes beyond the in-memory head...
+        let spilled = std::fs::read(&path).unwrap();
+        assert!(spilled.len() > STREAM_CAP, "only {} bytes", spilled.len());
+        // ...and is the transcript from byte 0: its head equals the tail head.
+        let head = v["stdout_tail"].as_str().unwrap().as_bytes();
+        assert_eq!(&spilled[..head.len()], head);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spill_files_are_private_to_the_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let spill_root = tempfile::tempdir().unwrap();
+        let spill_dir = spill_root.path().join("spill");
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions.insert(ShellSpillDir(spill_dir.clone()));
+
+        let out = run("seq 1 200000", ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        let v: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        let path = std::path::PathBuf::from(v["output_path"].as_str().expect("output_path"));
+
+        // Transcripts can carry secrets: the dir is 0700 and the file 0600,
+        // even under a permissive umask.
+        let dir_mode = std::fs::metadata(&spill_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "spill dir mode {dir_mode:o}");
+        assert_eq!(file_mode, 0o600, "spill file mode {file_mode:o}");
+    }
+
+    #[tokio::test]
+    async fn under_cap_output_does_not_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let spill_dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions
+            .insert(ShellSpillDir(spill_dir.path().to_path_buf()));
+
+        let out = run("echo hi", ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        let v: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert!(v.get("output_path").is_none());
+        assert!(v.get("truncated").is_none());
+        assert_eq!(std::fs::read_dir(spill_dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
