@@ -18,7 +18,7 @@
 //! wraps calls in its runtime's blocking facility.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ac_types::{Message, Role};
@@ -52,6 +52,14 @@ pub enum StoreError {
     /// the door, not discovered mid-session; carries the first check line.
     #[error("store failed the integrity check: {0}")]
     Corrupt(String),
+    /// The caller's view of the meta blob is stale: the stored value no
+    /// longer matches the expectation. Carries the current raw value so a
+    /// lock/retry loop needs no second query.
+    #[error("meta conflict in session {session}: expectation does not match the stored value")]
+    MetaConflict {
+        session: String,
+        current: Option<String>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -66,11 +74,43 @@ pub struct SessionRecord {
     pub updated_at_ms: i64,
 }
 
+/// A committed change to the store, reported to the mutation listener.
+/// Fired only after the write commits — a failed or conflicted write, or a
+/// no-op (delete of an absent row, truncate that removed nothing, adopt of
+/// an existing id), fires nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreMutation {
+    SessionCreated {
+        id: String,
+    },
+    SessionDeleted {
+        id: String,
+    },
+    SessionRenamed {
+        id: String,
+    },
+    MetaSet {
+        id: String,
+    },
+    MessagesAppended {
+        id: String,
+        count: u64,
+        next_seq: u64,
+    },
+    MessagesTruncated {
+        id: String,
+        deleted: u64,
+    },
+}
+
+pub type MutationListener = Arc<dyn Fn(&StoreMutation) + Send + Sync>;
+
 /// SQLite-backed session + message store. One global DB file per host (or
 /// `open_in_memory` for tests). Internally serialized on one connection —
 /// correct and plenty for a single-user local host.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
+    listener: Mutex<Option<MutationListener>>,
 }
 
 const SCHEMA: &str = "
@@ -156,7 +196,32 @@ impl SqliteStore {
         }
         Ok(Self {
             conn: Mutex::new(conn),
+            listener: Mutex::new(None),
         })
+    }
+
+    /// Installs (or clears) the mutation listener. One listener at a time;
+    /// a host that needs fan-out multiplexes behind its own closure. The
+    /// listener runs after the write commits and outside the store's
+    /// internal lock, so it may reentrantly call back into the store; under
+    /// concurrent writers, delivery order may differ from commit order.
+    pub fn set_mutation_listener(&self, listener: Option<MutationListener>) {
+        *self.listener.lock().expect("listener lock poisoned") = listener;
+    }
+
+    /// Precondition: the connection guard is already dropped. Clones the
+    /// listener out and releases its slot before invoking — a listener that
+    /// mutates the store reenters here, and holding either guard across the
+    /// call would deadlock it.
+    fn emit(&self, mutation: StoreMutation) {
+        let listener = self
+            .listener
+            .lock()
+            .expect("listener lock poisoned")
+            .clone();
+        if let Some(listener) = listener {
+            listener(&mutation);
+        }
     }
 
     /// Mints an opaque hex id. Hosts that need their own id scheme can prefix
@@ -170,6 +235,8 @@ impl SqliteStore {
             "INSERT INTO sessions (id, title, meta, created_at, updated_at) VALUES (?1, ?2, NULL, ?3, ?3)",
             params![id, title, now],
         )?;
+        drop(conn);
+        self.emit(StoreMutation::SessionCreated { id: id.clone() });
         Ok(SessionRecord {
             id,
             title: title.map(str::to_string),
@@ -191,6 +258,10 @@ impl SqliteStore {
              VALUES (?1, ?2, NULL, ?3, ?3)",
             params![id, title, now],
         )?;
+        drop(conn);
+        if created > 0 {
+            self.emit(StoreMutation::SessionCreated { id: id.to_string() });
+        }
         Ok(created > 0)
     }
 
@@ -226,6 +297,8 @@ impl SqliteStore {
         if changed == 0 {
             return Err(StoreError::UnknownSession(id.to_string()));
         }
+        drop(conn);
+        self.emit(StoreMutation::SessionRenamed { id: id.to_string() });
         Ok(())
     }
 
@@ -239,6 +312,46 @@ impl SqliteStore {
         if changed == 0 {
             return Err(StoreError::UnknownSession(id.to_string()));
         }
+        drop(conn);
+        self.emit(StoreMutation::MetaSet { id: id.to_string() });
+        Ok(())
+    }
+
+    /// Sets the meta blob only if the stored value still equals `expected`
+    /// (NULL-safe: `None` matches only an absent blob). Both sides are raw
+    /// text compared verbatim — the kit still never reads meta, it only
+    /// checks equality — which makes this the compare-and-swap substrate a
+    /// host builds lock/lease protocols on. On mismatch fails with
+    /// [`StoreError::MetaConflict`] carrying the current value, so a retry
+    /// loop needs no second query. Callers keep the text valid JSON:
+    /// `get_session` parses the blob.
+    pub fn set_meta_cas(&self, id: &str, expected: Option<&str>, meta: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let changed = conn.execute(
+            "UPDATE sessions SET meta = ?2, updated_at = ?3 WHERE id = ?1 AND meta IS ?4",
+            params![id, meta, now_ms(), expected],
+        )?;
+        if changed == 0 {
+            // Zero rows is ambiguous: absent session or stale expectation.
+            // Disambiguate inside the same locked section, so the reported
+            // current value is exactly what the swap compared against.
+            let current: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT meta FROM sessions WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            return match current {
+                None => Err(StoreError::UnknownSession(id.to_string())),
+                Some(current) => Err(StoreError::MetaConflict {
+                    session: id.to_string(),
+                    current,
+                }),
+            };
+        }
+        drop(conn);
+        self.emit(StoreMutation::MetaSet { id: id.to_string() });
         Ok(())
     }
 
@@ -246,7 +359,12 @@ impl SqliteStore {
     /// the store (a host's files are not the store's to touch).
     pub fn delete_session(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().expect("store lock poisoned");
-        Ok(conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])? > 0)
+        let deleted = conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])? > 0;
+        drop(conn);
+        if deleted {
+            self.emit(StoreMutation::SessionDeleted { id: id.to_string() });
+        }
+        Ok(deleted)
     }
 
     /// Appends messages atomically, continuing the seq series. Returns the
@@ -288,6 +406,12 @@ impl SqliteStore {
                 actual: seq,
             });
         }
+        // An empty append is a no-op: it must not touch `updated_at` (recents
+        // ordering) and must not emit a mutation (the listener doctrine —
+        // "a no-op fires nothing").
+        if messages.is_empty() {
+            return Ok(seq);
+        }
         let now = now_ms();
         for message in messages {
             tx.execute(
@@ -298,7 +422,7 @@ impl SqliteStore {
                     seq as i64,
                     role_str(message.role),
                     serde_json::to_string(&message.content)?,
-                    message.cache,
+                    cache_column(&message.cache),
                     now
                 ],
             )?;
@@ -309,7 +433,50 @@ impl SqliteStore {
             params![id, now],
         )?;
         tx.commit()?;
+        drop(conn);
+        self.emit(StoreMutation::MessagesAppended {
+            id: id.to_string(),
+            count: messages.len() as u64,
+            next_seq: seq,
+        });
         Ok(seq)
+    }
+
+    /// Deletes every message with `seq >= from_seq`, transactionally, and
+    /// returns how many were deleted (0 is not an error). The next append
+    /// continues from the table's surviving maximum — seq derives from the
+    /// log, not a counter — so `expected_next_seq == from_seq` succeeds
+    /// after a truncation at `from_seq`.
+    pub fn truncate_messages_from(&self, id: &str, from_seq: u64) -> Result<u64> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::UnknownSession(id.to_string()));
+        }
+        let deleted = tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND seq >= ?2",
+            params![id, from_seq as i64],
+        )? as u64;
+        if deleted > 0 {
+            tx.execute(
+                "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+                params![id, now_ms()],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
+        if deleted > 0 {
+            self.emit(StoreMutation::MessagesTruncated {
+                id: id.to_string(),
+                deleted,
+            });
+        }
+        Ok(deleted)
     }
 
     /// The full message log in seq order — feed it to `Session::resume`.
@@ -330,7 +497,7 @@ impl SqliteStore {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, bool>(2)?,
+                row.get::<_, rusqlite::types::Value>(2)?,
             ))
         })?;
         let mut messages = Vec::new();
@@ -339,7 +506,7 @@ impl SqliteStore {
             messages.push(Message {
                 role: parse_role(&role),
                 content: serde_json::from_str(&content)?,
-                cache,
+                cache: parse_cache_column(cache)?,
             });
         }
         Ok(messages)
@@ -397,6 +564,34 @@ fn now_ms() -> i64 {
             Ok(_) => return next,
             Err(actual) => last = actual,
         }
+    }
+}
+
+/// The `cache` column is dynamically typed for wire-compatible widening:
+/// legacy rows hold the historical bool (0/1); a TTL-pinned mark stores the
+/// TTL's wire string (e.g. "1h") so a pinned breakpoint survives a store
+/// round-trip instead of degrading to a plain mark.
+fn cache_column(mark: &ac_types::CacheMark) -> rusqlite::types::Value {
+    match mark {
+        ac_types::CacheMark::Off => rusqlite::types::Value::Integer(0),
+        ac_types::CacheMark::On => rusqlite::types::Value::Integer(1),
+        ac_types::CacheMark::WithTtl(ttl) => rusqlite::types::Value::Text(ttl.as_str().to_string()),
+    }
+}
+
+/// Inverse of [`cache_column`]. A text value routes through `CacheMark`'s own
+/// wire deserialization, so a TTL string written by a newer kit that this
+/// build does not model fails the load as a typed per-session error — never a
+/// silent mis-read.
+fn parse_cache_column(value: rusqlite::types::Value) -> Result<ac_types::CacheMark> {
+    match value {
+        rusqlite::types::Value::Integer(i) => Ok(ac_types::CacheMark::from(i != 0)),
+        rusqlite::types::Value::Text(s) => {
+            Ok(serde_json::from_value(serde_json::Value::String(s))?)
+        }
+        // Null/Real/Blob were never written by any version of this store: fail
+        // the load typed rather than guess (from_value(Null) is a Serde error).
+        _ => Ok(serde_json::from_value(serde_json::Value::Null)?),
     }
 }
 
@@ -499,7 +694,7 @@ mod tests {
                     input: serde_json::json!({ "path": "a.txt" }),
                 }),
             ],
-            cache: false,
+            cache: ac_types::CacheMark::Off,
         };
         let tool_result = Message {
             role: Role::User,
@@ -508,7 +703,7 @@ mod tests {
                 content: "ok".into(),
                 is_error: false,
             })],
-            cache: false,
+            cache: ac_types::CacheMark::Off,
         };
         store
             .append_messages(&s.id, &[assistant, tool_result], None)
@@ -599,13 +794,53 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let s = store.create_session(None).unwrap();
         let mut marked = msg(Role::User, "pinned");
-        marked.cache = true;
+        marked.cache = ac_types::CacheMark::On;
         store
             .append_messages(&s.id, &[marked, msg(Role::Assistant, "ok")], None)
             .unwrap();
         let loaded = store.load_messages(&s.id).unwrap();
-        assert!(loaded[0].cache);
-        assert!(!loaded[1].cache);
+        assert!(loaded[0].cache.is_on());
+        assert!(loaded[1].cache.is_off());
+    }
+
+    #[test]
+    fn a_ttl_pinned_mark_survives_the_round_trip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        let mut pinned = msg(Role::User, "pinned long");
+        pinned.cache = ac_types::CacheMark::WithTtl(ac_types::CacheTtl::OneHour);
+        store.append_messages(&s.id, &[pinned], None).unwrap();
+        // The pin must not degrade to a plain mark across the store: a host
+        // resuming a session would silently lose its long-TTL breakpoint.
+        let loaded = store.load_messages(&s.id).unwrap();
+        assert_eq!(
+            loaded[0].cache,
+            ac_types::CacheMark::WithTtl(ac_types::CacheTtl::OneHour)
+        );
+    }
+
+    #[test]
+    fn an_empty_append_is_a_true_no_op() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        store
+            .append_messages(&s.id, &[msg(Role::User, "hi")], None)
+            .unwrap();
+        let before = store.get_session(&s.id).unwrap().unwrap().updated_at_ms;
+
+        let events: Arc<Mutex<Vec<StoreMutation>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            sink.lock().unwrap().push(m.clone());
+        })));
+        // Nothing written: no mutation event, no recents bump, seq unchanged.
+        let seq = store.append_messages(&s.id, &[], None).unwrap();
+        assert_eq!(seq, 1);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().updated_at_ms,
+            before
+        );
     }
 
     #[test]
@@ -621,5 +856,261 @@ mod tests {
             store.load_messages(&s.id),
             Err(StoreError::UnknownSession(_))
         ));
+    }
+
+    #[test]
+    fn meta_cas_swaps_from_absent_and_from_a_value() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        store
+            .set_meta_cas(&s.id, None, Some(r#"{"lock":"a"}"#))
+            .unwrap();
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().meta.unwrap(),
+            serde_json::json!({ "lock": "a" })
+        );
+        store
+            .set_meta_cas(&s.id, Some(r#"{"lock":"a"}"#), Some(r#"{"lock":"b"}"#))
+            .unwrap();
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().meta.unwrap(),
+            serde_json::json!({ "lock": "b" })
+        );
+        // Swap back to absent — the release half of a lock protocol.
+        store
+            .set_meta_cas(&s.id, Some(r#"{"lock":"b"}"#), None)
+            .unwrap();
+        assert!(store.get_session(&s.id).unwrap().unwrap().meta.is_none());
+    }
+
+    #[test]
+    fn meta_cas_conflict_carries_the_current_value() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        store
+            .set_meta_cas(&s.id, None, Some(r#"{"lock":"winner"}"#))
+            .unwrap();
+        match store
+            .set_meta_cas(&s.id, None, Some(r#"{"lock":"loser"}"#))
+            .unwrap_err()
+        {
+            StoreError::MetaConflict { session, current } => {
+                assert_eq!(session, s.id);
+                assert_eq!(current.as_deref(), Some(r#"{"lock":"winner"}"#));
+            }
+            other => panic!("got: {other}"),
+        }
+        // A stale expectation of a value conflicts too — the NULL-safe
+        // compare covers both directions.
+        assert!(matches!(
+            store.set_meta_cas(&s.id, Some(r#"{"lock":"stale"}"#), None),
+            Err(StoreError::MetaConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn meta_cas_unknown_session_is_typed_not_a_conflict() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(matches!(
+            store.set_meta_cas("nope", None, Some("{}")),
+            Err(StoreError::UnknownSession(_))
+        ));
+    }
+
+    #[test]
+    fn meta_cas_race_has_exactly_one_winner() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let contenders = ["a", "b"];
+        let outcomes: Vec<Result<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = contenders
+                .iter()
+                .map(|who| {
+                    let (store, id, barrier) = (&store, &s.id, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store.set_meta_cas(id, None, Some(&format!(r#"{{"lock":"{who}"}}"#)))
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one CAS must win: {outcomes:?}"
+        );
+        // The loser's conflict carries the winner's committed value — enough
+        // to drive a lock/retry loop without a second query.
+        let winner = contenders[outcomes.iter().position(|r| r.is_ok()).unwrap()];
+        match outcomes
+            .into_iter()
+            .find(Result::is_err)
+            .unwrap()
+            .unwrap_err()
+        {
+            StoreError::MetaConflict { current, .. } => {
+                assert_eq!(current, Some(format!(r#"{{"lock":"{winner}"}}"#)));
+            }
+            other => panic!("got: {other}"),
+        }
+    }
+
+    #[test]
+    fn truncate_rewinds_the_log_and_next_seq_follows_the_table() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        store
+            .append_messages(
+                &s.id,
+                &[
+                    msg(Role::User, "keep"),
+                    msg(Role::Assistant, "cut"),
+                    msg(Role::User, "cut too"),
+                ],
+                Some(0),
+            )
+            .unwrap();
+        assert_eq!(store.truncate_messages_from(&s.id, 1).unwrap(), 2);
+        assert_eq!(store.message_count(&s.id).unwrap(), 1);
+        // next_seq derives from the surviving table, not a counter: the
+        // freed positions are immediately reusable under the seq-CAS.
+        let next = store
+            .append_messages(&s.id, &[msg(Role::Assistant, "rewritten")], Some(1))
+            .unwrap();
+        assert_eq!(next, 2);
+        let loaded = store.load_messages(&s.id).unwrap();
+        assert!(matches!(&loaded[0].content[0], ContentPart::Text { text } if text == "keep"));
+        assert!(matches!(&loaded[1].content[0], ContentPart::Text { text } if text == "rewritten"));
+        // Truncating from 0 empties the log; the series restarts at 0.
+        assert_eq!(store.truncate_messages_from(&s.id, 0).unwrap(), 2);
+        assert_eq!(
+            store
+                .append_messages(&s.id, &[msg(Role::User, "fresh")], Some(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn truncate_past_the_end_is_ok_zero_and_unknown_session_is_typed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        store
+            .append_messages(&s.id, &[msg(Role::User, "a")], None)
+            .unwrap();
+        assert_eq!(store.truncate_messages_from(&s.id, 5).unwrap(), 0);
+        assert_eq!(store.message_count(&s.id).unwrap(), 1);
+        assert!(matches!(
+            store.truncate_messages_from("nope", 0),
+            Err(StoreError::UnknownSession(_))
+        ));
+    }
+
+    #[test]
+    fn every_mutation_kind_reaches_the_listener() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            sink.lock().unwrap().push(m.clone());
+        })));
+
+        let s = store.create_session(None).unwrap();
+        store.create_session_with_id("adopted", None).unwrap();
+        store.rename_session(&s.id, "titled").unwrap();
+        store
+            .set_meta(&s.id, &serde_json::json!({ "k": 1 }))
+            .unwrap();
+        store.set_meta_cas(&s.id, Some(r#"{"k":1}"#), None).unwrap();
+        store
+            .append_messages(&s.id, &[msg(Role::User, "a"), msg(Role::User, "b")], None)
+            .unwrap();
+        store.truncate_messages_from(&s.id, 1).unwrap();
+        store.delete_session(&s.id).unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                StoreMutation::SessionCreated { id: s.id.clone() },
+                StoreMutation::SessionCreated {
+                    id: "adopted".into()
+                },
+                StoreMutation::SessionRenamed { id: s.id.clone() },
+                StoreMutation::MetaSet { id: s.id.clone() },
+                StoreMutation::MetaSet { id: s.id.clone() },
+                StoreMutation::MessagesAppended {
+                    id: s.id.clone(),
+                    count: 2,
+                    next_seq: 2
+                },
+                StoreMutation::MessagesTruncated {
+                    id: s.id.clone(),
+                    deleted: 1
+                },
+                StoreMutation::SessionDeleted { id: s.id.clone() },
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_conflicted_and_no_op_writes_fire_nothing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        store.set_meta_cas(&s.id, None, Some(r#""held""#)).unwrap();
+        store
+            .append_messages(&s.id, &[msg(Role::User, "a")], None)
+            .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            sink.lock().unwrap().push(m.clone());
+        })));
+
+        assert!(store.set_meta_cas(&s.id, None, Some("{}")).is_err());
+        assert!(
+            store
+                .append_messages(&s.id, &[msg(Role::User, "x")], Some(0))
+                .is_err()
+        );
+        assert!(store.rename_session("nope", "t").is_err());
+        assert!(store.truncate_messages_from("nope", 0).is_err());
+        assert!(!store.delete_session("nope").unwrap());
+        assert!(!store.create_session_with_id(&s.id, None).unwrap());
+        assert_eq!(store.truncate_messages_from(&s.id, 9).unwrap(), 0);
+
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_reentrant_listener_does_not_deadlock() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let s = store.create_session(None).unwrap();
+        let weak = Arc::downgrade(&store);
+        let observed = Arc::new(Mutex::new(None));
+        let obs = observed.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            if let StoreMutation::MessagesAppended { id, .. } = m {
+                let store = weak.upgrade().unwrap();
+                // A read (store lock) and a mutation (which re-enters emit,
+                // relocking the listener slot) — both from inside the
+                // listener. Neither may deadlock.
+                *obs.lock().unwrap() = Some(store.message_count(id).unwrap());
+                store
+                    .rename_session(id, "renamed from the listener")
+                    .unwrap();
+            }
+        })));
+
+        store
+            .append_messages(&s.id, &[msg(Role::User, "hi")], None)
+            .unwrap();
+        assert_eq!(*observed.lock().unwrap(), Some(1));
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().title.as_deref(),
+            Some("renamed from the listener")
+        );
     }
 }

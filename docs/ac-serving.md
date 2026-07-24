@@ -168,8 +168,9 @@ its completed work. The store is the continuity; the request is stateless.
 
 ## 10. Deferred
 
-- **Preventing same-session concurrency** — the seq conflict makes it loud today; prevention
-  needs process-shared session state, a seam to add when a real host needs it.
+- **Preventing same-session concurrency** — the seq conflict makes it loud today; the store's
+  guarded metadata swap supplies the compare-and-swap substrate a host builds a run lock on; a
+  shipped prevention discipline still awaits a real host that needs it.
 - **Steering through the wires** — the ACP adapter refuses mid-turn prompts today; on the
   rebuild-per-request wire a concurrent request is a concurrent turn, detected by the seq guard (§6).
   When [ac-queue-steer.md](ac-queue-steer.md) lands, ingress gains *steer* with no new framing.
