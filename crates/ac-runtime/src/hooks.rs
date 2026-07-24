@@ -161,7 +161,7 @@ impl StepPrepareHook for ForcedChainHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ac_types::{Role, ToolResult, ToolUse};
+    use ac_types::{CacheMark, Role, ToolResult, ToolUse};
 
     fn tool_use(id: &str, name: &str) -> Message {
         Message {
@@ -171,7 +171,7 @@ mod tests {
                 name: name.into(),
                 input: serde_json::Value::Null,
             })],
-            cache: false,
+            cache: CacheMark::Off,
         }
     }
 
@@ -183,7 +183,7 @@ mod tests {
                 content: "r".into(),
                 is_error,
             })],
-            cache: false,
+            cache: CacheMark::Off,
         }
     }
 

@@ -6,6 +6,11 @@ pub enum CompletionError {
     Auth(String),
     #[error("rate limited{}", retry_after_ms.map(|ms| format!(" (retry after {ms} ms)")).unwrap_or_default())]
     RateLimited { retry_after_ms: Option<u64> },
+    /// The account is out of credit (HTTP 402). Distinct from `Auth`: the key
+    /// is valid, and no amount of retrying helps — the host must surface a
+    /// top-up path to the user.
+    #[error("insufficient credits: {0}")]
+    InsufficientCredits(String),
     #[error("provider overloaded: {0}")]
     Overloaded(String),
     #[error("prompt too large: {0}")]

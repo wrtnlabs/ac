@@ -2,7 +2,7 @@
 //! Wire crates (ac-provider-openrouter, …) implement [`Provider`] and map
 //! their native wire events into [`ac_types::CompletionEvent`].
 
-use ac_types::{CompletionError, CompletionEvent, Effort, Message, ToolSpec};
+use ac_types::{CacheMark, CompletionError, CompletionEvent, Effort, Message, ToolSpec};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -15,9 +15,10 @@ pub struct CompletionRequest {
     /// System prompt. Kept separate from `messages` so wire crates can apply
     /// provider-specific placement and cache marking.
     pub system: Option<String>,
-    /// Cache-break after the system prompt (Anthropic `cache_control`).
+    /// Cache-break after the system prompt (Anthropic `cache_control`),
+    /// optionally with an explicit TTL. Deserializes from the legacy bool.
     #[serde(default)]
-    pub cache_system: bool,
+    pub cache_system: CacheMark,
     pub messages: Vec<Message>,
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
@@ -65,7 +66,7 @@ impl CompletionRequest {
         Self {
             model: model.into(),
             system: None,
-            cache_system: false,
+            cache_system: CacheMark::Off,
             messages: Vec::new(),
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,

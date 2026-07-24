@@ -21,8 +21,8 @@ use ac_provider::{CompletionRequest, Provider, ServerTool};
 use ac_rollout::Rollout;
 use ac_tool::{ToolCtx, ToolRegistry};
 use ac_types::{
-    CompletionEvent, ContentPart, Effort, Message, Role, StopReason, TokenUsage, ToolResult,
-    ToolUse,
+    CacheMark, CompletionError, CompletionEvent, ContentPart, Effort, Message, Role, StopReason,
+    TokenUsage, ToolResult, ToolUse,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -450,7 +450,7 @@ impl Session {
 
             let mut req = CompletionRequest::new(&self.config.model);
             req.system = self.config.system.clone();
-            req.cache_system = self.config.system.is_some();
+            req.cache_system = self.config.system.is_some().into();
             req.messages = self.rollout.project();
             req.tools = self.registry.specs();
             req.server_tools = self.config.server_tools.clone();
@@ -559,7 +559,7 @@ impl Session {
             self.record(Message {
                 role: Role::Assistant,
                 content: assistant_content,
-                cache: false,
+                cache: CacheMark::Off,
             });
 
             // A completed step makes the queue drainable from here on.
@@ -629,7 +629,7 @@ impl Session {
             self.record(Message {
                 role: Role::User,
                 content: user_content,
-                cache: false,
+                cache: CacheMark::Off,
             });
 
             // Mid-turn trigger: the model owes a continuation (tool calls just
@@ -773,35 +773,79 @@ impl Session {
             cfg.summary_max_tokens,
         );
 
-        let mut stream = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(CompactionError::Cancelled),
-            res = provider.stream_completion(req) => res?,
-        };
-
-        let mut summary = String::new();
-        loop {
-            let next = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(CompactionError::Cancelled),
-                n = async {
-                    match self.config.idle_timeout {
-                        Some(d) => tokio::time::timeout(d, stream.next()).await.map_err(|_| ()),
-                        None => Ok(stream.next().await),
-                    }
-                } => n,
-            };
-            match next {
-                Err(()) => return Err(CompactionError::Timeout),
-                Ok(None) => break,
-                Ok(Some(Ok(CompletionEvent::Text(s)))) => summary.push_str(&s),
-                Ok(Some(Ok(CompletionEvent::Stop(_)))) => break,
-                Ok(Some(Ok(_))) => {}
-                Ok(Some(Err(e))) => return Err(CompactionError::Completion(e)),
-            }
-        }
-        Ok(summary)
+        collect_completion_text(
+            provider.as_ref(),
+            req,
+            Some(cancel),
+            self.config.idle_timeout,
+        )
+        .await
+        .map_err(|e| match e {
+            CollectTextError::Cancelled => CompactionError::Cancelled,
+            CollectTextError::Timeout => CompactionError::Timeout,
+            CollectTextError::Completion(e) => CompactionError::Completion(e),
+        })
     }
+}
+
+/// Why [`collect_completion_text`] gave up before producing a string.
+#[derive(Debug, thiserror::Error)]
+pub enum CollectTextError {
+    #[error("cancelled")]
+    Cancelled,
+    /// No event arrived within the idle timeout — a stalled provider, not a
+    /// deliberate cancel.
+    #[error("stalled: no event within the idle timeout")]
+    Timeout,
+    #[error(transparent)]
+    Completion(#[from] CompletionError),
+}
+
+/// Drive one completion to a single concatenated string of its text events —
+/// the one-shot path for short utility completions (titling, classification,
+/// summarization) where the caller wants a `String`, not a stream or a
+/// session. Non-text events are ignored; the collection ends at `Stop` or
+/// stream end.
+///
+/// `cancel` aborts between events and `idle_timeout` bounds the wait for the
+/// next one; pass `None` for either to opt out.
+pub async fn collect_completion_text(
+    provider: &dyn Provider,
+    request: CompletionRequest,
+    cancel: Option<&CancellationToken>,
+    idle_timeout: Option<Duration>,
+) -> Result<String, CollectTextError> {
+    let never = CancellationToken::new();
+    let cancel = cancel.unwrap_or(&never);
+
+    let mut stream = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(CollectTextError::Cancelled),
+        res = provider.stream_completion(request) => res?,
+    };
+
+    let mut text = String::new();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(CollectTextError::Cancelled),
+            n = async {
+                match idle_timeout {
+                    Some(d) => tokio::time::timeout(d, stream.next()).await.map_err(|_| ()),
+                    None => Ok(stream.next().await),
+                }
+            } => n,
+        };
+        match next {
+            Err(()) => return Err(CollectTextError::Timeout),
+            Ok(None) => break,
+            Ok(Some(Ok(CompletionEvent::Text(s)))) => text.push_str(&s),
+            Ok(Some(Ok(CompletionEvent::Stop(_)))) => break,
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(e))) => return Err(CollectTextError::Completion(e)),
+        }
+    }
+    Ok(text)
 }
 
 #[cfg(test)]

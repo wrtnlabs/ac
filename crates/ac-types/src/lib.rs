@@ -9,7 +9,7 @@ mod event;
 mod marker;
 mod tool;
 
-pub use content::{ContentPart, Message, Role, ToolResult, ToolUse};
+pub use content::{CacheMark, CacheTtl, ContentPart, Message, Role, ToolResult, ToolUse};
 pub use effort::Effort;
 pub use error::CompletionError;
 pub use event::{Citation, CompletionEvent, StopReason, TokenUsage};

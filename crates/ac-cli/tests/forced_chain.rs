@@ -17,7 +17,7 @@ use ac_tool::{
     ToolOutput, ToolRegistry,
 };
 use ac_tools::{ReadFile, WriteFile};
-use ac_types::{ContentPart, Message, Role, StopReason, ToolResult, ToolUse};
+use ac_types::{CacheMark, ContentPart, Message, Role, StopReason, ToolResult, ToolUse};
 use futures::future::BoxFuture;
 use serde_json::json;
 
@@ -294,7 +294,7 @@ async fn a_resumed_session_does_not_re_force_a_completed_chain() {
                 name: "bind_workdir".to_string(),
                 input: json!({ "dir": "proj" }),
             })],
-            cache: false,
+            cache: CacheMark::Off,
         },
         Message {
             role: Role::User,
@@ -303,7 +303,7 @@ async fn a_resumed_session_does_not_re_force_a_completed_chain() {
                 content: "working directory bound to proj".to_string(),
                 is_error: false,
             })],
-            cache: false,
+            cache: CacheMark::Off,
         },
         Message::text(Role::Assistant, "earlier work".to_string()),
     ];

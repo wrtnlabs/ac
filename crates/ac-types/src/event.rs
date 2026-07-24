@@ -68,6 +68,12 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub cache_creation_input_tokens: u64,
+    /// Reasoning/thinking tokens — a breakdown (subset) of `output_tokens`,
+    /// mirroring how the cache fields break down `input_tokens`; never
+    /// additional. Defaulted so events recorded before the field existed
+    /// still deserialize.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 #[cfg(test)]

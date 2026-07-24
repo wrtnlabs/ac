@@ -12,7 +12,7 @@
 
 use ac_context::FragmentRegistry;
 use ac_provider::{CompletionRequest, ToolChoice};
-use ac_types::{ContentPart, Message, Role, TokenUsage};
+use ac_types::{CacheMark, ContentPart, Message, Role, TokenUsage};
 
 /// How the summary `σ` is produced ([docs/ac-compaction.md] §4). The two axes —
 /// trigger and strategy — are orthogonal, and (R4) observationally equivalent
@@ -257,7 +257,7 @@ pub(crate) fn cap_message(m: &Message, cap_tokens: u64) -> Message {
     Message {
         role: m.role,
         content,
-        cache: false,
+        cache: CacheMark::Off,
     }
 }
 
@@ -304,7 +304,7 @@ pub(crate) fn build_summary_request(
     view.push(Message::text(Role::User, SUMMARY_NUDGE));
     let mut req = CompletionRequest::new(model);
     req.system = Some(system);
-    req.cache_system = false;
+    req.cache_system = CacheMark::Off;
     req.messages = view;
     req.tools = Vec::new();
     req.tool_choice = ToolChoice::None;
@@ -331,7 +331,7 @@ mod tests {
                 content: t.into(),
                 is_error: false,
             })],
-            cache: false,
+            cache: CacheMark::Off,
         }
     }
 
@@ -350,7 +350,7 @@ mod tests {
                 media_type: "image/png".into(),
                 data: "base64".into(),
             }],
-            cache: false,
+            cache: CacheMark::Off,
         };
         assert!(is_user_input(&image_only), "image-only user input survives");
     }
@@ -467,7 +467,7 @@ mod tests {
             input_tokens: 1000,
             output_tokens: 200,
             cache_read_input_tokens: 800,
-            cache_creation_input_tokens: 0,
+            ..TokenUsage::default()
         };
         assert_eq!(context_occupancy(&u, false), 1200);
         assert_eq!(
@@ -488,7 +488,7 @@ mod tests {
                     name: "read".into(),
                     input: serde_json::json!({}),
                 })],
-                cache: false,
+                cache: CacheMark::Off,
             },
             tool_result(&"b".repeat(40)),
         ];

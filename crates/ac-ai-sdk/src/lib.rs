@@ -356,7 +356,7 @@ pub fn user_text(message: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ac_types::{TokenUsage, ToolResult, ToolUse};
+    use ac_types::{CacheMark, TokenUsage, ToolResult, ToolUse};
 
     fn types(chunks: &[Value]) -> Vec<String> {
         chunks
@@ -549,7 +549,7 @@ mod tests {
                         input: json!({ "path": "a.txt" }),
                     }),
                 ],
-                cache: false,
+                cache: CacheMark::Off,
             },
             Message {
                 role: Role::User,
@@ -558,7 +558,7 @@ mod tests {
                     content: "hello".into(),
                     is_error: false,
                 })],
-                cache: false,
+                cache: CacheMark::Off,
             },
         ];
         let ui = hydrate_messages(&history);

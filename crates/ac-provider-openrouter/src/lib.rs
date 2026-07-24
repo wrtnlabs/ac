@@ -5,22 +5,36 @@
 
 use ac_provider::{CompletionRequest, EventStream, Provider, ServerTool, ToolChoice};
 use ac_types::{
-    Citation, CompletionError, CompletionEvent, ContentPart, Effort, Role, StopReason, TokenUsage,
-    ToolUse,
+    CacheMark, Citation, CompletionError, CompletionEvent, ContentPart, Effort, Role, StopReason,
+    TokenUsage, ToolUse,
 };
 use async_stream::try_stream;
 use eventsource_stream::Eventsource;
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
+/// A rejected extra header ([`OpenRouter::with_extra_header`]): the name or
+/// value failed validation. Raised at build time so a malformed header is a
+/// typed error where it was written, never a panic (or silent drop) at send.
+#[derive(Debug, thiserror::Error)]
+pub enum HeaderError {
+    #[error("invalid header name: {0:?}")]
+    InvalidName(String),
+    #[error("invalid value for header {0}")]
+    InvalidValue(String),
+}
+
 pub struct OpenRouter {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
+    extra_headers: HeaderMap,
+    provider_order: Option<Vec<String>>,
 }
 
 impl OpenRouter {
@@ -29,11 +43,36 @@ impl OpenRouter {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
+            extra_headers: HeaderMap::new(),
+            provider_order: None,
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Add a static header sent on every request (attribution headers, proxy
+    /// tokens, …). Validated eagerly — see [`HeaderError`]. Repeated names
+    /// append rather than replace, matching HTTP multi-value semantics.
+    pub fn with_extra_header(
+        mut self,
+        name: impl AsRef<str>,
+        value: impl AsRef<str>,
+    ) -> Result<Self, HeaderError> {
+        let name = HeaderName::from_bytes(name.as_ref().as_bytes())
+            .map_err(|_| HeaderError::InvalidName(name.as_ref().to_string()))?;
+        let value = HeaderValue::from_str(value.as_ref())
+            .map_err(|_| HeaderError::InvalidValue(name.to_string()))?;
+        self.extra_headers.append(name, value);
+        Ok(self)
+    }
+
+    /// Pin which upstream providers may serve requests, in preference order —
+    /// emitted as the body's `provider.order`. Unset emits no `provider` key.
+    pub fn with_provider_order(mut self, order: Vec<String>) -> Self {
+        self.provider_order = Some(order);
         self
     }
 }
@@ -53,11 +92,14 @@ impl Provider for OpenRouter {
     ) -> BoxFuture<'static, Result<EventStream, CompletionError>> {
         let http = self.http.clone();
         let api_key = self.api_key.clone();
+        let extra_headers = self.extra_headers.clone();
+        let provider_order = self.provider_order.clone();
         let url = format!("{}/chat/completions", self.base_url);
         Box::pin(async move {
-            let body = build_body(&request);
+            let body = build_body(&request, provider_order.as_deref());
             let response = http
                 .post(url)
+                .headers(extra_headers)
                 .bearer_auth(api_key)
                 .json(&body)
                 .send()
@@ -75,6 +117,7 @@ impl Provider for OpenRouter {
                 let text = response.text().await.unwrap_or_default();
                 return Err(match status.as_u16() {
                     401 | 403 => CompletionError::Auth(text),
+                    402 => CompletionError::InsufficientCredits(text),
                     429 => CompletionError::RateLimited { retry_after_ms },
                     400 => CompletionError::BadRequest(text),
                     500..=599 => CompletionError::Overloaded(text),
@@ -87,13 +130,16 @@ impl Provider for OpenRouter {
     }
 }
 
-fn build_body(request: &CompletionRequest) -> Value {
+fn build_body(request: &CompletionRequest, provider_order: Option<&[String]>) -> Value {
     let mut body = json!({
         "model": request.model,
         "messages": build_messages(request),
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    if let Some(order) = provider_order {
+        body["provider"] = json!({ "order": order });
+    }
     if !request.tools.is_empty() {
         body["tools"] = request
             .tools
@@ -157,12 +203,21 @@ fn build_body(request: &CompletionRequest) -> Value {
     body
 }
 
+/// The Anthropic-compatible `cache_control` object for a mark, carrying the
+/// explicit TTL when the mark pins one.
+fn cache_control(mark: CacheMark) -> Value {
+    match mark.ttl() {
+        Some(ttl) => json!({ "type": "ephemeral", "ttl": ttl.as_str() }),
+        None => json!({ "type": "ephemeral" }),
+    }
+}
+
 fn build_messages(request: &CompletionRequest) -> Vec<Value> {
     let mut out = Vec::new();
     if let Some(system) = &request.system {
         let mut part = json!({ "type": "text", "text": system });
-        if request.cache_system {
-            part["cache_control"] = json!({ "type": "ephemeral" });
+        if request.cache_system.is_on() {
+            part["cache_control"] = cache_control(request.cache_system);
         }
         out.push(json!({ "role": "system", "content": [part] }));
     }
@@ -210,10 +265,24 @@ fn build_messages(request: &CompletionRequest) -> Vec<Value> {
             }
         }
 
-        if message.cache
-            && let Some(last_text) = parts.iter_mut().rev().find(|p| p["type"] == json!("text"))
-        {
-            last_text["cache_control"] = json!({ "type": "ephemeral" });
+        // The breakpoint must land on the LAST wire message this Message emits.
+        // Tool results are re-emitted after (or instead of) the main message as
+        // standalone role:"tool" messages, so when any exist the mark goes on
+        // the last of those — its plain-string content switched to the
+        // parts-array form, the encoding that can carry `cache_control`.
+        if message.cache.is_on() {
+            if let Some(last) = tool_results.last_mut() {
+                let text = last["content"].take();
+                last["content"] = json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": cache_control(message.cache),
+                }]);
+            } else if let Some(last_text) =
+                parts.iter_mut().rev().find(|p| p["type"] == json!("text"))
+            {
+                last_text["cache_control"] = cache_control(message.cache);
+            }
         }
 
         if !parts.is_empty() || !tool_calls.is_empty() {
@@ -400,6 +469,7 @@ struct UsageChunk {
     #[serde(default)]
     completion_tokens: u64,
     prompt_tokens_details: Option<PromptTokensDetails>,
+    completion_tokens_details: Option<CompletionTokensDetails>,
     cache_creation_input_tokens: Option<u64>,
 }
 
@@ -407,6 +477,12 @@ struct UsageChunk {
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: u64,
+}
+
+#[derive(Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 impl From<UsageChunk> for TokenUsage {
@@ -419,6 +495,10 @@ impl From<UsageChunk> for TokenUsage {
                 .map(|d| d.cached_tokens)
                 .unwrap_or(0),
             cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .map(|d| d.reasoning_tokens)
+                .unwrap_or(0),
         }
     }
 }
@@ -426,15 +506,15 @@ impl From<UsageChunk> for TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ac_types::Message;
+    use ac_types::{CacheTtl, Message, ToolResult};
 
     #[test]
     fn cache_marks_become_cache_control() {
         let mut request = CompletionRequest::new("test/model");
         request.system = Some("sys".into());
-        request.cache_system = true;
+        request.cache_system = CacheMark::On;
         let mut message = Message::text(Role::User, "hello");
-        message.cache = true;
+        message.cache = CacheMark::On;
         request.messages.push(message);
 
         let messages = build_messages(&request);
@@ -453,16 +533,127 @@ mod tests {
         let mut request = CompletionRequest::new("test/model");
         request.messages.push(Message {
             role: Role::User,
-            content: vec![ContentPart::ToolResult(ac_types::ToolResult {
+            content: vec![ContentPart::ToolResult(ToolResult {
                 tool_use_id: "call_1".into(),
                 content: "ok".into(),
                 is_error: false,
             })],
-            cache: false,
+            cache: CacheMark::Off,
         });
         let messages = build_messages(&request);
         assert_eq!(messages[0]["role"], json!("tool"));
         assert_eq!(messages[0]["tool_call_id"], json!("call_1"));
+    }
+
+    fn tool_result_part(id: &str, content: &str) -> ContentPart {
+        ContentPart::ToolResult(ToolResult {
+            tool_use_id: id.into(),
+            content: content.into(),
+            is_error: false,
+        })
+    }
+
+    // The breakpoint must land on the LAST wire message a marked Message emits.
+    // Tool results become standalone role:"tool" messages emitted last, so a
+    // tool-results-only marked message puts the mark on the final tool message
+    // (parts-array form) — previously it was silently dropped.
+    #[test]
+    fn cache_mark_on_a_tool_results_only_message_lands_on_the_last_tool_message() {
+        let mut request = CompletionRequest::new("test/model");
+        request.messages.push(Message {
+            role: Role::User,
+            content: vec![tool_result_part("c1", "one"), tool_result_part("c2", "two")],
+            cache: CacheMark::On,
+        });
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0]["content"],
+            json!("one"),
+            "only the last tool message carries the mark; earlier ones keep string content"
+        );
+        assert_eq!(messages[1]["tool_call_id"], json!("c2"));
+        assert_eq!(
+            messages[1]["content"],
+            json!([{
+                "type": "text",
+                "text": "two",
+                "cache_control": { "type": "ephemeral" },
+            }])
+        );
+    }
+
+    #[test]
+    fn cache_mark_on_a_mixed_text_and_tool_result_message_rides_the_last_emitted_piece() {
+        let mut request = CompletionRequest::new("test/model");
+        request.messages.push(Message {
+            role: Role::User,
+            content: vec![
+                ContentPart::Text {
+                    text: "note".into(),
+                },
+                tool_result_part("c1", "out"),
+            ],
+            cache: CacheMark::On,
+        });
+
+        let messages = build_messages(&request);
+        assert_eq!(messages.len(), 2, "user message first, tool message last");
+        assert!(
+            messages[0]["content"][0].get("cache_control").is_none(),
+            "the text part must NOT carry the mark — it is not the last emitted piece"
+        );
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
+
+    // Unmarked messages must be untouched by the mark-placement logic —
+    // asserted as exact wire JSON, not spot checks.
+    #[test]
+    fn unmarked_messages_are_unchanged() {
+        let mut request = CompletionRequest::new("test/model");
+        request.messages.push(Message {
+            role: Role::User,
+            content: vec![
+                ContentPart::Text {
+                    text: "note".into(),
+                },
+                tool_result_part("c1", "out"),
+            ],
+            cache: CacheMark::Off,
+        });
+
+        let messages = build_messages(&request);
+        assert_eq!(
+            serde_json::to_value(&messages).unwrap(),
+            json!([
+                { "role": "user", "content": [{ "type": "text", "text": "note" }] },
+                { "role": "tool", "tool_call_id": "c1", "content": "out" },
+            ])
+        );
+    }
+
+    #[test]
+    fn cache_ttl_encodes_into_cache_control() {
+        let mut request = CompletionRequest::new("test/model");
+        request.system = Some("sys".into());
+        request.cache_system = CacheMark::WithTtl(CacheTtl::OneHour);
+        let mut message = Message::text(Role::User, "hello");
+        message.cache = CacheMark::WithTtl(CacheTtl::FiveMinutes);
+        request.messages.push(message);
+
+        let messages = build_messages(&request);
+        assert_eq!(
+            messages[0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "5m" })
+        );
     }
 
     // tool_choice only makes sense alongside tools; with no tools declared the
@@ -471,7 +662,7 @@ mod tests {
     fn tool_choice_is_omitted_without_tools() {
         let mut request = CompletionRequest::new("test/model");
         request.tool_choice = ToolChoice::Required;
-        let body = build_body(&request);
+        let body = build_body(&request, None);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
     }
@@ -496,7 +687,7 @@ mod tests {
             let mut request = CompletionRequest::new("test/model");
             request.tools.push(spec.clone());
             request.tool_choice = choice;
-            assert_eq!(build_body(&request)["tool_choice"], expected);
+            assert_eq!(build_body(&request, None)["tool_choice"], expected);
         }
     }
 
@@ -506,12 +697,12 @@ mod tests {
     #[test]
     fn web_search_server_tool_encodes_web_plugin() {
         let mut request = CompletionRequest::new("test/model");
-        assert!(build_body(&request).get("plugins").is_none());
+        assert!(build_body(&request, None).get("plugins").is_none());
 
         request.server_tools.push(ServerTool::WebSearch {
             max_results: Some(3),
         });
-        let body = build_body(&request);
+        let body = build_body(&request, None);
         assert_eq!(body["plugins"][0]["id"], json!("web"));
         assert_eq!(body["plugins"][0]["max_results"], json!(3));
     }
@@ -521,7 +712,7 @@ mod tests {
     fn effort_encodes_reasoning_and_max_collapses_to_high() {
         // Absent effort adds nothing.
         let request = CompletionRequest::new("test/model");
-        assert!(build_body(&request).get("reasoning").is_none());
+        assert!(build_body(&request, None).get("reasoning").is_none());
 
         for (effort, level) in [
             (Effort::Low, "low"),
@@ -532,7 +723,7 @@ mod tests {
             let mut request = CompletionRequest::new("test/model");
             request.effort = Some(effort);
             assert_eq!(
-                build_body(&request)["reasoning"]["effort"],
+                build_body(&request, None)["reasoning"]["effort"],
                 json!(level),
                 "{effort:?} must map to {level}"
             );
@@ -543,6 +734,133 @@ mod tests {
     fn openrouter_advertises_web_search_support() {
         let provider = OpenRouter::new("key");
         assert!(provider.supports_server_tool(&ServerTool::WebSearch { max_results: None }));
+    }
+
+    // --- provider routing (`provider.order`) ---
+    #[test]
+    fn provider_order_emits_the_provider_object_and_is_omitted_when_unset() {
+        let request = CompletionRequest::new("test/model");
+        assert!(
+            build_body(&request, None).get("provider").is_none(),
+            "unset order must emit no provider key at all"
+        );
+
+        let order = vec!["anthropic".to_string(), "openai".to_string()];
+        assert_eq!(
+            build_body(&request, Some(&order)),
+            json!({
+                "model": "test/model",
+                "messages": [],
+                "stream": true,
+                "stream_options": { "include_usage": true },
+                "provider": { "order": ["anthropic", "openai"] },
+            })
+        );
+    }
+
+    // --- extra headers ---
+    #[test]
+    fn malformed_extra_headers_are_rejected_at_the_builder() {
+        assert!(matches!(
+            OpenRouter::new("key").with_extra_header("bad name\n", "v"),
+            Err(HeaderError::InvalidName(_))
+        ));
+        assert!(matches!(
+            OpenRouter::new("key").with_extra_header("x-ok", "bad\nvalue"),
+            Err(HeaderError::InvalidValue(_))
+        ));
+    }
+
+    /// A minimal one-connection HTTP server: consumes one full request, hands
+    /// its head (request line + headers) back through the channel, writes
+    /// `response`, and closes. Everything stays on 127.0.0.1 — hermetic.
+    async fn one_shot_server(response: String) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let head = loop {
+                let mut chunk = [0u8; 1024];
+                let n = sock.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + content_length {
+                        break head;
+                    }
+                }
+            };
+            let _ = tx.send(head);
+            sock.write_all(response.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn extra_headers_reach_the_wire_request() {
+        let sse = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                   Connection: close\r\n\r\ndata: [DONE]\n\n";
+        let (base_url, head_rx) = one_shot_server(sse.into()).await;
+
+        let provider = OpenRouter::new("key")
+            .with_base_url(base_url)
+            .with_extra_header("x-attribution", "some-host")
+            .unwrap()
+            .with_extra_header("http-referer", "https://host.invalid")
+            .unwrap();
+        let mut stream = provider
+            .stream_completion(CompletionRequest::new("test/model"))
+            .await
+            .expect("request must succeed");
+        while stream.next().await.is_some() {}
+
+        let head = head_rx.await.unwrap().to_ascii_lowercase();
+        assert!(head.contains("x-attribution: some-host"), "head: {head}");
+        assert!(head.contains("http-referer: https://host.invalid"));
+        assert!(
+            head.contains("authorization: bearer key"),
+            "extra headers must not displace auth"
+        );
+    }
+
+    // --- error taxonomy: 402 ---
+    #[tokio::test]
+    async fn status_402_maps_to_insufficient_credits() {
+        let body = r#"{"error":"credits exhausted"}"#;
+        let response = format!(
+            "HTTP/1.1 402 Payment Required\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base_url, _head_rx) = one_shot_server(response).await;
+
+        let err = OpenRouter::new("key")
+            .with_base_url(base_url)
+            .stream_completion(CompletionRequest::new("test/model"))
+            .await
+            .err()
+            .expect("402 must be an error");
+        assert!(
+            matches!(&err, CompletionError::InsufficientCredits(text) if text.contains("credits exhausted")),
+            "got: {err:?}"
+        );
     }
 
     // Decode side: a `url_citation` annotation in the SSE stream must surface as
@@ -702,5 +1020,42 @@ mod tests {
             "buffered prefix flushes as one delta at identification"
         );
         assert_eq!(deltas[0], r#"{"x":1}"#, "the buffered prefix is not lost");
+    }
+
+    // --- usage accounting: completion_tokens_details ---
+    #[tokio::test]
+    async fn usage_chunk_surfaces_reasoning_tokens() {
+        let frames = vec![
+            frame(
+                r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"completion_tokens_details":{"reasoning_tokens":7}}}"#,
+            ),
+            frame(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+        ];
+
+        let mut stream = map_events(futures::stream::iter(frames));
+        let mut usage: Option<TokenUsage> = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(CompletionEvent::UsageUpdate(u)) = item {
+                usage = Some(u);
+            }
+        }
+        let u = usage.expect("usage event must surface");
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 20);
+        assert_eq!(u.reasoning_tokens, 7);
+
+        // A chunk without the details block stays at zero, not an error.
+        let frames = vec![
+            frame(r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2}}"#),
+            frame(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+        ];
+        let mut stream = map_events(futures::stream::iter(frames));
+        let mut usage: Option<TokenUsage> = None;
+        while let Some(item) = stream.next().await {
+            if let Ok(CompletionEvent::UsageUpdate(u)) = item {
+                usage = Some(u);
+            }
+        }
+        assert_eq!(usage.expect("usage event").reasoning_tokens, 0);
     }
 }
