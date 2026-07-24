@@ -129,13 +129,19 @@ CREATE TABLE IF NOT EXISTS messages (
   content     TEXT    NOT NULL,
   cache       INTEGER NOT NULL DEFAULT 0,
   created_at  INTEGER NOT NULL,
+  meta        TEXT,
   PRIMARY KEY (session_id, seq)
 );
 ";
 
 /// Bumped when the on-disk schema changes shape. Opening a store stamped
 /// higher fails with [`StoreError::FutureSchema`].
-const SCHEMA_VERSION: u32 = 1;
+/// v2: `messages.meta` — an opaque per-message host annotation, the exact
+/// mirror of `sessions.meta` (the kit stores it verbatim and never reads
+/// it). Lets a host keep its own per-message record — an id, display
+/// metadata, an alternate rendering — in the same transaction as the
+/// message itself instead of a second store with its own crash window.
+const SCHEMA_VERSION: u32 = 2;
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -188,9 +194,20 @@ impl SqliteStore {
             });
         }
         conn.execute_batch(SCHEMA)?;
+        if found < 2 {
+            // v1 → v2: additive column. CREATE IF NOT EXISTS above only
+            // shapes fresh tables, so a pre-existing v1 table needs the
+            // ALTER; guarded by an actual column probe to stay idempotent.
+            let has_meta = conn
+                .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'meta'")?
+                .exists([])?;
+            if !has_meta {
+                conn.execute_batch("ALTER TABLE messages ADD COLUMN meta TEXT;")?;
+            }
+        }
         if found < SCHEMA_VERSION {
-            // Fresh store, or one from before versioning existed (tables
-            // present, user_version 0) — both take the current stamp; the
+            // Fresh store, or one from an older stamp (including pre-
+            // versioning user_version 0) — all take the current stamp; the
             // upgrade is idempotent.
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -382,6 +399,19 @@ impl SqliteStore {
         messages: &[Message],
         expected_next_seq: Option<u64>,
     ) -> Result<u64> {
+        let entries: Vec<(&Message, Option<&str>)> = messages.iter().map(|m| (m, None)).collect();
+        self.append_messages_with_meta(id, &entries, expected_next_seq)
+    }
+
+    /// Like [`append_messages`], with an opaque host annotation riding each
+    /// message — the per-message mirror of `sessions.meta`, stored verbatim
+    /// in the same transaction and never read by the kit.
+    pub fn append_messages_with_meta(
+        &self,
+        id: &str,
+        entries: &[(&Message, Option<&str>)],
+        expected_next_seq: Option<u64>,
+    ) -> Result<u64> {
         let mut conn = self.conn.lock().expect("store lock poisoned");
         let tx = conn.transaction()?;
         let exists: bool = tx.query_row(
@@ -409,21 +439,22 @@ impl SqliteStore {
         // An empty append is a no-op: it must not touch `updated_at` (recents
         // ordering) and must not emit a mutation (the listener doctrine —
         // "a no-op fires nothing").
-        if messages.is_empty() {
+        if entries.is_empty() {
             return Ok(seq);
         }
         let now = now_ms();
-        for message in messages {
+        for (message, meta) in entries {
             tx.execute(
-                "INSERT INTO messages (session_id, seq, role, content, cache, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO messages (session_id, seq, role, content, cache, created_at, meta)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     id,
                     seq as i64,
                     role_str(message.role),
                     serde_json::to_string(&message.content)?,
                     cache_column(&message.cache),
-                    now
+                    now,
+                    meta
                 ],
             )?;
             seq += 1;
@@ -436,7 +467,7 @@ impl SqliteStore {
         drop(conn);
         self.emit(StoreMutation::MessagesAppended {
             id: id.to_string(),
-            count: messages.len() as u64,
+            count: entries.len() as u64,
             next_seq: seq,
         });
         Ok(seq)
@@ -481,6 +512,16 @@ impl SqliteStore {
 
     /// The full message log in seq order — feed it to `Session::resume`.
     pub fn load_messages(&self, id: &str) -> Result<Vec<Message>> {
+        Ok(self
+            .load_messages_with_meta(id)?
+            .into_iter()
+            .map(|(message, _)| message)
+            .collect())
+    }
+
+    /// Like [`load_messages`], carrying each message's opaque host
+    /// annotation (see [`append_messages_with_meta`]).
+    pub fn load_messages_with_meta(&self, id: &str) -> Result<Vec<(Message, Option<String>)>> {
         let conn = self.conn.lock().expect("store lock poisoned");
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
@@ -491,23 +532,27 @@ impl SqliteStore {
             return Err(StoreError::UnknownSession(id.to_string()));
         }
         let mut stmt = conn.prepare(
-            "SELECT role, content, cache FROM messages WHERE session_id = ?1 ORDER BY seq",
+            "SELECT role, content, cache, meta FROM messages WHERE session_id = ?1 ORDER BY seq",
         )?;
         let rows = stmt.query_map(params![id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, rusqlite::types::Value>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?;
         let mut messages = Vec::new();
         for row in rows {
-            let (role, content, cache) = row?;
-            messages.push(Message {
-                role: parse_role(&role),
-                content: serde_json::from_str(&content)?,
-                cache: parse_cache_column(cache)?,
-            });
+            let (role, content, cache, meta) = row?;
+            messages.push((
+                Message {
+                    role: parse_role(&role),
+                    content: serde_json::from_str(&content)?,
+                    cache: parse_cache_column(cache)?,
+                },
+                meta,
+            ));
         }
         Ok(messages)
     }
@@ -840,6 +885,52 @@ mod tests {
         assert_eq!(
             store.get_session(&s.id).unwrap().unwrap().updated_at_ms,
             before
+        );
+    }
+
+    #[test]
+    fn per_message_meta_rides_the_same_transaction() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        let m1 = msg(Role::User, "hi");
+        let m2 = msg(Role::Assistant, "ok");
+        store
+            .append_messages_with_meta(&s.id, &[(&m1, Some(r#"{"id":"m_1"}"#)), (&m2, None)], None)
+            .unwrap();
+        let loaded = store.load_messages_with_meta(&s.id).unwrap();
+        assert_eq!(loaded[0].1.as_deref(), Some(r#"{"id":"m_1"}"#));
+        assert_eq!(loaded[1].1, None);
+        // The meta-blind loaders keep working over the same rows.
+        assert_eq!(store.load_messages(&s.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_v1_store_gains_the_meta_column_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        {
+            // A genuine v1 store: the old table shape, stamped 1, with data.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, meta TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE messages (session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, cache INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq));
+                 INSERT INTO sessions VALUES ('s1', NULL, NULL, 1, 1);
+                 INSERT INTO messages VALUES ('s1', 0, 'user', '[{\"type\":\"text\",\"text\":\"old\"}]', 1, 1);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let store = SqliteStore::open(&path).unwrap();
+        let loaded = store.load_messages_with_meta("s1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, None);
+        let m = msg(Role::Assistant, "new");
+        store
+            .append_messages_with_meta("s1", &[(&m, Some("host"))], Some(1))
+            .unwrap();
+        assert_eq!(
+            store.load_messages_with_meta("s1").unwrap()[1].1.as_deref(),
+            Some("host")
         );
     }
 

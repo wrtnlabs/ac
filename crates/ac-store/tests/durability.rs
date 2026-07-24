@@ -171,7 +171,7 @@ fn future_schema_store_refuses_to_open_typed() {
             err,
             StoreError::FutureSchema {
                 found: 99,
-                supported: 1
+                supported: 2
             }
         ),
         "got: {err}"
@@ -205,7 +205,8 @@ fn pre_versioning_store_is_stamped_on_open() {
     let stamped: u32 = raw
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(stamped, 1);
+    // The current schema stamp (v2: per-message meta).
+    assert_eq!(stamped, 2);
 }
 
 /// §4 self-check: mid-file damage surfaces as a typed error at open — at
