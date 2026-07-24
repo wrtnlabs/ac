@@ -4,14 +4,18 @@
 //! and runtime loop the built-ins use.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use ac_mcp::{MAX_TOOL_NAME_LEN, McpConnection, McpError, RegisterOptions, ToolPrefix};
+use ac_mcp::{
+    MAX_TOOL_NAME_LEN, McpConnection, McpDialer, McpError, RegisterOptions, ToolPrefix,
+    register_cached,
+};
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
 use ac_runtime::{AgentConfig, AgentEvent, Session};
 use ac_tool::{Capability, SubtreePolicy, ToolCtx, ToolRegistry};
 use ac_types::StopReason;
+use futures::future::BoxFuture;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, CancelledNotificationParam, ContentBlock, ErrorData,
     JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
@@ -178,6 +182,37 @@ fn make_ctx() -> (Arc<ToolCtx>, tempfile::TempDir) {
     let policy = SubtreePolicy::new(dir.path()).unwrap();
     let ctx = Arc::new(ToolCtx::new(Arc::new(policy)));
     (ctx, dir)
+}
+
+/// A dialer over the same duplex harness, instrumented so tests can assert
+/// exactly when dials happen and force them to fail.
+fn counting_dialer(dials: Arc<AtomicUsize>, broken: Arc<AtomicBool>) -> McpDialer {
+    Arc::new(move || {
+        let dials = dials.clone();
+        let broken = broken.clone();
+        let fut: BoxFuture<'static, Result<McpConnection, McpError>> = Box::pin(async move {
+            dials.fetch_add(1, Ordering::SeqCst);
+            if broken.load(Ordering::SeqCst) {
+                return Err(McpError::Connect {
+                    server: "test".to_string(),
+                    message: "dial refused (synthetic)".to_string(),
+                });
+            }
+            let (conn, _state) = connect().await;
+            Ok(conn)
+        });
+        fut
+    })
+}
+
+/// Export a catalog from a live connection, shut it down, and round-trip the
+/// specs through JSON — the persistence step the offline path exists for.
+async fn exported_catalog() -> Vec<ac_mcp::CachedToolSpec> {
+    let (conn, _state) = connect().await;
+    let specs = conn.export_catalog().await.unwrap();
+    conn.shutdown();
+    let json = serde_json::to_string(&specs).unwrap();
+    serde_json::from_str(&json).unwrap()
 }
 
 fn drain(mut rx: mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
@@ -500,6 +535,173 @@ async fn mcp_tool_rides_the_runtime_loop() {
             .iter()
             .any(|e| matches!(e, AgentEvent::ToolResult { id, is_error: false, .. } if id == "c1"))
     );
+}
+
+#[tokio::test]
+async fn cached_specs_register_without_a_single_dial() {
+    let specs = exported_catalog().await;
+
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dialer = counting_dialer(dials.clone(), Arc::new(AtomicBool::new(false)));
+    let mut registry = ToolRegistry::new();
+    let result = register_cached(
+        &mut registry,
+        "test",
+        &specs,
+        dialer,
+        &RegisterOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        0,
+        "registration must not dial"
+    );
+
+    // Same names, same prefixing, same skip accounting as the live path.
+    assert_eq!(
+        result.registered,
+        vec![
+            "mcp__test__echo",
+            "mcp__test__add",
+            "mcp__test__always_fails",
+            "mcp__test__slow",
+        ]
+    );
+    assert_eq!(result.skipped.len(), 3);
+    assert_eq!(result.skipped[0].remote_name, "bad name!");
+    assert_eq!(result.skipped[1].remote_name, long_name());
+    assert_eq!(result.skipped[2].remote_name, "");
+
+    // Spec passthrough survives the serde round-trip…
+    let registered = registry.specs();
+    let echo = registered
+        .iter()
+        .find(|s| s.name == "mcp__test__echo")
+        .unwrap();
+    assert_eq!(echo.description, "Echoes text back.");
+    assert_eq!(echo.input_schema["properties"]["text"]["type"], "string");
+    // …and default distrust holds even though the cache carries the hint.
+    assert_eq!(
+        registry.capability("mcp__test__echo"),
+        Some(Capability::Mutating)
+    );
+}
+
+#[tokio::test]
+async fn cached_capability_honors_trust_annotations_opt_in_only() {
+    let specs = exported_catalog().await;
+    let dialer = counting_dialer(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let mut registry = ToolRegistry::new();
+    let options = RegisterOptions {
+        trust_annotations: true,
+        ..RegisterOptions::default()
+    };
+    register_cached(&mut registry, "test", &specs, dialer, &options).unwrap();
+    // The cached readOnlyHint upgrades under the opt-in; unannotated stays.
+    assert_eq!(
+        registry.capability("mcp__test__echo"),
+        Some(Capability::ReadOnly)
+    );
+    assert_eq!(
+        registry.capability("mcp__test__add"),
+        Some(Capability::Mutating)
+    );
+}
+
+#[tokio::test]
+async fn first_call_dials_and_the_second_reuses_the_connection() {
+    let specs = exported_catalog().await;
+
+    let dials = Arc::new(AtomicUsize::new(0));
+    let dialer = counting_dialer(dials.clone(), Arc::new(AtomicBool::new(false)));
+    let mut registry = ToolRegistry::new();
+    register_cached(
+        &mut registry,
+        "test",
+        &specs,
+        dialer,
+        &RegisterOptions::default(),
+    )
+    .unwrap();
+    let (ctx, _dir) = make_ctx();
+
+    let out = registry
+        .run("mcp__test__echo", json!({ "text": "lazy" }), ctx.clone())
+        .await;
+    assert!(!out.is_error, "first call failed: {}", out.content);
+    assert_eq!(out.content, "lazy");
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "first call dials once");
+
+    // A sibling tool from the same batch shares the memoized connection.
+    let out = registry
+        .run("mcp__test__add", json!({ "a": 2, "b": 3 }), ctx)
+        .await;
+    assert!(!out.is_error, "second call failed: {}", out.content);
+    assert_eq!(out.content, "5");
+    assert_eq!(
+        dials.load(Ordering::SeqCst),
+        1,
+        "second call must not re-dial"
+    );
+}
+
+#[tokio::test]
+async fn failed_dial_is_error_data_and_the_next_call_retries() {
+    let specs = exported_catalog().await;
+
+    let dials = Arc::new(AtomicUsize::new(0));
+    let broken = Arc::new(AtomicBool::new(true));
+    let dialer = counting_dialer(dials.clone(), broken.clone());
+    let mut registry = ToolRegistry::new();
+    register_cached(
+        &mut registry,
+        "test",
+        &specs,
+        dialer,
+        &RegisterOptions::default(),
+    )
+    .unwrap();
+    let (ctx, _dir) = make_ctx();
+
+    let out = registry
+        .run("mcp__test__echo", json!({ "text": "hi" }), ctx.clone())
+        .await;
+    assert!(out.is_error, "a failed dial must be error data");
+    assert!(out.content.contains("dial refused"), "got: {}", out.content);
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+
+    // Not poisoned: fix the dialer and the same tool works.
+    broken.store(false, Ordering::SeqCst);
+    let out = registry
+        .run("mcp__test__echo", json!({ "text": "recovered" }), ctx)
+        .await;
+    assert!(!out.is_error, "retry after a fixed dialer: {}", out.content);
+    assert_eq!(out.content, "recovered");
+    assert_eq!(dials.load(Ordering::SeqCst), 2, "the retry re-dials");
+}
+
+#[test]
+fn register_cached_holds_the_server_name_to_the_prefix_rules() {
+    let dialer = counting_dialer(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mut registry = ToolRegistry::new();
+    let err = register_cached(
+        &mut registry,
+        "a__b",
+        &[],
+        dialer,
+        &RegisterOptions::default(),
+    )
+    .expect_err("must reject");
+    assert!(matches!(err, McpError::InvalidServerName { .. }), "{err}");
 }
 
 #[test]

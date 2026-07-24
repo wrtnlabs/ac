@@ -6,11 +6,17 @@
 //! - [`McpConnection`] owns one client connection to one MCP server (rmcp
 //!   underneath — the official MCP Rust SDK). Hosts connect over any rmcp
 //!   transport; [`McpConnection::connect_command`] covers the common
-//!   child-process (stdio) case.
+//!   child-process (stdio) case, and the opt-in `http` cargo feature adds
+//!   `connect_http` for remote streamable-HTTP servers.
 //! - [`McpConnection::register_tools`] lists the server's tools and registers
 //!   each as a [`RawTool`]: the server's name/description/input schema pass
 //!   through verbatim, and `run` forwards the model's raw JSON arguments to
 //!   the server's `tools/call`.
+//! - A run can start connection-free: [`McpConnection::export_catalog`]
+//!   snapshots the discovered tools into serializable [`CachedToolSpec`]s a
+//!   host persists, and [`register_cached`] registers them without dialing —
+//!   the first call dials through a host-injected [`McpDialer`] and the live
+//!   connection is memoized for the rest of the session.
 //! - Failures are data, per AC doctrine: a transport error, a server-side
 //!   `isError` result, or non-object arguments all come back as
 //!   [`ToolOutput::error`] — never a panic, never a poisoned session.
@@ -51,6 +57,13 @@ pub enum McpError {
     /// Connecting or the MCP initialize handshake failed.
     #[error("MCP connect failed for server '{server}': {message}")]
     Connect { server: String, message: String },
+    /// The server observably refused us as unauthorized (HTTP 401/403 or the
+    /// transport's own auth-required signals). Distinguished so a host can
+    /// route to (re)authentication instead of retrying blindly. Ambiguous
+    /// failures stay [`Connect`](Self::Connect)/[`Service`](Self::Service) —
+    /// only what the underlying error actually surfaces is classified.
+    #[error("MCP server '{server}' requires authentication: {message}")]
+    Auth { server: String, message: String },
     /// An RPC on an established connection failed (transport or protocol).
     #[error("MCP request failed for server '{server}': {source}")]
     Service {
@@ -58,6 +71,46 @@ pub enum McpError {
         #[source]
         source: ServiceError,
     },
+}
+
+/// Signals the underlying stack actually emits on an unauthorized refusal:
+/// rmcp's streamable-HTTP client renders 401-with-`WWW-Authenticate` as
+/// "Auth required", 403-with-`WWW-Authenticate` as "Insufficient scope", and
+/// header-less 401/403 responses as "HTTP <status>: <body>" where the status
+/// carries the canonical reason phrase. Anything else is ambiguous and keeps
+/// its existing class — a mislabeled connect error beats a guessed auth one.
+fn indicates_unauthorized(message: &str) -> bool {
+    message.contains("Auth required")
+        || message.contains("Insufficient scope")
+        || message.contains("HTTP 401")
+        || message.contains("HTTP 403")
+        || message.contains("401 Unauthorized")
+        || message.contains("403 Forbidden")
+}
+
+fn connect_error(server: String, message: String) -> McpError {
+    if indicates_unauthorized(&message) {
+        McpError::Auth { server, message }
+    } else {
+        McpError::Connect { server, message }
+    }
+}
+
+/// thiserror interpolates transitively, so rendering the [`ServiceError`]
+/// exposes the transport error underneath it for classification.
+fn service_error(server: &str, source: ServiceError) -> McpError {
+    let message = source.to_string();
+    if indicates_unauthorized(&message) {
+        McpError::Auth {
+            server: server.to_string(),
+            message,
+        }
+    } else {
+        McpError::Service {
+            server: server.to_string(),
+            source,
+        }
+    }
 }
 
 /// How discovered tool names appear in the registry.
@@ -99,6 +152,20 @@ impl Default for RegisterOptions {
             call_timeout: Some(Duration::from_secs(300)),
         }
     }
+}
+
+/// Auth for [`McpConnection::connect_http_with`], applied to every request
+/// the transport makes (the streamable-HTTP transport is many requests, not
+/// one connection).
+#[cfg(feature = "http")]
+#[derive(Debug, Clone, Default)]
+pub struct HttpOptions {
+    /// Sent as `Authorization: Bearer <token>`. The token only — no
+    /// `Bearer ` prefix.
+    pub bearer_token: Option<String>,
+    /// Extra `(name, value)` headers. Invalid names or values fail the
+    /// connect with a typed error, never a partial header set.
+    pub headers: Vec<(String, String)>,
 }
 
 /// What [`McpConnection::register_tools`] did — nothing is skipped silently.
@@ -155,6 +222,14 @@ fn server_name_violation(name: &str) -> Option<String> {
         return Some(format!("name contains {bad:?}; allowed: [A-Za-z0-9_-]"));
     }
     None
+}
+
+fn registry_prefix(prefix: &ToolPrefix, server: &str) -> String {
+    match prefix {
+        ToolPrefix::ServerName => format!("mcp__{server}__"),
+        ToolPrefix::None => String::new(),
+        ToolPrefix::Custom(prefix) => prefix.clone(),
+    }
 }
 
 fn tool_name_violation(name: &str) -> Option<String> {
@@ -217,10 +292,10 @@ impl McpConnection {
                 reason,
             });
         }
-        let service = ().serve(transport).await.map_err(|e| McpError::Connect {
-            server: name.clone(),
-            message: e.to_string(),
-        })?;
+        let service =
+            ().serve(transport)
+                .await
+                .map_err(|e| connect_error(name.clone(), e.to_string()))?;
         Ok(Self {
             service: Arc::new(service),
             name,
@@ -239,6 +314,61 @@ impl McpConnection {
             message: format!("spawn failed: {e}"),
         })?;
         Self::connect(name, transport).await
+    }
+
+    /// Connect to a remote MCP server over the streamable-HTTP transport.
+    /// Requires the `http` cargo feature.
+    #[cfg(feature = "http")]
+    pub async fn connect_http(
+        name: impl Into<String>,
+        url: impl AsRef<str>,
+    ) -> Result<Self, McpError> {
+        Self::connect_http_with(name, url, HttpOptions::default()).await
+    }
+
+    /// [`connect_http`](Self::connect_http) with per-request auth: a bearer
+    /// token and/or extra headers, sent on every request the transport makes.
+    #[cfg(feature = "http")]
+    pub async fn connect_http_with(
+        name: impl Into<String>,
+        url: impl AsRef<str>,
+        options: HttpOptions,
+    ) -> Result<Self, McpError> {
+        use rmcp::transport::StreamableHttpClientTransport;
+        use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+        let name = name.into();
+        let url = url.as_ref();
+        // Checked before the transport spawns its worker: a bad URL should be
+        // one crisp error here, not a confusing request failure at handshake.
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(McpError::Connect {
+                server: name,
+                message: format!("invalid URL '{url}': expected an http:// or https:// URL"),
+            });
+        }
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+        if let Some(token) = options.bearer_token {
+            config = config.auth_header(token);
+        }
+        if !options.headers.is_empty() {
+            let mut headers = std::collections::HashMap::new();
+            for (key, value) in &options.headers {
+                let key = http::HeaderName::from_bytes(key.as_bytes()).map_err(|e| {
+                    McpError::Connect {
+                        server: name.clone(),
+                        message: format!("invalid header name '{key}': {e}"),
+                    }
+                })?;
+                let value = http::HeaderValue::from_str(value).map_err(|e| McpError::Connect {
+                    server: name.clone(),
+                    message: format!("invalid value for header '{key}': {e}"),
+                })?;
+                headers.insert(key, value);
+            }
+            config = config.custom_headers(headers);
+        }
+        Self::connect(name, StreamableHttpClientTransport::from_config(config)).await
     }
 
     pub fn name(&self) -> &str {
@@ -260,10 +390,24 @@ impl McpConnection {
             .peer()
             .list_all_tools()
             .await
-            .map_err(|e| McpError::Service {
-                server: self.name.clone(),
-                source: e,
+            .map_err(|e| service_error(&self.name, e))
+    }
+
+    /// Snapshot the server's discovered tools into serializable specs a host
+    /// can persist and later feed to [`register_cached`] — starting a run
+    /// with no live connection at all.
+    pub async fn export_catalog(&self) -> Result<Vec<CachedToolSpec>, McpError> {
+        Ok(self
+            .tools()
+            .await?
+            .iter()
+            .map(|tool| CachedToolSpec {
+                name: tool.name.to_string(),
+                description: tool.description.as_deref().map(str::to_string),
+                input_schema: Value::Object((*tool.input_schema).clone()),
+                read_only_hint: tool.annotations.as_ref().and_then(|a| a.read_only_hint),
             })
+            .collect())
     }
 
     /// Discover the server's tools and register each into `registry`. Tools
@@ -278,11 +422,7 @@ impl McpConnection {
         options: &RegisterOptions,
     ) -> Result<RegisteredTools, McpError> {
         let tools = self.tools().await?;
-        let prefix = match &options.prefix {
-            ToolPrefix::ServerName => format!("mcp__{}__", self.name),
-            ToolPrefix::None => String::new(),
-            ToolPrefix::Custom(prefix) => prefix.clone(),
-        };
+        let prefix = registry_prefix(&options.prefix, &self.name);
 
         let mut result = RegisteredTools::default();
         for tool in tools {
@@ -317,7 +457,7 @@ impl McpConnection {
                 description: tool
                     .description
                     .as_deref()
-                    .unwrap_or("(no description provided by the MCP server)")
+                    .unwrap_or(NO_DESCRIPTION)
                     .to_string(),
                 input_schema: Value::Object((*tool.input_schema).clone()),
             };
@@ -375,72 +515,266 @@ impl RawTool for McpTool {
 
     fn run(self: Arc<Self>, input: Value, ctx: Arc<ToolCtx>) -> BoxFuture<'static, ToolOutput> {
         Box::pin(async move {
-            let arguments = match input {
-                Value::Object(map) => Some(map),
-                Value::Null => None,
-                other => {
-                    return ToolOutput::error(format!(
-                        "invalid input for {}: expected a JSON object, got {}",
-                        self.spec.name,
-                        json_kind(&other)
-                    ));
-                }
-            };
+            call_remote(
+                self.peer.clone(),
+                &self.server,
+                &self.remote_name,
+                &self.spec.name,
+                self.call_timeout,
+                input,
+                &ctx,
+            )
+            .await
+        })
+    }
+}
 
-            let mut params = CallToolRequestParams::new(self.remote_name.clone());
-            params.arguments = arguments;
-            let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
-            let options = match self.call_timeout {
-                Some(timeout) => PeerRequestOptions::with_timeout(timeout),
-                None => PeerRequestOptions::no_options(),
-            };
+/// The one remote-call path both tool shapes share: shape-only argument
+/// validation, a cancellable `tools/call`, and the cancel/timeout race.
+async fn call_remote(
+    peer: Peer<RoleClient>,
+    server: &str,
+    remote_name: &str,
+    registry_name: &str,
+    call_timeout: Option<Duration>,
+    input: Value,
+    ctx: &ToolCtx,
+) -> ToolOutput {
+    let arguments = match input {
+        Value::Object(map) => Some(map),
+        Value::Null => None,
+        other => {
+            return ToolOutput::error(format!(
+                "invalid input for {registry_name}: expected a JSON object, got {}",
+                json_kind(&other)
+            ));
+        }
+    };
 
-            // A cancellable request, so a cancelled turn tells the server to
-            // stop (notifications/cancelled) instead of silently abandoning a
-            // possibly-mutating call to run to completion.
-            let handle = match self.peer.send_cancellable_request(request, options).await {
-                Ok(handle) => handle,
-                Err(e) => {
-                    return ToolOutput::error(format!(
-                        "MCP call to '{}' on server '{}' failed: {e}",
-                        self.remote_name, self.server
-                    ));
-                }
-            };
-            let request_id = handle.id.clone();
-            let peer = handle.peer.clone();
+    let mut params = CallToolRequestParams::new(remote_name.to_string());
+    params.arguments = arguments;
+    let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+    let options = match call_timeout {
+        Some(timeout) => PeerRequestOptions::with_timeout(timeout),
+        None => PeerRequestOptions::no_options(),
+    };
 
-            tokio::select! {
+    // A cancellable request, so a cancelled turn tells the server to
+    // stop (notifications/cancelled) instead of silently abandoning a
+    // possibly-mutating call to run to completion.
+    let handle = match peer.send_cancellable_request(request, options).await {
+        Ok(handle) => handle,
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "MCP call to '{remote_name}' on server '{server}' failed: {e}"
+            ));
+        }
+    };
+    let request_id = handle.id.clone();
+    let peer = handle.peer.clone();
+
+    tokio::select! {
+        _ = ctx.cancel.cancelled() => {
+            let notification = CancelledNotification::new(CancelledNotificationParam::new(
+                Some(request_id),
+                Some("cancelled by host".to_string()),
+            ));
+            // Best effort, bounded: a transport wedged mid-write must
+            // not hang the very turn cancellation exists to escape.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                peer.send_notification(notification.into()),
+            )
+            .await;
+            ToolOutput::error(format!("{registry_name} cancelled"))
+        }
+        result = handle.await_response() => match result {
+            Ok(ServerResult::CallToolResult(result)) => render_result(result),
+            Ok(_) => ToolOutput::error(format!(
+                "MCP call to '{remote_name}' on server '{server}' returned an unexpected response type"
+            )),
+            Err(ServiceError::Timeout { timeout }) => ToolOutput::error(format!(
+                "MCP call to '{remote_name}' on server '{server}' timed out after {timeout:?}"
+            )),
+            Err(e) => ToolOutput::error(format!(
+                "MCP call to '{remote_name}' on server '{server}' failed: {e}"
+            )),
+        },
+    }
+}
+
+/// The explicit stand-in for a server that declared no description — a
+/// placeholder the model can read, never an empty string.
+const NO_DESCRIPTION: &str = "(no description provided by the MCP server)";
+
+/// A serializable snapshot of one discovered tool: what a host persists so a
+/// later run can register the server's tools before any connection exists.
+/// Produced by [`McpConnection::export_catalog`]; consumed by
+/// [`register_cached`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedToolSpec {
+    /// The tool's name as the server declared it (unprefixed).
+    pub name: String,
+    pub description: Option<String>,
+    /// The server's declared input schema, verbatim.
+    pub input_schema: Value,
+    /// The server's `readOnlyHint` annotation, if it declared one. Still an
+    /// unverified claim — honored only under
+    /// [`RegisterOptions::trust_annotations`], exactly like the live path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+}
+
+/// Host-injected connection factory for [`register_cached`]. Called on the
+/// first tool call (never at registration), and again only if a dial failed
+/// or a memoized connection has since died.
+pub type McpDialer =
+    Arc<dyn Fn() -> BoxFuture<'static, Result<McpConnection, McpError>> + Send + Sync>;
+
+/// Register a server's cached tools without dialing it. The registered tools
+/// share one lazily-dialed connection: the first call dials through `dialer`
+/// and memoizes the result for every subsequent call on any of them. A failed
+/// dial is one failed tool result — nothing is poisoned, the next call
+/// retries.
+///
+/// Name validation, prefixing, capability classification, and skip accounting
+/// are exactly [`McpConnection::register_tools`]'s: `server_name` is held to
+/// the same rules as [`McpConnection::connect`]'s name, contract-violating
+/// tool names are skipped and reported, and every tool defaults to
+/// [`Capability::Mutating`] unless the host opted into trusting annotations.
+// The pre-existing `McpError::Service` variant embeds rmcp's `ServiceError`
+// (large by clippy's threshold); this is just the crate's first non-async fn
+// returning it, and boxing the variant would churn the public error contract.
+#[allow(clippy::result_large_err)]
+pub fn register_cached(
+    registry: &mut ToolRegistry,
+    server_name: &str,
+    specs: &[CachedToolSpec],
+    dialer: McpDialer,
+    options: &RegisterOptions,
+) -> Result<RegisteredTools, McpError> {
+    if let Some(reason) = server_name_violation(server_name) {
+        return Err(McpError::InvalidServerName {
+            server: server_name.to_string(),
+            reason,
+        });
+    }
+    let prefix = registry_prefix(&options.prefix, server_name);
+    let slot = Arc::new(tokio::sync::Mutex::new(None));
+
+    let mut result = RegisteredTools::default();
+    for cached in specs {
+        if cached.name.is_empty() {
+            result.skipped.push(SkippedTool {
+                remote_name: String::new(),
+                reason: "server declared an empty tool name".to_string(),
+            });
+            continue;
+        }
+        let registry_name = format!("{prefix}{}", cached.name);
+        if let Some(reason) = tool_name_violation(&registry_name) {
+            result.skipped.push(SkippedTool {
+                remote_name: cached.name.clone(),
+                reason,
+            });
+            continue;
+        }
+        let capability = if options.trust_annotations && cached.read_only_hint == Some(true) {
+            Capability::ReadOnly
+        } else {
+            Capability::Mutating
+        };
+        let spec = ToolSpec {
+            name: registry_name.clone(),
+            description: cached
+                .description
+                .clone()
+                .unwrap_or_else(|| NO_DESCRIPTION.to_string()),
+            input_schema: cached.input_schema.clone(),
+        };
+        registry.register_raw(CachedMcpTool {
+            server: server_name.to_string(),
+            remote_name: cached.name.clone(),
+            spec,
+            capability,
+            call_timeout: options.call_timeout,
+            dialer: dialer.clone(),
+            slot: slot.clone(),
+        });
+        result.registered.push(registry_name);
+    }
+    Ok(result)
+}
+
+/// A cached tool bridged into the registry with no live connection behind it.
+/// Not constructed directly — [`register_cached`] is the entry point.
+struct CachedMcpTool {
+    server: String,
+    remote_name: String,
+    spec: ToolSpec,
+    capability: Capability,
+    call_timeout: Option<Duration>,
+    dialer: McpDialer,
+    /// Shared by every tool of one [`register_cached`] batch: whichever tool
+    /// is called first dials once for the whole server. Also the keepalive —
+    /// the memoized connection lives as long as any of the batch's tools.
+    slot: Arc<tokio::sync::Mutex<Option<McpConnection>>>,
+}
+
+impl CachedMcpTool {
+    /// A dial failure leaves the slot as it was, so the next call retries; a
+    /// memoized connection whose transport has since died is re-dialed.
+    async fn service(&self) -> Result<Arc<RunningService<RoleClient, ()>>, McpError> {
+        let mut slot = self.slot.lock().await;
+        if let Some(conn) = slot.as_ref()
+            && !conn.is_closed()
+        {
+            return Ok(conn.service.clone());
+        }
+        let conn = (self.dialer)().await?;
+        let service = conn.service.clone();
+        *slot = Some(conn);
+        Ok(service)
+    }
+}
+
+impl RawTool for CachedMcpTool {
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+
+    fn capability(&self) -> Capability {
+        self.capability
+    }
+
+    fn run(self: Arc<Self>, input: Value, ctx: Arc<ToolCtx>) -> BoxFuture<'static, ToolOutput> {
+        Box::pin(async move {
+            let service = tokio::select! {
                 _ = ctx.cancel.cancelled() => {
-                    let notification = CancelledNotification::new(CancelledNotificationParam::new(
-                        Some(request_id),
-                        Some("cancelled by host".to_string()),
-                    ));
-                    // Best effort, bounded: a transport wedged mid-write must
-                    // not hang the very turn cancellation exists to escape.
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        peer.send_notification(notification.into()),
-                    )
-                    .await;
-                    ToolOutput::error(format!("{} cancelled", self.spec.name))
+                    return ToolOutput::error(format!("{} cancelled", self.spec.name));
                 }
-                result = handle.await_response() => match result {
-                    Ok(ServerResult::CallToolResult(result)) => render_result(result),
-                    Ok(_) => ToolOutput::error(format!(
-                        "MCP call to '{}' on server '{}' returned an unexpected response type",
-                        self.remote_name, self.server
-                    )),
-                    Err(ServiceError::Timeout { timeout }) => ToolOutput::error(format!(
-                        "MCP call to '{}' on server '{}' timed out after {timeout:?}",
-                        self.remote_name, self.server
-                    )),
-                    Err(e) => ToolOutput::error(format!(
-                        "MCP call to '{}' on server '{}' failed: {e}",
-                        self.remote_name, self.server
-                    )),
+                dialed = self.service() => match dialed {
+                    Ok(service) => service,
+                    // Errors-as-data: the dial failure is the tool result the
+                    // model reads, and the session survives.
+                    Err(e) => {
+                        return ToolOutput::error(format!(
+                            "MCP dial for server '{}' failed: {e}",
+                            self.server
+                        ));
+                    }
                 },
-            }
+            };
+            call_remote(
+                service.peer().clone(),
+                &self.server,
+                &self.remote_name,
+                &self.spec.name,
+                self.call_timeout,
+                input,
+                &ctx,
+            )
+            .await
         })
     }
 }
@@ -587,6 +921,94 @@ mod tests {
         assert!(tool_name_violation("bad name").is_some());
         assert!(tool_name_violation("bad.name").is_some());
         assert!(tool_name_violation("héllo").is_some());
+    }
+
+    #[test]
+    fn auth_is_classified_only_on_observable_signals() {
+        // What the HTTP stack actually emits on an unauthorized refusal:
+        // rmcp's AuthRequired / InsufficientScope displays, and header-less
+        // 401/403 responses rendered with their status line.
+        assert!(indicates_unauthorized(
+            "Transport [streamable http client] error: Auth required"
+        ));
+        assert!(indicates_unauthorized("Insufficient scope"));
+        assert!(indicates_unauthorized(
+            "HTTP 401 Unauthorized: missing bearer token"
+        ));
+        assert!(indicates_unauthorized(
+            "HTTP status client error (403 Forbidden) for url (http://localhost/mcp)"
+        ));
+        // Ambiguity keeps the existing class — never guessed into Auth.
+        assert!(!indicates_unauthorized("connection refused"));
+        assert!(!indicates_unauthorized("spawn failed: no such file"));
+        assert!(!indicates_unauthorized("request timeout after PT300S"));
+    }
+
+    #[test]
+    fn connect_and_service_failures_route_to_the_auth_class() {
+        let err = connect_error("test".into(), "HTTP 401 Unauthorized: nope".into());
+        assert!(matches!(err, McpError::Auth { .. }), "{err}");
+        let err = connect_error("test".into(), "connection refused".into());
+        assert!(matches!(err, McpError::Connect { .. }), "{err}");
+
+        // A synthetic transport error with the auth signal one level down:
+        // thiserror renders transitively, so classification still sees it.
+        let auth: Box<dyn std::error::Error + Send + Sync> = "Auth required".into();
+        let source =
+            ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+                "test-transport",
+                std::any::TypeId::of::<()>(),
+                auth,
+            ));
+        assert!(matches!(
+            service_error("test", source),
+            McpError::Auth { .. }
+        ));
+
+        let plain: Box<dyn std::error::Error + Send + Sync> = "broken pipe".into();
+        let source =
+            ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+                "test-transport",
+                std::any::TypeId::of::<()>(),
+                plain,
+            ));
+        assert!(matches!(
+            service_error("test", source),
+            McpError::Service { .. }
+        ));
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn connect_http_rejects_non_http_urls_without_dialing() {
+        let err = McpConnection::connect_http("test", "ftp://example.invalid/mcp")
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, McpError::Connect { .. }), "{err}");
+        assert!(err.to_string().contains("http://"), "{err}");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn connect_http_rejects_malformed_headers_without_dialing() {
+        let options = HttpOptions {
+            bearer_token: None,
+            headers: vec![("bad header name".into(), "v".into())],
+        };
+        let err = McpConnection::connect_http_with("test", "http://127.0.0.1:9/mcp", options)
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, McpError::Connect { .. }), "{err}");
+        assert!(err.to_string().contains("invalid header name"), "{err}");
+    }
+
+    #[cfg(feature = "http")]
+    #[tokio::test]
+    async fn connect_http_holds_the_server_name_to_the_prefix_rules() {
+        let err = McpConnection::connect_http("a__b", "http://127.0.0.1:9/mcp")
+            .await
+            .expect_err("must reject");
+        assert!(matches!(err, McpError::InvalidServerName { .. }), "{err}");
     }
 
     #[test]

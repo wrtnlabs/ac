@@ -4,6 +4,15 @@
 (server configuration format) records the de-facto `mcpServers` JSON object as the host contract
 to follow — the kit stays format-agnostic (it takes connections, not files), and other tools'
 native configs are one-way importers, never the contract.
+**Amended 2026-07-24:** the remote-transport deferral (§9) is partially closed. A
+streamable-HTTP client connect path ships behind an opt-in `http` cargo feature (bearer token
+and extra headers at connect); an observably-unauthorized refusal — HTTP 401/403 or the
+transport's own auth-required signals — now surfaces as a distinct auth error class, with
+ambiguous failures keeping their existing class. Separately, an offline catalog closes the
+connect-time-snapshot gap: a live connection exports its discovered tools as serializable
+cached specs, and a cached-registration path registers them connection-free with a
+host-injected dialer — first call dials, the batch memoizes the live connection, and a failed
+dial is one failed tool result, retried on the next call (§5). OAuth flows remain deferred.
 **Requires:** [ac-tools.md](ac-tools.md) (the tool registry, the raw (runtime-described) registration
 path, errors-as-data), [ac-provider.md](ac-provider.md) (tool specs ride every sampling request —
 the exposure that motivates the name floor defined in §2). **Required by:** nothing yet. **Interacts with:**
@@ -139,6 +148,14 @@ arguments. The model sees a failed tool; the session continues.
   ones, but replacement cannot express *removal* — a tool the server dropped stays registered
   and fails at call time as error data. Hosts that refresh SHOULD therefore rebuild the
   registry from fresh discovery rather than mutate one in place.
+- **Lazy dial (cached catalog).** A live connection MAY export its discovered tools as a
+  serializable catalog, and a host MAY register that catalog with no connection at all,
+  supplying a dial factory instead. Registration performs zero dials; the first call — by any
+  tool of the batch — dials once and the batch memoizes the live connection. A failed dial is
+  one failed tool result (R4), never a poisoned batch: the next call retries, and a memoized
+  connection observed dead is re-dialed rather than kept as a corpse. Name floor, prefixing,
+  capability distrust, and skip accounting are identical to live registration (I4–I6); the
+  cached spec carries the server's read-only claim so the trust opt-in composes unchanged.
 
 ## 6. Invariants
 
@@ -198,8 +215,8 @@ the standard to follow is the *de-facto* one the ecosystem converged on, not any
   policy over untrusted input: names are re-validated against the floor (§2) and unmodeled keys
   are dropped, never adopted. The kit sees only the resulting connections.
 - **Transport reach.** The stdio definition maps onto the child-process connect path; the remote
-  `url` definition maps onto the transport-generic connect seam but rides streamable HTTP,
-  deferred (§9). Until that lands a host honors the stdio form and reports a remote definition as
+  `url` definition maps onto the streamable-HTTP connect path (opt-in `http` feature; `headers`
+  carry bearer auth). A host built without that feature MUST still report a remote definition as
   skipped with a stated reason (R5) — never silently.
 
 ## 9. Deferred
@@ -208,5 +225,7 @@ the standard to follow is the *de-facto* one the ecosystem converged on, not any
   loop needs; the rest is host surface until evidence says otherwise.
 - **List-changed notifications** — snapshot-plus-host-driven-refresh is the contract today;
   reactive re-registration needs a story for removal (§5) first.
-- **Remote transports and auth** — the connect seam is transport-generic already, but the
-  covered, tested path is child-process stdio; streamable HTTP and OAuth are future work.
+- **OAuth** — streamable HTTP landed (2026-07-24, opt-in feature) and an observably-unauthorized
+  refusal is now a distinct auth error class a host can route to (re)authentication, but the
+  authentication flow itself — token acquisition, refresh, storage — is host surface; the kit
+  carries the credentials it is handed, nothing more.
