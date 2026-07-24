@@ -414,63 +414,17 @@ impl SqliteStore {
     ) -> Result<u64> {
         let mut conn = self.conn.lock().expect("store lock poisoned");
         let tx = conn.transaction()?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-            params![id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(StoreError::UnknownSession(id.to_string()));
-        }
-        let mut seq: u64 = tx.query_row(
-            "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE session_id = ?1",
-            params![id],
-            |row| row.get::<_, i64>(0).map(|v| v as u64),
-        )?;
-        if let Some(expected) = expected_next_seq
-            && expected != seq
-        {
-            return Err(StoreError::SeqConflict {
-                session: id.to_string(),
-                expected,
-                actual: seq,
-            });
-        }
-        // An empty append is a no-op: it must not touch `updated_at` (recents
-        // ordering) and must not emit a mutation (the listener doctrine —
-        // "a no-op fires nothing").
-        if entries.is_empty() {
-            return Ok(seq);
-        }
-        let now = now_ms();
-        for (message, meta) in entries {
-            tx.execute(
-                "INSERT INTO messages (session_id, seq, role, content, cache, created_at, meta)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    id,
-                    seq as i64,
-                    role_str(message.role),
-                    serde_json::to_string(&message.content)?,
-                    cache_column(&message.cache),
-                    now,
-                    meta
-                ],
-            )?;
-            seq += 1;
-        }
-        tx.execute(
-            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-            params![id, now],
-        )?;
+        let next_seq = append_rows(&tx, id, entries, expected_next_seq)?;
         tx.commit()?;
         drop(conn);
-        self.emit(StoreMutation::MessagesAppended {
-            id: id.to_string(),
-            count: entries.len() as u64,
-            next_seq: seq,
-        });
-        Ok(seq)
+        if !entries.is_empty() {
+            self.emit(StoreMutation::MessagesAppended {
+                id: id.to_string(),
+                count: entries.len() as u64,
+                next_seq,
+            });
+        }
+        Ok(next_seq)
     }
 
     /// Deletes every message with `seq >= from_seq`, transactionally, and
@@ -481,24 +435,7 @@ impl SqliteStore {
     pub fn truncate_messages_from(&self, id: &str, from_seq: u64) -> Result<u64> {
         let mut conn = self.conn.lock().expect("store lock poisoned");
         let tx = conn.transaction()?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-            params![id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(StoreError::UnknownSession(id.to_string()));
-        }
-        let deleted = tx.execute(
-            "DELETE FROM messages WHERE session_id = ?1 AND seq >= ?2",
-            params![id, from_seq as i64],
-        )? as u64;
-        if deleted > 0 {
-            tx.execute(
-                "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
-                params![id, now_ms()],
-            )?;
-        }
+        let deleted = truncate_rows(&tx, id, from_seq)?;
         tx.commit()?;
         drop(conn);
         if deleted > 0 {
@@ -508,6 +445,73 @@ impl SqliteStore {
             });
         }
         Ok(deleted)
+    }
+
+    /// Atomic read-modify-write of the host meta blob, inside one
+    /// transaction under the store's lock: `f` sees the current raw text
+    /// (`None` when unset) and returns `Some(next)` to write (and bump
+    /// `updated_at`) or `None` to leave the row untouched — a declined
+    /// update is a true no-op, no bump, no event. Two concurrent updates
+    /// serialize; neither is lost — the primitive lock/lease protocols
+    /// build on without compare-and-swap retry loops. The kit still never
+    /// reads the blob; `f` is host code.
+    pub fn update_meta<T>(
+        &self,
+        id: &str,
+        f: impl FnOnce(Option<&str>) -> (Option<Option<String>>, T),
+    ) -> Result<T> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        let current: Option<Option<String>> = tx
+            .query_row(
+                "SELECT meta FROM sessions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current) = current else {
+            return Err(StoreError::UnknownSession(id.to_string()));
+        };
+        let (write, out) = f(current.as_deref());
+        let wrote = match write {
+            None => false,
+            Some(next) => {
+                tx.execute(
+                    "UPDATE sessions SET meta = ?2, updated_at = ?3 WHERE id = ?1",
+                    params![id, next, now_ms()],
+                )?;
+                true
+            }
+        };
+        tx.commit()?;
+        drop(conn);
+        if wrote {
+            self.emit(StoreMutation::MetaSet { id: id.to_string() });
+        }
+        Ok(out)
+    }
+
+    /// Runs `f` inside ONE transaction — the composition seam for hosts
+    /// whose logical operation spans several store ops (create a branch and
+    /// copy its prefix; truncate a log and clear a marker). Everything in
+    /// `f` commits or rolls back together; mutation events are collected
+    /// and emitted only after the commit, outside the lock. An `Err` from
+    /// `f` rolls back and emits nothing.
+    pub fn atomic<T>(&self, f: impl FnOnce(&TxOps<'_>) -> Result<T>) -> Result<T> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        let ops = TxOps {
+            tx: &tx,
+            mutations: std::cell::RefCell::new(Vec::new()),
+        };
+        let out = f(&ops)?;
+        let mutations = ops.mutations.into_inner();
+        tx.commit()?;
+        drop(conn);
+        for mutation in mutations {
+            self.emit(mutation);
+        }
+        Ok(out)
     }
 
     /// The full message log in seq order — feed it to `Session::resume`.
@@ -523,38 +527,7 @@ impl SqliteStore {
     /// annotation (see [`append_messages_with_meta`]).
     pub fn load_messages_with_meta(&self, id: &str) -> Result<Vec<(Message, Option<String>)>> {
         let conn = self.conn.lock().expect("store lock poisoned");
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
-            params![id],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(StoreError::UnknownSession(id.to_string()));
-        }
-        let mut stmt = conn.prepare(
-            "SELECT role, content, cache, meta FROM messages WHERE session_id = ?1 ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(params![id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, rusqlite::types::Value>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        let mut messages = Vec::new();
-        for row in rows {
-            let (role, content, cache, meta) = row?;
-            messages.push((
-                Message {
-                    role: parse_role(&role),
-                    content: serde_json::from_str(&content)?,
-                    cache: parse_cache_column(cache)?,
-                },
-                meta,
-            ));
-        }
-        Ok(messages)
+        load_rows(&conn, id)
     }
 
     pub fn message_count(&self, id: &str) -> Result<u64> {
@@ -610,6 +583,215 @@ fn now_ms() -> i64 {
             Err(actual) => last = actual,
         }
     }
+}
+
+/// The transactional view handed to [`SqliteStore::atomic`]'s closure. Each
+/// method mirrors its `SqliteStore` namesake, but runs on the enclosing
+/// transaction and queues its mutation event for post-commit emission.
+pub struct TxOps<'a> {
+    tx: &'a rusqlite::Transaction<'a>,
+    mutations: std::cell::RefCell<Vec<StoreMutation>>,
+}
+
+impl TxOps<'_> {
+    pub fn create_session_with_id(&self, id: &str, title: Option<&str>) -> Result<bool> {
+        let now = now_ms();
+        let created = self.tx.execute(
+            "INSERT OR IGNORE INTO sessions (id, title, meta, created_at, updated_at)
+             VALUES (?1, ?2, NULL, ?3, ?3)",
+            params![id, title, now],
+        )? > 0;
+        if created {
+            self.mutations
+                .borrow_mut()
+                .push(StoreMutation::SessionCreated { id: id.to_string() });
+        }
+        Ok(created)
+    }
+
+    /// Unconditional meta replace — atomicity comes from the enclosing
+    /// transaction, so no compare-and-swap is needed inside it.
+    pub fn set_meta_raw(&self, id: &str, meta: Option<&str>) -> Result<()> {
+        let changed = self.tx.execute(
+            "UPDATE sessions SET meta = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, meta, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::UnknownSession(id.to_string()));
+        }
+        self.mutations
+            .borrow_mut()
+            .push(StoreMutation::MetaSet { id: id.to_string() });
+        Ok(())
+    }
+
+    /// The current raw meta text (`None` = unset), read inside the
+    /// transaction — consistent with every other op in the closure.
+    pub fn meta_raw(&self, id: &str) -> Result<Option<String>> {
+        let current: Option<Option<String>> = self
+            .tx
+            .query_row(
+                "SELECT meta FROM sessions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        current.ok_or_else(|| StoreError::UnknownSession(id.to_string()))
+    }
+
+    pub fn append_messages_with_meta(
+        &self,
+        id: &str,
+        entries: &[(&Message, Option<&str>)],
+        expected_next_seq: Option<u64>,
+    ) -> Result<u64> {
+        let next_seq = append_rows(self.tx, id, entries, expected_next_seq)?;
+        if !entries.is_empty() {
+            self.mutations
+                .borrow_mut()
+                .push(StoreMutation::MessagesAppended {
+                    id: id.to_string(),
+                    count: entries.len() as u64,
+                    next_seq,
+                });
+        }
+        Ok(next_seq)
+    }
+
+    pub fn truncate_messages_from(&self, id: &str, from_seq: u64) -> Result<u64> {
+        let deleted = truncate_rows(self.tx, id, from_seq)?;
+        if deleted > 0 {
+            self.mutations
+                .borrow_mut()
+                .push(StoreMutation::MessagesTruncated {
+                    id: id.to_string(),
+                    deleted,
+                });
+        }
+        Ok(deleted)
+    }
+
+    pub fn load_messages_with_meta(&self, id: &str) -> Result<Vec<(Message, Option<String>)>> {
+        load_rows(self.tx, id)
+    }
+}
+
+/// Shared row logic for the append paths ([`SqliteStore::append_messages_with_meta`]
+/// and [`TxOps::append_messages_with_meta`]) — one implementation, two
+/// transaction owners.
+fn append_rows(
+    conn: &rusqlite::Connection,
+    id: &str,
+    entries: &[(&Message, Option<&str>)],
+    expected_next_seq: Option<u64>,
+) -> Result<u64> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(StoreError::UnknownSession(id.to_string()));
+    }
+    let mut seq: u64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE session_id = ?1",
+        params![id],
+        |row| row.get::<_, i64>(0).map(|v| v as u64),
+    )?;
+    if let Some(expected) = expected_next_seq
+        && expected != seq
+    {
+        return Err(StoreError::SeqConflict {
+            session: id.to_string(),
+            expected,
+            actual: seq,
+        });
+    }
+    // An empty append is a no-op: it must not touch `updated_at` (recents
+    // ordering) and must not emit a mutation (the listener doctrine —
+    // "a no-op fires nothing").
+    if entries.is_empty() {
+        return Ok(seq);
+    }
+    let now = now_ms();
+    for (message, meta) in entries {
+        conn.execute(
+            "INSERT INTO messages (session_id, seq, role, content, cache, created_at, meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                seq as i64,
+                role_str(message.role),
+                serde_json::to_string(&message.content)?,
+                cache_column(&message.cache),
+                now,
+                meta
+            ],
+        )?;
+        seq += 1;
+    }
+    conn.execute(
+        "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+        params![id, now],
+    )?;
+    Ok(seq)
+}
+
+fn truncate_rows(conn: &rusqlite::Connection, id: &str, from_seq: u64) -> Result<u64> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(StoreError::UnknownSession(id.to_string()));
+    }
+    let deleted = conn.execute(
+        "DELETE FROM messages WHERE session_id = ?1 AND seq >= ?2",
+        params![id, from_seq as i64],
+    )? as u64;
+    if deleted > 0 {
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![id, now_ms()],
+        )?;
+    }
+    Ok(deleted)
+}
+
+fn load_rows(conn: &rusqlite::Connection, id: &str) -> Result<Vec<(Message, Option<String>)>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(StoreError::UnknownSession(id.to_string()));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT role, content, cache, meta FROM messages WHERE session_id = ?1 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, rusqlite::types::Value>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (role, content, cache, meta) = row?;
+        messages.push((
+            Message {
+                role: parse_role(&role),
+                content: serde_json::from_str(&content)?,
+                cache: parse_cache_column(cache)?,
+            },
+            meta,
+        ));
+    }
+    Ok(messages)
 }
 
 /// The `cache` column is dynamically typed for wire-compatible widening:
@@ -902,6 +1084,117 @@ mod tests {
         assert_eq!(loaded[1].1, None);
         // The meta-blind loaders keep working over the same rows.
         assert_eq!(store.load_messages(&s.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn update_meta_serializes_concurrent_writers() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let s = store.create_session(None).unwrap();
+        store
+            .update_meta(&s.id, |_| (Some(Some(r#"{"n":0}"#.to_string())), ()))
+            .unwrap();
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let id = s.id.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        store
+                            .update_meta(&id, |current| {
+                                let mut v: serde_json::Value =
+                                    serde_json::from_str(current.unwrap()).unwrap();
+                                v["n"] = (v["n"].as_i64().unwrap() + 1).into();
+                                (Some(Some(v.to_string())), ())
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // Two racing writers, one hundred increments, zero lost updates and
+        // zero conflicts — the property the CAS-retry shape cannot give.
+        let meta = store.get_session(&s.id).unwrap().unwrap().meta.unwrap();
+        assert_eq!(meta["n"], 100);
+    }
+
+    #[test]
+    fn a_declined_meta_update_is_a_true_no_op() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        let before = store.get_session(&s.id).unwrap().unwrap().updated_at_ms;
+        let events: Arc<Mutex<Vec<StoreMutation>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            sink.lock().unwrap().push(m.clone());
+        })));
+        let seen = store
+            .update_meta(&s.id, |current| (None, current.is_none()))
+            .unwrap();
+        assert!(seen);
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(
+            store.get_session(&s.id).unwrap().unwrap().updated_at_ms,
+            before
+        );
+    }
+
+    #[test]
+    fn atomic_composes_all_or_nothing_with_post_commit_events() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let events: Arc<Mutex<Vec<StoreMutation>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            sink.lock().unwrap().push(m.clone());
+        })));
+
+        // Failure: everything in the closure rolls back, nothing is emitted.
+        let m = msg(Role::User, "orphan");
+        let err: Result<()> = store.atomic(|tx| {
+            tx.create_session_with_id("branch", Some("b"))?;
+            tx.append_messages_with_meta("branch", &[(&m, None)], None)?;
+            Err(StoreError::UnknownSession("boom".into()))
+        });
+        assert!(err.is_err());
+        assert!(store.get_session("branch").unwrap().is_none());
+        assert!(events.lock().unwrap().is_empty());
+
+        // Success: one commit, events after it, in op order.
+        let m2 = msg(Role::Assistant, "copied");
+        store
+            .atomic(|tx| {
+                tx.create_session_with_id("branch", Some("b"))?;
+                tx.set_meta_raw("branch", Some(r#"{"lineage":"src"}"#))?;
+                tx.append_messages_with_meta("branch", &[(&m2, Some("host"))], Some(0))?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .load_messages_with_meta("branch")
+                .unwrap()
+                .first()
+                .unwrap()
+                .1
+                .as_deref(),
+            Some("host")
+        );
+        let kinds: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                format!("{m:?}")
+                    .split('{')
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(kinds, ["SessionCreated", "MetaSet", "MessagesAppended"]);
     }
 
     #[test]
