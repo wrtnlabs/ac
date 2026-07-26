@@ -134,23 +134,32 @@ fn build_profile(policy: &ac_tool::SandboxPolicy) -> (String, Vec<(String, std::
     let mut profile = String::from(BASE_POLICY);
     let mut params: Vec<(String, std::path::PathBuf)> = Vec::new();
 
-    // Reads: broad, then deny the mandatory secret set (last-match-wins).
+    // SBPL is LAST-MATCH-WINS, so the order below is the policy:
+    //   1. read broadly, 2. write only in the roots, 3. deny — final.
+    //
+    // The denies MUST come last. Emitting them before the write allows (as
+    // this did) let any allow whose subpath contained a denied path silently
+    // un-deny it: a deny of `<root>/.git/hooks` followed by an allow of
+    // `<root>` is a WRITABLE hook, and a hook is code the user's own tooling
+    // executes later, outside the sandbox. A deny_paths entry is a promise
+    // that nothing reaches it — it cannot be conditional on ordering against
+    // an allow the caller supplies separately.
     profile.push_str("\n; --- filesystem ---\n(allow file-read*)\n");
-    for (i, deny) in policy.deny_paths.iter().enumerate() {
-        let key = format!("DENY_{i}");
-        profile.push_str(&format!(
-            "(deny file-read* file-write* (subpath (param \"{key}\")))\n"
-        ));
-        params.push((key, deny.clone()));
-    }
 
-    // Writes: allow only the write roots.
     for (i, root) in policy.write_roots.iter().enumerate() {
         let key = format!("WRITE_{i}");
         profile.push_str(&format!(
             "(allow file-write* (subpath (param \"{key}\")))\n"
         ));
         params.push((key, root.clone()));
+    }
+
+    for (i, deny) in policy.deny_paths.iter().enumerate() {
+        let key = format!("DENY_{i}");
+        profile.push_str(&format!(
+            "(deny file-read* file-write* (subpath (param \"{key}\")))\n"
+        ));
+        params.push((key, deny.clone()));
     }
 
     if policy.network == NetworkMode::On {

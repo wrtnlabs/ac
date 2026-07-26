@@ -121,6 +121,40 @@ async fn reading_a_denied_secret_is_blocked() {
     );
 }
 
+/// The write half of the deny contract — the half that was broken.
+///
+/// SBPL is last-match-wins and `build_profile` emitted the denies BEFORE the
+/// write allows, so `(allow file-write* <root>)` silently un-denied everything
+/// under it. `reading_a_denied_secret_is_blocked` could not catch this: a
+/// write allow does not override a read deny, so the read half kept passing
+/// while every denied path inside a writable root stayed freely writable.
+/// Concretely that let a sandboxed command plant `<repo>/.git/hooks/pre-commit`
+/// — code the user's own `git commit` runs later, outside any sandbox.
+#[tokio::test]
+async fn writing_to_a_denied_path_inside_a_write_root_is_blocked() {
+    let ws = workspace();
+    let root = ws.path().canonicalize().unwrap();
+    let hooks = root.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+
+    let mut policy = SandboxPolicy::workspace(&root);
+    // The workspace IS the write root; the denied path sits inside it.
+    policy.deny_paths = vec![root.join(".git")];
+
+    let r = run(policy, &root, "printf PWNED > .git/hooks/pre-commit").await;
+    assert_ne!(
+        r.exit,
+        Some(0),
+        "planting a hook inside a denied subpath must fail; stderr: {:?}",
+        r.stderr
+    );
+    assert!(
+        !hooks.join("pre-commit").exists(),
+        "the hook must not be on disk — a deny_paths entry is unconditional, \
+         not merely 'earlier in the profile than some allow'"
+    );
+}
+
 #[tokio::test]
 async fn network_off_blocks_a_loopback_connect_and_on_allows_it() {
     // A loopback HTTP responder OUTSIDE the sandbox. Under network-off the
