@@ -477,6 +477,14 @@ struct UsageChunk {
 struct PromptTokensDetails {
     #[serde(default)]
     cached_tokens: u64,
+    /// Where OpenRouter reports cache WRITES. The top-level
+    /// `cache_creation_input_tokens` is the Anthropic-direct shape and stays a
+    /// fallback, but a request routed through OpenRouter carries the count
+    /// here — reading only the top-level field reports every cache write as
+    /// zero while reads stay correct, which shows up in a cost view as
+    /// "caching is off" on a provider where it is demonstrably on.
+    #[serde(default)]
+    cache_write_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -487,14 +495,26 @@ struct CompletionTokensDetails {
 
 impl From<UsageChunk> for TokenUsage {
     fn from(usage: UsageChunk) -> Self {
+        let details_write = usage
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cache_write_tokens)
+            .unwrap_or(0);
         TokenUsage {
             input_tokens: usage.prompt_tokens,
             output_tokens: usage.completion_tokens,
             cache_read_input_tokens: usage
                 .prompt_tokens_details
+                .as_ref()
                 .map(|d| d.cached_tokens)
                 .unwrap_or(0),
-            cache_creation_input_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
+            // Nested first (OpenRouter), top-level as the Anthropic-direct
+            // fallback; whichever is present wins, so both wire shapes report.
+            cache_creation_input_tokens: if details_write > 0 {
+                details_write
+            } else {
+                usage.cache_creation_input_tokens.unwrap_or(0)
+            },
             reasoning_tokens: usage
                 .completion_tokens_details
                 .map(|d| d.reasoning_tokens)
@@ -1057,5 +1077,56 @@ mod tests {
             }
         }
         assert_eq!(usage.expect("usage event").reasoning_tokens, 0);
+    }
+
+    /// Cache writes arrive under two different wire shapes and BOTH must
+    /// report. Reading only the top-level `cache_creation_input_tokens` (the
+    /// Anthropic-direct shape) silently reported zero writes for every
+    /// OpenRouter-routed request while reads were correct — a cost view that
+    /// says caching never engages on a provider where it demonstrably does.
+    #[tokio::test]
+    async fn cache_writes_report_under_both_wire_shapes() {
+        async fn usage_of(json: &str) -> TokenUsage {
+            let frames = vec![
+                frame(json),
+                frame(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            ];
+            let mut stream = map_events(futures::stream::iter(frames));
+            let mut usage: Option<TokenUsage> = None;
+            while let Some(item) = stream.next().await {
+                if let Ok(CompletionEvent::UsageUpdate(u)) = item {
+                    usage = Some(u);
+                }
+            }
+            usage.expect("usage event must surface")
+        }
+
+        // OpenRouter: nested under prompt_tokens_details.
+        let u = usage_of(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,
+                "prompt_tokens_details":{"cached_tokens":40,"cache_write_tokens":60}}}"#,
+        )
+        .await;
+        assert_eq!(u.cache_read_input_tokens, 40);
+        assert_eq!(
+            u.cache_creation_input_tokens, 60,
+            "OpenRouter reports cache writes nested; reading only the top-level field zeroes them"
+        );
+
+        // Anthropic-direct: top-level, still honored.
+        let u = usage_of(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,
+                "cache_creation_input_tokens":77}}"#,
+        )
+        .await;
+        assert_eq!(u.cache_creation_input_tokens, 77);
+
+        // Neither present is zero, not an error.
+        let u = usage_of(
+            r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,
+                "prompt_tokens_details":{"cached_tokens":1}}}"#,
+        )
+        .await;
+        assert_eq!(u.cache_creation_input_tokens, 0);
     }
 }
