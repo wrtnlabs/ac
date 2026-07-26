@@ -89,6 +89,13 @@ pub enum StoreMutation {
     SessionRenamed {
         id: String,
     },
+    /// The row's `created_at`/`updated_at` were overwritten verbatim (see
+    /// [`SqliteStore::set_session_timestamps`]). Distinct from the other
+    /// setters because nothing about the session's *content* changed — only
+    /// its place in an `updated_at`-ordered list.
+    SessionTimestampsSet {
+        id: String,
+    },
     MetaSet {
         id: String,
     },
@@ -317,6 +324,42 @@ impl SqliteStore {
         drop(conn);
         self.emit(StoreMutation::SessionRenamed { id: id.to_string() });
         Ok(())
+    }
+
+    /// Overwrites the row's timestamps verbatim — the one deliberate escape
+    /// hatch from the store's stamp-it-now rule. Returns false for an
+    /// unknown id (no error: an importer walking a foreign log skips rows it
+    /// cannot place, and that is not a failure).
+    ///
+    /// A host importing an existing conversation history — from an export,
+    /// from a previous generation of its own storage — has to restore the
+    /// original times. Every other path stamps `now_ms()`:
+    /// `create_session_with_id` on insert, every setter and append on
+    /// `updated_at`. Without this, imported sessions all carry today's date
+    /// and a recents list (`list_sessions`, ordered by `updated_at`) loses
+    /// the history it is meant to show. Call it LAST for a session, after
+    /// the writes that would bump the row.
+    ///
+    /// Values are written as given: the store does not clamp them to the
+    /// past, order them, or force the per-process monotonicity `now_ms()`
+    /// guarantees. Two imported sessions sharing a millisecond tie-break on
+    /// id, like any other equal pair.
+    pub fn set_session_timestamps(
+        &self,
+        id: &str,
+        created_ms: i64,
+        updated_ms: i64,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let changed = conn.execute(
+            "UPDATE sessions SET created_at = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, created_ms, updated_ms],
+        )? > 0;
+        drop(conn);
+        if changed {
+            self.emit(StoreMutation::SessionTimestampsSet { id: id.to_string() });
+        }
+        Ok(changed)
     }
 
     /// Replaces the session's host-owned meta blob verbatim.
@@ -623,6 +666,27 @@ impl TxOps<'_> {
             .borrow_mut()
             .push(StoreMutation::MetaSet { id: id.to_string() });
         Ok(())
+    }
+
+    /// See [`SqliteStore::set_session_timestamps`]. In a transaction an
+    /// import lands as one unit: create the row, append its log, restore its
+    /// times — all or nothing.
+    pub fn set_session_timestamps(
+        &self,
+        id: &str,
+        created_ms: i64,
+        updated_ms: i64,
+    ) -> Result<bool> {
+        let changed = self.tx.execute(
+            "UPDATE sessions SET created_at = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, created_ms, updated_ms],
+        )? > 0;
+        if changed {
+            self.mutations
+                .borrow_mut()
+                .push(StoreMutation::SessionTimestampsSet { id: id.to_string() });
+        }
+        Ok(changed)
     }
 
     /// The current raw meta text (`None` = unset), read inside the
@@ -1138,6 +1202,107 @@ mod tests {
         assert_eq!(
             store.get_session(&s.id).unwrap().unwrap().updated_at_ms,
             before
+        );
+    }
+
+    #[test]
+    fn restored_timestamps_are_written_verbatim_and_reorder_recents() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let old = store.create_session(Some("imported")).unwrap();
+        let fresh = store.create_session(Some("today")).unwrap();
+        let events: Arc<Mutex<Vec<StoreMutation>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            sink.lock().unwrap().push(m.clone());
+        })));
+
+        assert!(
+            store
+                .set_session_timestamps(&old.id, 1_600_000_000_000, 1_600_000_500_000)
+                .unwrap()
+        );
+        let got = store.get_session(&old.id).unwrap().unwrap();
+        assert_eq!(got.created_at_ms, 1_600_000_000_000);
+        assert_eq!(got.updated_at_ms, 1_600_000_500_000);
+        // The point of the escape hatch: history sorts as history.
+        assert_eq!(store.list_sessions(10).unwrap()[0].id, fresh.id);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [StoreMutation::SessionTimestampsSet { id: old.id.clone() }]
+        );
+    }
+
+    #[test]
+    fn restoring_an_unknown_session_is_false_not_an_error() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let events: Arc<Mutex<Vec<StoreMutation>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            sink.lock().unwrap().push(m.clone());
+        })));
+        assert!(!store.set_session_timestamps("nope", 1, 2).unwrap());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_later_append_still_bumps_a_restored_updated_at() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let s = store.create_session(None).unwrap();
+        store
+            .set_session_timestamps(&s.id, 1_600_000_000_000, 1_600_000_500_000)
+            .unwrap();
+
+        store
+            .append_messages(&s.id, &[msg(Role::User, "resumed")], None)
+            .unwrap();
+
+        // A restore, not a freeze: the row rejoins the live clock on the
+        // next write, and only `updated_at` moves.
+        let got = store.get_session(&s.id).unwrap().unwrap();
+        assert_eq!(got.created_at_ms, 1_600_000_000_000);
+        assert!(got.updated_at_ms > 1_600_000_500_000);
+    }
+
+    #[test]
+    fn an_imported_session_lands_in_one_transaction() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let events: Arc<Mutex<Vec<StoreMutation>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        store.set_mutation_listener(Some(Arc::new(move |m: &StoreMutation| {
+            sink.lock().unwrap().push(m.clone());
+        })));
+
+        let m = msg(Role::User, "from the old log");
+        store
+            .atomic(|tx| {
+                assert!(tx.create_session_with_id("old", Some("t"))?);
+                tx.append_messages_with_meta("old", &[(&m, None)], Some(0))?;
+                assert!(tx.set_session_timestamps("old", 1_600_000_000_000, 1_600_000_500_000)?);
+                assert!(!tx.set_session_timestamps("absent", 1, 2)?);
+                Ok(())
+            })
+            .unwrap();
+
+        let got = store.get_session("old").unwrap().unwrap();
+        assert_eq!(got.created_at_ms, 1_600_000_000_000);
+        // Restored last, so the append's bump does not survive it.
+        assert_eq!(got.updated_at_ms, 1_600_000_500_000);
+        let kinds: Vec<String> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                format!("{m:?}")
+                    .split('{')
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["SessionCreated", "MessagesAppended", "SessionTimestampsSet"]
         );
     }
 
