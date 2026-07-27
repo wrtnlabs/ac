@@ -27,7 +27,7 @@ struct Args {
 }
 
 fn parse_args() -> anyhow::Result<Args> {
-    let mut model = "anthropic/claude-haiku-4.5".to_string();
+    let mut model = "anthropic/claude-opus-5".to_string();
     let mut dir: Option<PathBuf> = None;
     let mut web_search = false;
     let mut skills: Option<PathBuf> = None;

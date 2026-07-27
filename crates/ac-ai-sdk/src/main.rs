@@ -423,7 +423,7 @@ impl Args {
     fn parse(mut args: impl Iterator<Item = String>) -> anyhow::Result<Self> {
         let mut parsed = Self {
             dir: PathBuf::from("."),
-            model: "anthropic/claude-haiku-4.5".to_string(),
+            model: "anthropic/claude-opus-5".to_string(),
             port: 8790,
             db: None,
             allow_origin: Vec::new(),
