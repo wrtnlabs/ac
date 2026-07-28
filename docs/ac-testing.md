@@ -1,6 +1,6 @@
 # RFC: The proof doctrine
 
-**Status:** doctrine — in force (2026-07-21).
+**Status:** doctrine — in force (2026-07-28).
 **Interacts with:** every specification in this directory; the one-rule section of [ac-sandbox.md](ac-sandbox.md) (the actual-vs-pretend rule this doctrine generalizes).
 
 The key words MUST, MUST NOT, SHOULD, and MAY are to be interpreted as in RFC 2119.
@@ -59,6 +59,14 @@ skill. A live proof asserts the same ground truth as P2 (disk, history) plus the
 outcome. Cost discipline: smallest sufficient model, smallest sufficient task, never a secret
 in a transcript.
 
+The repeated P3 suite mechanics live in [`support/evals`](../support/evals):
+explicit cost opt-in, CI refusal, scenario discovery and selection, one build,
+one deterministic preflight, child supervision, signal forwarding, expensive
+case classification, and summary reporting. A host supplies commands around an
+opaque target—which may be a binary, URL, service, or library fixture—plus its
+prompts, fixtures, protocol driver, and product assertions. It MUST NOT fork
+the orchestration merely to add another scenario.
+
 **P4 — Kernel proofs.** For enforcement claims (R4): spawn under the real mechanism and
 attempt the violation — write outside the tree, read the secret, open the socket, exceed the
 limit — asserting both the failure of the attempt and the absence of the effect. Platform
@@ -97,8 +105,8 @@ by execution outrank findings verified by inspection.
 | --- | --- |
 | P1/P2 proofs for every kit claim; P4 for every enforcement claim | kit |
 | The scripted-provider substrate and its request-recording contract | kit |
-| P3 live proofs of kit prompts and wire crates | kit (opt-in harness) |
-| Proofs of host wiring, host policy choices, host UX | host |
+| Reusable P3 orchestration and live proofs of kit prompts/wire crates | kit (opt-in harness) |
+| P3 scenario declarations plus proofs of host wiring, policy choices, and UX | host |
 | P5 adversarial verification of nontrivial changes and studies | whoever lands the change |
 
 ## 5. Deferred

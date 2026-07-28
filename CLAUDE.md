@@ -1,6 +1,6 @@
 # AC (Agent Core) — architecture doctrine
 
-AC is an **app-agnostic AI agent runtime**: providers, the agent loop, hard built-in tools, skills, MCP, sandboxing, and an ACP serving layer — as a kit. It is UI-free like codex-rs's `core`, consumable like a library (which codex-core is not), and never welded to a host framework (the mistake that makes Zed's agent crates unusable outside Zed). AC must work for any host — a desktop app, an editor plugin, a headless CLI — without knowing which one it is serving.
+AC is an **application-agnostic agent backend framework**: the composition harness, providers, loop, generic tools, skills, MCP, sandboxing, persistence mechanisms, and serving projections — as a library kit. It is UI-free like codex-rs's `core`, consumable like a library (which codex-core is not), and never welded to one host application's process or domain. AC must work for any host — a desktop app, an editor plugin, a headless CLI — without knowing which one it is serving.
 
 Crates are `ac-*`. The workspace is source-public but not published to crates.io (`publish = false`).
 
@@ -26,6 +26,10 @@ ac-acp                     LIVE: Agent-side ACP over the official agent-client-p
                            prompt work spawned off the dispatch loop; cancelled turns respond
                            StopReason::Cancelled and the session rebuilds from its own history;
                            store present → loadSession capability + persistence + first-prompt titling
+ac-host                    application-agnostic composition harness: host-injected provider,
+                           registry, ToolCtx, AgentConfig, hooks, and reactive sections → fresh or
+                           resumed Session; borrow-based turn pump → ordered AgentEvents then one
+                           terminal result. No prompts, policies, tools, storage, process, or wire.
 ac-runtime                 THE LOOP: Session/Turn/Task, step hooks, tool router, read-before-write,
                            compaction, cancellation, typed event stream — phase 2
 ac-tools                   hard built-ins: read/write/edit file, ls/glob, grep, shell, fetch — phase 2

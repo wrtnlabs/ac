@@ -7,11 +7,14 @@
 //! one canonical [`AgentEvent`] stream. Neither is stacked on the other — a
 //! host picks the wire its ecosystem wants (ACP for editors, this for React).
 //!
-//! Two directions:
+//! Three protocol operations:
 //! - **out** — [`ChunkEncoder`] turns each [`AgentEvent`] into one or more
 //!   `UIMessageChunk`s (the SSE `data:` payloads `useChat` consumes),
 //!   bracketing text/reasoning parts and mapping tool calls through the AI
 //!   SDK's `tool-input-*` / `tool-output-*` lifecycle.
+//! - **track / replay** — [`MessageStateTracker`] reduces those chunks to an
+//!   in-flight assistant `UIMessage` and synthesizes an equivalent sequence
+//!   for reconnecting or late subscribers.
 //! - **in / hydrate** — [`hydrate_messages`] renders stored [`Message`]s back
 //!   as `UIMessage`s so a resumed chat repaints, and [`user_text`] pulls the
 //!   prompt text out of an incoming `UIMessage`.
@@ -22,6 +25,10 @@
 use ac_runtime::AgentEvent;
 use ac_types::{ContentPart, Message, Role};
 use serde_json::{Value, json};
+
+mod message_state;
+
+pub use message_state::MessageStateTracker;
 
 /// The SSE terminator `useChat` expects after the last chunk.
 pub const DONE: &str = "[DONE]";
@@ -38,9 +45,56 @@ pub struct ChunkEncoder {
     message_id: String,
     part_seq: u64,
     open: Option<OpenPart>,
+    config: ChunkEncoderConfig,
     /// Tool call ids already announced via `tool-input-start` (the streaming
     /// path), so the assembled call doesn't emit a duplicate start.
     announced: std::collections::HashSet<String>,
+}
+
+/// How tool parts should be represented by an AI SDK consumer.
+///
+/// Dynamic parts use `dynamic-tool` and retain `toolName` in the projected
+/// message. Static parts use `tool-<name>`, which lets a host register
+/// type-specific UI for a known tool catalog.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolPartStyle {
+    #[default]
+    Dynamic,
+    Static,
+}
+
+/// Optional decoding applied to successful tool outputs before they are put
+/// on the UI stream.
+///
+/// AC tool results are strings because that is the portable model-facing
+/// representation. Some AI SDK hosts expose structured tool results to their
+/// UI, so they can opt into decoding JSON objects and arrays at this adapter
+/// boundary. Scalars and invalid JSON always remain strings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolOutputDecoding {
+    #[default]
+    String,
+    JsonObjectsAndArrays,
+}
+
+/// Host-selectable protocol projection behavior.
+///
+/// The default preserves the adapter's original wire output.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkEncoderConfig {
+    pub tool_part_style: ToolPartStyle,
+    pub tool_output_decoding: ToolOutputDecoding,
+}
+
+fn successful_tool_output(output: impl Into<String>, config: ChunkEncoderConfig) -> Value {
+    let output = output.into();
+    if config.tool_output_decoding == ToolOutputDecoding::JsonObjectsAndArrays
+        && let Ok(parsed) = serde_json::from_str::<Value>(&output)
+        && (parsed.is_object() || parsed.is_array())
+    {
+        return parsed;
+    }
+    Value::String(output)
 }
 
 #[derive(PartialEq)]
@@ -51,12 +105,25 @@ enum OpenPart {
 
 impl ChunkEncoder {
     pub fn new(message_id: impl Into<String>) -> Self {
+        Self::with_config(message_id, ChunkEncoderConfig::default())
+    }
+
+    pub fn with_config(message_id: impl Into<String>, config: ChunkEncoderConfig) -> Self {
         Self {
             message_id: message_id.into(),
             part_seq: 0,
             open: None,
+            config,
             announced: std::collections::HashSet::new(),
         }
+    }
+
+    fn dynamic_tools(&self) -> bool {
+        self.config.tool_part_style == ToolPartStyle::Dynamic
+    }
+
+    fn successful_tool_output(&self, output: String) -> Value {
+        successful_tool_output(output, self.config)
     }
 
     /// The opening chunks of a turn: `start` (naming the assistant message)
@@ -119,12 +186,15 @@ impl ChunkEncoder {
                     out.push(end);
                 }
                 if self.announced.insert(id.clone()) {
-                    out.push(json!({
+                    let mut chunk = json!({
                         "type": "tool-input-start",
                         "toolCallId": id,
                         "toolName": name,
-                        "dynamic": true,
-                    }));
+                    });
+                    if self.dynamic_tools() {
+                        chunk["dynamic"] = json!(true);
+                    }
+                    out.push(chunk);
                 }
                 out.push(json!({
                     "type": "tool-input-delta",
@@ -139,20 +209,26 @@ impl ChunkEncoder {
                 // Streamed deltas already announced this call; only the start
                 // is skippable — the available chunk is always authoritative.
                 if !self.announced.contains(&id) {
-                    out.push(json!({
+                    let mut chunk = json!({
                         "type": "tool-input-start",
                         "toolCallId": id,
                         "toolName": name,
-                        "dynamic": true,
-                    }));
+                    });
+                    if self.dynamic_tools() {
+                        chunk["dynamic"] = json!(true);
+                    }
+                    out.push(chunk);
                 }
-                out.push(json!({
+                let mut chunk = json!({
                     "type": "tool-input-available",
                     "toolCallId": id,
                     "toolName": name,
                     "input": input,
-                    "dynamic": true,
-                }));
+                });
+                if self.dynamic_tools() {
+                    chunk["dynamic"] = json!(true);
+                }
+                out.push(chunk);
             }
             AgentEvent::ToolResult {
                 id,
@@ -161,19 +237,26 @@ impl ChunkEncoder {
                 ..
             } => {
                 if is_error {
-                    out.push(json!({
+                    let mut chunk = json!({
                         "type": "tool-output-error",
                         "toolCallId": id,
                         "errorText": output,
-                        "dynamic": true,
-                    }));
+                    });
+                    if self.dynamic_tools() {
+                        chunk["dynamic"] = json!(true);
+                    }
+                    out.push(chunk);
                 } else {
-                    out.push(json!({
+                    let output = self.successful_tool_output(output);
+                    let mut chunk = json!({
                         "type": "tool-output-available",
                         "toolCallId": id,
                         "output": output,
-                        "dynamic": true,
-                    }));
+                    });
+                    if self.dynamic_tools() {
+                        chunk["dynamic"] = json!(true);
+                    }
+                    out.push(chunk);
                 }
             }
             AgentEvent::Citation { url, title } => {
@@ -261,11 +344,15 @@ impl ChunkEncoder {
     }
 }
 
-/// Render stored history as `UIMessage`s for a resumed chat. Tool calls are
-/// paired with their results (which live in the following message) and emitted
-/// as completed `dynamic-tool` parts. System messages are dropped (the host
-/// owns the system prompt; it's not conversation).
+/// Render stored history with the default projection for a resumed chat.
 pub fn hydrate_messages(history: &[Message]) -> Vec<Value> {
+    hydrate_messages_with_config(history, ChunkEncoderConfig::default())
+}
+
+/// Render stored history with the same host-selected projection used for live
+/// chunks. Tool calls are paired with results from following messages. System
+/// messages are dropped because the host owns the system prompt.
+pub fn hydrate_messages_with_config(history: &[Message], config: ChunkEncoderConfig) -> Vec<Value> {
     // First pass: collect tool outputs by id so an assistant tool-use part can
     // carry its result.
     let mut outputs: std::collections::HashMap<&str, (&str, bool)> =
@@ -296,12 +383,19 @@ pub fn hydrate_messages(history: &[Message]) -> Vec<Value> {
                     parts.push(json!({ "type": "reasoning", "text": text }))
                 }
                 ContentPart::ToolUse(tool_use) => {
+                    let dynamic = config.tool_part_style == ToolPartStyle::Dynamic;
                     let mut tool = json!({
-                        "type": "dynamic-tool",
-                        "toolName": tool_use.name,
+                        "type": if dynamic {
+                            "dynamic-tool".to_string()
+                        } else {
+                            format!("tool-{}", tool_use.name)
+                        },
                         "toolCallId": tool_use.id,
                         "input": tool_use.input,
                     });
+                    if dynamic {
+                        tool["toolName"] = json!(tool_use.name);
+                    }
                     match outputs.get(tool_use.id.as_str()) {
                         Some((output, true)) => {
                             tool["state"] = json!("output-error");
@@ -309,7 +403,7 @@ pub fn hydrate_messages(history: &[Message]) -> Vec<Value> {
                         }
                         Some((output, false)) => {
                             tool["state"] = json!("output-available");
-                            tool["output"] = json!(output);
+                            tool["output"] = successful_tool_output(*output, config);
                         }
                         None => tool["state"] = json!("input-available"),
                     }
@@ -493,6 +587,104 @@ mod tests {
     }
 
     #[test]
+    fn defaults_keep_dynamic_parts_and_string_outputs() {
+        let mut enc = ChunkEncoder::new("m1");
+        let call = enc.encode(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "lookup".into(),
+            input: json!({ "query": "x" }),
+        });
+        assert_eq!(call[0]["dynamic"], true);
+        assert_eq!(call[1]["dynamic"], true);
+
+        let result = enc.encode(AgentEvent::ToolResult {
+            id: "c1".into(),
+            name: "lookup".into(),
+            output: r#"{"value":1}"#.into(),
+            is_error: false,
+        });
+        assert_eq!(result[0]["dynamic"], true);
+        assert_eq!(result[0]["output"], r#"{"value":1}"#);
+    }
+
+    #[test]
+    fn static_structured_projection_is_host_selectable() {
+        let mut enc = ChunkEncoder::with_config(
+            "m1",
+            ChunkEncoderConfig {
+                tool_part_style: ToolPartStyle::Static,
+                tool_output_decoding: ToolOutputDecoding::JsonObjectsAndArrays,
+            },
+        );
+        let call = enc.encode(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "lookup".into(),
+            input: json!({ "query": "x" }),
+        });
+        assert!(call.iter().all(|chunk| chunk.get("dynamic").is_none()));
+
+        let object = enc.encode(AgentEvent::ToolResult {
+            id: "c1".into(),
+            name: "lookup".into(),
+            output: r#"{"value":1}"#.into(),
+            is_error: false,
+        });
+        assert_eq!(object[0]["output"], json!({ "value": 1 }));
+        assert!(object[0].get("dynamic").is_none());
+
+        let array = enc.encode(AgentEvent::ToolResult {
+            id: "c2".into(),
+            name: "lookup".into(),
+            output: "[1,2]".into(),
+            is_error: false,
+        });
+        assert_eq!(array[0]["output"], json!([1, 2]));
+
+        for output in ["42", "true", "\"text\"", "not-json"] {
+            let result = enc.encode(AgentEvent::ToolResult {
+                id: "c3".into(),
+                name: "lookup".into(),
+                output: output.into(),
+                is_error: false,
+            });
+            assert_eq!(result[0]["output"], output);
+        }
+    }
+
+    #[test]
+    fn configured_encoder_and_tracker_form_one_projection_pipeline() {
+        let mut enc = ChunkEncoder::with_config(
+            "m1",
+            ChunkEncoderConfig {
+                tool_part_style: ToolPartStyle::Static,
+                tool_output_decoding: ToolOutputDecoding::JsonObjectsAndArrays,
+            },
+        );
+        let mut tracker = MessageStateTracker::new("m1");
+        for chunk in enc
+            .encode(AgentEvent::ToolCall {
+                id: "c1".into(),
+                name: "lookup".into(),
+                input: json!({ "query": "x" }),
+            })
+            .into_iter()
+            .chain(enc.encode(AgentEvent::ToolResult {
+                id: "c1".into(),
+                name: "lookup".into(),
+                output: r#"{"value":1}"#.into(),
+                is_error: false,
+            }))
+        {
+            tracker.apply(&chunk);
+        }
+        assert_eq!(tracker.snapshot()["parts"][0]["type"], "tool-lookup");
+        assert_eq!(
+            tracker.snapshot()["parts"][0]["output"],
+            json!({ "value": 1 })
+        );
+    }
+
+    #[test]
     fn tool_error_and_usage_and_citation_map() {
         let mut enc = ChunkEncoder::new("m1");
         let err = enc.encode(AgentEvent::ToolResult {
@@ -572,6 +764,42 @@ mod tests {
         assert_eq!(tool["toolCallId"], "c1");
         assert_eq!(tool["state"], "output-available");
         assert_eq!(tool["output"], "hello");
+    }
+
+    #[test]
+    fn configured_hydration_matches_live_tool_projection() {
+        let history = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentPart::ToolUse(ToolUse {
+                    id: "c1".into(),
+                    name: "lookup".into(),
+                    input: json!({ "query": "x" }),
+                })],
+                cache: CacheMark::Off,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentPart::ToolResult(ToolResult {
+                    tool_use_id: "c1".into(),
+                    content: r#"{"value":1}"#.into(),
+                    is_error: false,
+                })],
+                cache: CacheMark::Off,
+            },
+        ];
+        let ui = hydrate_messages_with_config(
+            &history,
+            ChunkEncoderConfig {
+                tool_part_style: ToolPartStyle::Static,
+                tool_output_decoding: ToolOutputDecoding::JsonObjectsAndArrays,
+            },
+        );
+        let tool = &ui[0]["parts"][0];
+        assert_eq!(tool["type"], "tool-lookup");
+        assert!(tool.get("toolName").is_none());
+        assert_eq!(tool["state"], "output-available");
+        assert_eq!(tool["output"], json!({ "value": 1 }));
     }
 
     #[test]

@@ -1,0 +1,23 @@
+[package]
+name = "ac-host"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+ac-context = { workspace = true }
+ac-provider = { workspace = true }
+ac-rollout = { workspace = true }
+ac-runtime = { workspace = true }
+ac-tool = { workspace = true }
+ac-types = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+ac-provider-mock = { workspace = true }
+futures = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

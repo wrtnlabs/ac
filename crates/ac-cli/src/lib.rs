@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ac_context::{Cadence, FragmentClass, ReactiveSection};
+use ac_host::AgentHostBuilder;
 use ac_provider::{Provider, ServerTool};
 use ac_runtime::{AgentConfig, ReferenceSpawner, Session};
 use ac_skills::{
@@ -131,20 +132,6 @@ fn child_registry(def: &AgentDefinition) -> ToolRegistry {
         r.register(Fetch::default());
     }
     r
-}
-
-/// The sub-agent catalog appended to the parent's system prompt, so the model
-/// knows whom it can delegate to via the `task` tool.
-fn agents_catalog(defs: &[AgentDefinition]) -> String {
-    let mut s = String::from(
-        "## Sub-agents\n\nYou may delegate a scoped, self-contained sub-task to a sub-agent with \
-         the `task` tool (pass `agent` and a `prompt`). The sub-agent runs in its own context and \
-         returns only its result. Available agents:\n",
-    );
-    for d in defs {
-        s.push_str(&format!("- `{}` — {}\n", d.name, d.description));
-    }
-    s
 }
 
 /// The delegation policy the parent agent is told to follow ([docs/ac-ultra.md]
@@ -430,13 +417,15 @@ pub fn build_host(
     }
 
     // Sub-agent delegation: install a reference spawner that runs children
-    // contained to the same workspace, and advertise the agents in the prompt.
-    // The child assembler builds each child with NO spawner (the recursion
-    // guard) and a cancellation token derived from the parent's.
+    // contained to the same workspace. The stock Task is built from the same
+    // definitions, so its model-facing description advertises the catalog with
+    // no parallel prompt rendering. The child assembler builds each child with
+    // NO spawner (the recursion guard) and a cancellation token derived from
+    // the parent's.
+    let mut task_tool = None;
     if subagents {
         let defs = subagent_definitions();
-        system.push_str("\n\n");
-        system.push_str(&agents_catalog(&defs));
+        task_tool = Some(Task::new(&defs));
 
         let child_provider = provider.clone();
         let child_dir = canonical.clone();
@@ -477,8 +466,8 @@ pub fn build_host(
     let ctx = Arc::new(tool_ctx);
     let registry = Arc::new({
         let mut r = generic_registry();
-        if subagents {
-            r.register(Task);
+        if let Some(task) = task_tool {
+            r.register(task);
         }
         r
     });
@@ -509,17 +498,18 @@ pub fn build_host(
         ..Default::default()
     };
 
-    let mut session = Session::new(provider, registry, ctx.clone(), config);
-
     // Under ultra, inject the proactive delegation mode as a reactive section and
     // hand the flip handle back so the host can change it mid-session (§4/§5).
+    let mut session_builder = AgentHostBuilder::new(provider, registry, ctx.clone(), config);
     let delegation_mode = if options.ultra {
         let handle = Arc::new(Mutex::new(DelegationMode::Proactive));
-        session.add_reactive_section(Arc::new(DelegationModeSection::new(handle.clone())));
+        session_builder =
+            session_builder.reactive_section(Arc::new(DelegationModeSection::new(handle.clone())));
         Some(handle)
     } else {
         None
     };
+    let session = session_builder.build();
 
     Ok(GenericHost {
         session,

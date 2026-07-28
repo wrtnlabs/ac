@@ -1,7 +1,9 @@
 # RFC: The sub-agent seam — delegation as an injected capability
 
-**Status:** design of record — proposed (2026-07-23). Decisions below are locked pending review
-sign-off; implementation has not begun. This document discharges the deferrals that name it:
+**Status:** implemented — specification of record (2026-07-23). **Amended 2026-07-28:** the stock
+delegation tool derives its model-facing agent catalog from host-supplied definitions and preserves
+the complete child handle, output, and error in durable failure data. This document discharges the
+deferrals that name it:
 [architecture.md](architecture.md) §7 ("multi-agent orchestration … earns its own document"),
 [ac-events.md](ac-events.md) §10 ("nested streams for sub-agents"), and [ac-ultra.md](ac-ultra.md)
 §"where each half lands" ("the sub-agent seam itself … a distinct subsystem with no spec yet").
@@ -92,7 +94,11 @@ final text wrapped in a result envelope carrying the child's session id (the id 
 handle a later resume would name — resume itself is deferred, §9). Its description carries the
 delegation discipline the model needs — launch independent tasks concurrently in one step, do not
 duplicate delegated work, the result is not shown to the user so summarize what matters — as tool
-text, not as a system-prompt constant.
+text, not as a system-prompt constant. A host constructs the stock tool with
+`Task::new(&definitions)`, using the same definitions its spawner resolves. The tool copies only each
+definition's name and description into an “available agents” block in its model-facing description;
+there is no parallel host-rendered catalog to drift, and prompts, tool scopes, models, and effort
+remain behind the spawning seam.
 
 **Agent definitions.** An **agent definition** is host-supplied data: a name and description (what
 the parent model reads when choosing whom to delegate to), an optional system prompt, a **tool
@@ -178,10 +184,14 @@ parent's contract stays "one tool call, one result." A child-spawned marker even
 but it is the deferred "nested streams" item and would have to earn its place against the
 every-variant round-trip and exhaustiveness guarantees of the event contract.
 
-**Failure is data (R5).** The delegation tool authors every outcome as a tool result the parent
-model reads: a completed child yields its **final text** and session id; an aborted or errored child
-yields an error result naming what happened; and a host that cannot even assemble a child yields an
-error result too. There is no channel by which a child failure becomes a parent-runtime fault — the
+**Failure is data (R5).** The delegation tool authors every spawned outcome as a durable JSON
+envelope `{session_id, status, output}` the parent model reads. A completed child yields its
+**final text** with `status: "completed"` as a successful tool result. An aborted child yields its
+partial final text with `status: "aborted"` as error data. An errored child yields the failure reason
+in an additional `error` field with `status: "error"` as error data, while `output` retains any
+partial/final child text and `session_id` keeps a child created before the failure inspectable after
+reload. A host that cannot even assemble a child uses the same error envelope with an empty session
+id and output. There is no channel by which a child failure becomes a parent-runtime fault — the
 seam's result type has no error arm that escapes the tool, mirroring the tool contract's "failures
 the model should see are data, not `Err`."
 

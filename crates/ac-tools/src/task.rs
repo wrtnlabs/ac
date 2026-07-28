@@ -2,15 +2,19 @@
 //! completion and returns its result ([docs/ac-subagents.md] §2, §5).
 //!
 //! It is the model-facing surface over the injected [`ac_tool::AgentSpawner`]
-//! capability. It is **not** a default built-in ([`crate::register_builtins`]
-//! omits it): a host registers it on a parent run and leaves it out of a child's
-//! surface — that, plus the child context's absent spawner, is the structural
-//! recursion guard. When no spawner is installed it refuses as data (R5), never
-//! a fault.
+//! capability. A host constructs it from the same [`ac_tool::AgentDefinition`]
+//! entries its spawner resolves, so the tool description advertises the exact
+//! names and descriptions available to the parent model. It is **not** a default
+//! built-in ([`crate::register_builtins`] omits it): a host registers it on a
+//! parent run and leaves it out of a child's surface — that, plus the child
+//! context's absent spawner, is the structural recursion guard. When no spawner
+//! is installed it refuses as data (R5), never a fault.
 
 use std::sync::Arc;
 
-use ac_tool::{Capability, Effort, SpawnRequest, SpawnStatus, Tool, ToolCtx, ToolOutput};
+use ac_tool::{
+    AgentDefinition, Capability, Effort, SpawnRequest, SpawnStatus, Tool, ToolCtx, ToolOutput,
+};
 use futures::future::BoxFuture;
 use serde::Deserialize;
 
@@ -31,8 +35,34 @@ pub struct TaskInput {
     pub effort: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentCatalogEntry {
+    name: String,
+    description: String,
+}
+
 /// Delegate a scoped sub-task to a child agent (see the module docs).
-pub struct Task;
+///
+/// Construct this from the same definitions the host's spawner resolves. Task
+/// keeps only the model-facing name and description; child prompts, tool scopes,
+/// models, and effort remain host data behind the spawning seam.
+pub struct Task {
+    agents: Vec<AgentCatalogEntry>,
+}
+
+impl Task {
+    pub fn new<'a>(definitions: impl IntoIterator<Item = &'a AgentDefinition>) -> Self {
+        Self {
+            agents: definitions
+                .into_iter()
+                .map(|definition| AgentCatalogEntry {
+                    name: definition.name.clone(),
+                    description: definition.description.clone(),
+                })
+                .collect(),
+        }
+    }
+}
 
 impl Tool for Task {
     type Input = TaskInput;
@@ -42,12 +72,22 @@ impl Tool for Task {
     }
 
     fn description(&self) -> String {
-        "Delegate a scoped sub-task to a child agent, which runs to completion in \
-         its own fresh context and returns only its result. Launch independent \
-         tasks concurrently in one step; do not duplicate work you have delegated; \
-         the result is not shown to the user, so summarize what matters. State \
-         exactly what the child should investigate and return."
-            .into()
+        let mut description =
+            "Delegate a scoped sub-task to a child agent, which runs to completion in \
+             its own fresh context and returns only its result. Launch independent \
+             tasks concurrently in one step; do not duplicate work you have delegated; \
+             the result is not shown to the user, so summarize what matters. State \
+             exactly what the child should investigate and return."
+                .to_string();
+        if self.agents.is_empty() {
+            description.push_str("\n\nNo child agents are configured.");
+        } else {
+            description.push_str("\n\nAvailable agents (pass the exact name in `agent`):");
+            for agent in &self.agents {
+                description.push_str(&format!("\n- `{}` — {}", agent.name, agent.description));
+            }
+        }
+        description
     }
 
     fn capability(&self) -> Capability {
@@ -98,9 +138,18 @@ impl Tool for Task {
                 // A bounded/aborted child is an error result, but its partial
                 // output still rides along (§5) so the parent is not left blind.
                 SpawnStatus::Aborted => ToolOutput::error(envelope("aborted")),
-                SpawnStatus::Error(msg) => {
-                    ToolOutput::error(format!("sub-agent delegation failed: {msg}"))
-                }
+                // Preserve the child handle in durable error data too. A host
+                // that failed before creating a child supplies an empty id;
+                // failures after creation remain resumable/inspectable.
+                SpawnStatus::Error(message) => ToolOutput::error(
+                    serde_json::json!({
+                        "session_id": result.session_id,
+                        "status": "error",
+                        "output": result.output,
+                        "error": message,
+                    })
+                    .to_string(),
+                ),
             }
         })
     }
@@ -109,8 +158,15 @@ impl Tool for Task {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ac_tool::{AgentSpawner, RefusingSpawner, SpawnResult, SubtreePolicy, as_dyn};
+    use ac_tool::{AgentSpawner, SpawnResult, SubtreePolicy, as_dyn};
     use futures::future::BoxFuture;
+
+    fn task() -> Task {
+        Task::new(&[AgentDefinition::new(
+            "explore",
+            "Read-only investigation and synthesis.",
+        )])
+    }
 
     fn ctx_with(spawner: Option<Arc<dyn AgentSpawner>>) -> Arc<ToolCtx> {
         let dir = tempfile::tempdir().unwrap();
@@ -136,11 +192,25 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_as_data_when_no_spawner() {
-        let out = Arc::new(Task).run(input("explore"), ctx_with(None)).await;
+        let out = Arc::new(task()).run(input("explore"), ctx_with(None)).await;
         assert!(out.is_error);
         assert!(out.content.contains("not available"));
         // A refusal is data, not a JSON envelope — nothing was spawned.
         assert!(!out.content.contains("session_id"));
+    }
+
+    #[test]
+    fn description_advertises_host_supplied_agent_names_and_descriptions() {
+        let task = Task::new(&[
+            AgentDefinition::new("explore", "Read-only investigation and synthesis."),
+            AgentDefinition::new("general", "Full worker for self-contained implementation."),
+        ]);
+
+        let description = task.description();
+
+        assert!(description.contains("Available agents"));
+        assert!(description.contains("`explore` — Read-only investigation and synthesis."));
+        assert!(description.contains("`general` — Full worker for self-contained implementation."));
     }
 
     #[tokio::test]
@@ -161,7 +231,7 @@ mod tests {
             }
         }
         let seen_call_id = Arc::new(std::sync::Mutex::new(None));
-        let out = Arc::new(Task)
+        let out = Arc::new(task())
             .run(
                 input("explore"),
                 ctx_with(Some(as_dyn(Ok {
@@ -181,11 +251,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_errored_child_is_error_data() {
-        let out = Arc::new(Task)
-            .run(input("explore"), ctx_with(Some(as_dyn(RefusingSpawner))))
+    async fn an_errored_child_keeps_its_session_handle_in_error_data() {
+        struct Failed;
+        impl AgentSpawner for Failed {
+            fn spawn(&self, _req: SpawnRequest) -> BoxFuture<'static, SpawnResult> {
+                Box::pin(std::future::ready(SpawnResult {
+                    session_id: "s_failed".into(),
+                    output: "partial child text".into(),
+                    status: SpawnStatus::Error("provider failed".into()),
+                }))
+            }
+        }
+
+        let out = Arc::new(task())
+            .run(input("explore"), ctx_with(Some(as_dyn(Failed))))
             .await;
+
         assert!(out.is_error);
-        assert!(out.content.contains("sub-agent delegation failed"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out.content).unwrap(),
+            serde_json::json!({
+                "session_id": "s_failed",
+                "status": "error",
+                "output": "partial child text",
+                "error": "provider failed",
+            })
+        );
+        assert_eq!(out.durable_content(), out.content);
     }
 }

@@ -4,7 +4,7 @@
 gains the *prefix-remap* and *deny* combinators and single-file grants; the composition laws are
 restated to cover them. **Amended 2026-07-28:** §4.3 adds the host-injected URL policy for
 `fetch`; §4.2 and §4.4 make file and shell execution reusable by host adapters with
-different schemas or presentation; §2.3
+different schemas or presentation; §4.2 also specifies the stock list/write bounds; §2.3
 specifies durable and transient tool output. **Requires:** nothing. **Required by:** [ac-mcp.md](ac-mcp.md) (wire tools enter through the raw form), [ac-sandbox.md](ac-sandbox.md)
 (implements the launcher seam carried here). **Interacts with:** [ac-skills.md](ac-skills.md) (hosts admit skill roots as read grants), [ac-loop.md](ac-loop.md) (every
 call dispatches through the registry), [ac-approvals.md](ac-approvals.md) (capability is the hook a
@@ -208,6 +208,27 @@ ring and is called with prior bytes only for a content-changing overwrite. `read
 `list_directory` similarly own resolved-path read/enumeration mechanics while leaving routing and
 presentation to the host. The pure `fuzzy_replace` cascade is shared by the compiled edit tool and
 host adapters; it tolerates common textual drift but refuses ambiguity and disproportionate spans.
+The stock `write_file.expected_mtime_ms` accepts the exact fractional-millisecond JSON number a
+reader returns and compares it at full precision; hosts do not need a rounding adapter.
+
+The compiled tools are bounded without requiring a host adapter. `write_file` accepts at most
+10 MiB of UTF-8 or decoded binary data by default. Text is measured before conversion; base64 is
+rejected from its encoded length when it cannot possibly fit, then checked again after decoding.
+`list_files` retains and renders at most 500 sorted entries by default, while still counting the
+complete filtered directory so it can visibly report truncation. Exact
+names for common metadata, dependency, and generated-output directories are filtered before the
+ceiling; ordinary dotfiles remain visible. A host may replace either policy for one run by inserting
+`WriteFileConfig` or `ListFilesConfig` into `ToolCtx::extensions`. The lower-level
+`FileMutation` and `list_directory` APIs remain policy-neutral: callers of those primitives supply
+their own payload checks, filters, ceilings, sorting, and presentation.
+
+`list_files` also honors an optional `ReadPathRecoveryConfig` extension after exact read
+authorization fails. Its callback may leave the policy rejection untouched, return model-facing
+diagnostic text, or propose another path identity. A proposed identity is always passed through the
+same `PathPolicy` before directory I/O; the callback can recover a platform or Unicode spelling but
+cannot create read authority. Exact authorized paths never invoke the callback. This keeps
+containment in the policy while giving a host with explicit user-referenced identities one narrow
+diagnostic/recovery seam instead of forcing it to fork the listing tool.
 
 A policy's `authorize_read` / `authorize_write` verdict retains both the resolved path and the
 specific policy root that contains it. On Unix, every stock file operation opens that root as a

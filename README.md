@@ -1,6 +1,10 @@
 # AC — Agent Core
 
-App-agnostic AI agent runtime in Rust. Providers, skills, MCP, and hard built-in tools live in the kit; everything app-shaped is injected through seams. Host applications consume AC as a library — no crate in this workspace may know who its host is.
+Application-agnostic agent backend framework in Rust. AC owns the reusable
+runtime, composition harness, providers, generic tools, skills, MCP, sandbox,
+store mechanisms, and serving projections. A host declares only what varies:
+its prompts, skills, domain tools, policy, persistence placement, and protocol
+mapping. No crate in this workspace may know who its host is.
 
 Read [CLAUDE.md](CLAUDE.md) for the architecture doctrine before touching code.
 
@@ -12,7 +16,10 @@ placement); a tool registry with typed schemas; path containment; an OS-level
 sandbox (Seatbelt on macOS, landlock + seccomp + rlimit on Linux); a session
 store with WAL and crash-safe sequencing; an append-only rollout log that fork,
 rewind, and compaction project from; skills as injected text; MCP as a client.
-These are the parts a host should not re-derive.
+It also ships a small [`ac-host`](crates/ac-host) composition harness that
+assembles those injected pieces into fresh or resumed sessions and drives a
+borrowed turn as ordered events plus one terminal result. These are the parts a
+host should not re-derive.
 
 **AC deliberately decides none of these for you**, and will not grow an opinion
 about them:
@@ -27,7 +34,10 @@ about them:
 - **No app vocabulary, and no plugin registry for app kinds.** No crate here
   knows what its host makes. Behaviour is layered through the seams in
   [CLAUDE.md](CLAUDE.md), never through an `if app == …`.
-- **No agent framework surface.** No chains, no graphs, no prompt DSL.
+- **No application framework or orchestration DSL.** AC is the agent backend
+  framework; it does not own your process, product lifecycle, chains, graphs,
+  or prompt language. `ac-host` wires the objects a host selected without
+  deciding their domain meaning.
 
 ## Where the boundary falls: how you deliver a tool
 
@@ -100,6 +110,14 @@ OPENROUTER_API_KEY=... cargo run -p ac-cli -- [--model <id>] [--dir <path>] \
 `--skills <dir>` points at a directory scanned (recursively, bounded depth) for `SKILL.md` skills: valid skills are advertised in the system prompt as a catalog of `name: description (file: path)` entries (invalid candidates are reported on stderr with a reason), a `$name` mention in the prompt injects that skill's `SKILL.md` into the turn input as a `<skill>` block, and the model reads companion `scripts/`/`references/` itself at the listed paths — there is no skill tool (codex-style text injection). `--skill <name>` selects a skill up front, exactly as if the prompt mentioned `$name`. The reusable resolver also offers an optional ordered direct-child policy with directory-name shadowing; both modes parse real YAML frontmatter, including nested metadata, sequences, flow collections, and block scalars.
 
 Status: the end-to-end agent loop works. `ac` is a generic filesystem agent — the OpenRouter provider wired to the built-in tool registry (`read_file`, `write_file`, `edit_file`, `list_files`, `glob`, `grep`, `shell`, `fetch`) over the `ac-runtime` loop, all writes contained by a path policy. Hosts that expose different tool schemas or result presentation reuse the same `FileTimes`/`FileMutation`, resolved-path read/list, fuzzy-replace, and `execute_shell` primitives rather than building another file or process runtime. Proven offline in `crates/ac-cli/tests/e2e.rs`, which exercises the whole stack (real tools, real loop, real temp dir) via a scripted mock provider and asserts both the on-disk ground truth and the policy safety invariant.
+
+Host assembly uses [`AgentHostBuilder`](crates/ac-host/src/lib.rs): inject the
+provider, registry, `ToolCtx`, and `AgentConfig`; optionally declare step hooks,
+observation hooks, and reactive sections; then build a fresh or resumed
+`Session`. [`TurnPump`](crates/ac-host/src/lib.rs) borrows that session for one
+turn and preserves the runtime's event order before yielding exactly one
+terminal `Result`. Product protocol mappings, transports, and daemons remain
+host-owned; reusable protocol projections live in AC.
 
 `ac-provider-openrouter` also exposes a typed image-generation client. It owns the provider request/response mechanics, decoding, remote-image download, cancellation, timeout, redirect handling, and response-size bounds; a host still owns its tool schema, reference-path authorization, naming, and output sink.
 

@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 ac-context = { workspace = true }
+ac-host = { workspace = true }
 ac-runtime = { workspace = true }
 ac-sandbox = { workspace = true }
 ac-skills = { workspace = true }

@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ac_cli::{HostOptions, build_host};
+use ac_host::{TurnPump, TurnPumpItem};
 use ac_provider_openrouter::OpenRouter;
 use ac_runtime::AgentEvent;
 use ac_types::{Effort, StopReason, TokenUsage};
-use tokio::sync::mpsc;
 
 struct Args {
     model: String,
@@ -153,17 +153,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
-
-    let handle = tokio::spawn(async move { session.run_turn(input, tx).await });
-
     let mut usage: Option<TokenUsage> = None;
-    while let Some(event) = rx.recv().await {
-        render(event, &mut usage);
-    }
-
-    // The sink is dropped once the loop ends; join the driver for its result.
-    let result = handle.await?;
+    let mut pump = TurnPump::new(&mut session, input);
+    let result = loop {
+        match pump.next().await {
+            Some(TurnPumpItem::Event(event)) => render(event, &mut usage),
+            Some(TurnPumpItem::Terminal(result)) => break result,
+            None => anyhow::bail!("turn pump ended without a terminal result"),
+        }
+    };
     match result {
         Ok(stop) => {
             summary(stop, usage);

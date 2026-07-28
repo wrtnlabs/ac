@@ -1,20 +1,21 @@
 # AC: system architecture
 
-**Status:** living overview (2026-07-21). This is the entry point to the specification set in
+**Status:** living overview (2026-07-28). This is the entry point to the specification set in
 this directory; it defines the system's shape and the reading order. Each subsystem's contract
 lives in its own document — this one contains no mechanics.
 
 ## 1. What AC is
 
-AC is an **application-agnostic agent runtime**, built as a kit of Rust crates: model
-providers, the agent loop, contained tools, skills, third-party tool integration, an OS-level
-sandbox, and protocol adapters for serving — consumable as a library by any host (a desktop
-application, an editor integration, a headless CLI, a server) without the kit knowing which.
+AC is an **application-agnostic agent backend framework**, built as a kit of Rust crates:
+the composition harness, model providers, agent loop, contained tools, skills, third-party
+tool integration, OS-level sandbox, persistence mechanisms, and protocol projections for
+serving. Any host (a desktop application, editor integration, headless CLI, or server)
+consumes it as a library without the kit knowing which.
 
-The design position it occupies: runtime cores welded to their product cannot be reused;
-frameworks that own your server dictate your architecture. AC is the third thing — a library
-of composable parts with hard boundaries, where everything application-shaped enters through
-declared seams.
+The design position it occupies: runtime cores welded to their product cannot be reused, while
+frameworks that own the product process dictate its architecture. AC is a backend framework
+with a small composition harness and hard library boundaries: it owns the standard agent
+machinery, while everything application-shaped enters through declared seams.
 
 ## 2. The one rule
 
@@ -44,6 +45,13 @@ Hosts inject what varies; the kit owns what doesn't:
    the host supplies policy and location.
    → [ac-sandbox.md](ac-sandbox.md), [ac-serving.md](ac-serving.md)
 
+[`ac-host`](../crates/ac-host) is the mechanical composition harness across
+these seams. `AgentHostBuilder` installs host-selected hooks and reactive
+sections on a fresh or resumed session; `TurnPump` borrows a session and exposes
+its ordered event stream followed by one terminal result. It adds no sixth
+seam and makes no host decision: provider, registry, context, configuration,
+prompt, policy, storage source, and transport are all injected.
+
 ## 4. The system in one paragraph
 
 A **provider** ([ac-provider.md](ac-provider.md)) turns a completion request into a normalized
@@ -55,7 +63,9 @@ containment, reinforced at the kernel by the **sandbox** ([ac-sandbox.md](ac-san
 code. Everything the agent does is emitted as one typed **event stream**
 ([ac-events.md](ac-events.md)), off which every **serving adapter**
 ([ac-serving.md](ac-serving.md)) is a thin, logic-free map — clients speak a wire protocol and
-never link the runtime. Sessions are backed in the runtime by an
+never link the runtime. The application-agnostic **host harness**
+([`ac-host`](../crates/ac-host)) removes repeated session/event-pump wiring
+without owning any of those choices. Sessions are backed in the runtime by an
 append-only **log** ([ac-fork.md](ac-fork.md)) that makes branching, rewind, and
 **compaction** ([ac-compaction.md](ac-compaction.md)) pure projections of it, and persist
 through a store (the flat view) or the log itself; mid-turn input
@@ -125,6 +135,9 @@ through a store (the flat view) or the log itself; mid-turn input
 
 - A UI, a product, or opinions about either.
 - A plugin marketplace or dynamic code loading; skills are text, extensions are compiled.
+- A domain framework or application lifecycle. `ac-host` composes already
+  chosen runtime objects; it does not supply profiles, prompts, tool suites,
+  persistence placement, process management, or a wire protocol.
 - **Proactive** multi-agent orchestration — the harness "ultra" tier that spawns coordinated sub-agents on its own — is a **host composition**, specified in [ac-ultra.md](ac-ultra.md): effort as a request parameter plus a standing delegation-mode injection over the sub-agent *seam* ([ac-subagents.md](ac-subagents.md)), not a subsystem of its own and never a kit-level effort→policy mapping. Background/fire-and-forget delegation is out.
 - Multi-tenant service duty: the kit assumes it acts *for one user on their machine*; hosts
   that serve many users own that isolation.

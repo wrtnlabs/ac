@@ -1,7 +1,7 @@
 //! `ac-tools` — the hard built-in tools every host can hand the agent.
 //!
 //! Eight compiled-in [`ac_tool::Tool`] implementations covering the baseline an
-//! agent needs to work over a workspace:
+//! agent needs to work over host-authorized roots:
 //!
 //! - [`ReadFile`], [`WriteFile`], [`EditFile`], [`ListFiles`] — file I/O with a
 //!   per-run read-before-write ledger.
@@ -36,13 +36,15 @@ pub use fetch::{
     AllowedOrigins, DEFAULT_FETCH_TIMEOUT, Fetch, FetchInput, FetchUrl, FetchUrlPolicy,
 };
 pub use files::{
-    DirectoryEntry, DirectoryEntryKind, DirectoryListing, EditFile, EditFileInput, ExpectedMtime,
-    FileCommit, FileMutation, FileMutationError, FileWriteResult, ListFiles, ListFilesInput,
-    ReadBytes, ReadBytesError, ReadFile, ReadFileInput, ReadTextError, ReadTextSlice, WriteFile,
-    WriteFileInput, ensure_directory_authorized, list_directory, list_directory_authorized,
-    list_directory_authorized_blocking, mtime_ms_f64, read_bytes_authorized,
-    read_bytes_authorized_blocking, read_text_slice, read_text_slice_authorized,
-    write_atomic_authorized,
+    DEFAULT_LIST_MAX_ENTRIES, DEFAULT_LIST_SKIP_NAMES, DEFAULT_WRITE_MAX_BYTES, DirectoryEntry,
+    DirectoryEntryKind, DirectoryListing, EditFile, EditFileInput, ExpectedMtime, FileCommit,
+    FileMutation, FileMutationError, FileWriteResult, ListFiles, ListFilesConfig, ListFilesInput,
+    ReadBytes, ReadBytesError, ReadFile, ReadFileInput, ReadPathRecovery, ReadPathRecoveryAction,
+    ReadPathRecoveryConfig, ReadTextError, ReadTextSlice, WriteFile, WriteFileConfig,
+    WriteFileInput, authorize_read_with_recovery, ensure_directory_authorized, list_directory,
+    list_directory_authorized, list_directory_authorized_blocking, mtime_ms_f64,
+    read_bytes_authorized, read_bytes_authorized_blocking, read_text_slice,
+    read_text_slice_authorized, write_atomic_authorized,
 };
 pub use search::{Glob, GlobInput, Grep, GrepInput};
 pub use shell::{

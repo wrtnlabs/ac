@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
 use ac_runtime::{AgentConfig, AgentEvent, ReferenceSpawner, Session};
 use ac_tool::{
-    AgentSpawner, SpawnRequest, SpawnResult, SpawnStatus, SubtreePolicy, ToolCtx, ToolRegistry,
-    as_dyn,
+    AgentDefinition, AgentSpawner, SpawnRequest, SpawnResult, SpawnStatus, SubtreePolicy, ToolCtx,
+    ToolRegistry, as_dyn,
 };
 use ac_tools::Task;
 use ac_types::{ContentPart, StopReason};
@@ -25,6 +25,10 @@ fn config(model: &str) -> AgentConfig {
         model: model.to_string(),
         ..Default::default()
     }
+}
+
+fn task(agent: &str) -> Task {
+    Task::new(&[AgentDefinition::new(agent, "Test child agent.")])
 }
 
 async fn run(mut parent: Session, prompt: &str) -> (StopReason, Vec<AgentEvent>) {
@@ -89,7 +93,7 @@ async fn a_parent_delegates_and_sees_only_the_task_call_and_result() {
     let spawner = as_dyn(ReferenceSpawner::new(assemble));
 
     let mut parent_registry = ToolRegistry::new();
-    parent_registry.register(Task);
+    parent_registry.register(task("echo-agent"));
     let parent_ctx = Arc::new(
         ToolCtx::new(Arc::new(SubtreePolicy::new(dir.path()).unwrap())).with_spawner(spawner),
     );
@@ -168,7 +172,7 @@ async fn a_child_cannot_recurse_even_when_it_holds_the_task_tool() {
         // The child even HOLDS the task tool — but its ctx has no spawner, so its
         // delegation attempt must self-refuse rather than recurse.
         let mut child_registry = ToolRegistry::new();
-        child_registry.register(Task);
+        child_registry.register(task("anything"));
         let child_provider = MockProvider::new(vec![
             vec![
                 tool_use(
@@ -193,7 +197,7 @@ async fn a_child_cannot_recurse_even_when_it_holds_the_task_tool() {
     let spawner = as_dyn(ReferenceSpawner::new(assemble));
 
     let mut parent_registry = ToolRegistry::new();
-    parent_registry.register(Task);
+    parent_registry.register(task("recursive"));
     let parent_ctx = Arc::new(
         ToolCtx::new(Arc::new(SubtreePolicy::new(dir.path()).unwrap())).with_spawner(spawner),
     );
@@ -263,7 +267,7 @@ async fn concurrent_task_calls_keep_their_exact_invocation_ids() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let spawner = as_dyn(RecordingSpawner { seen: seen.clone() });
     let mut registry = ToolRegistry::new();
-    registry.register(Task);
+    registry.register(task("general"));
     let ctx = Arc::new(
         ToolCtx::new(Arc::new(SubtreePolicy::new(dir.path()).unwrap())).with_spawner(spawner),
     );

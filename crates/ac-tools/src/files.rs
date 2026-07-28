@@ -4,6 +4,8 @@
 //! these tools never touch a raw user path. `read_file` stamps the mtime it saw
 //! into the per-run read-before-write ledger, and the write tools consult it.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -22,6 +24,158 @@ use crate::rooted_fs::RootedPath;
 
 /// Maximum bytes `read_file` returns; larger files are truncated with a note.
 const READ_CAP: usize = 256 * 1024;
+
+/// Default decoded payload ceiling for [`WriteFile`]: 10 MiB.
+///
+/// Hosts can override this per run by inserting a [`WriteFileConfig`] into
+/// [`ToolCtx::extensions`].
+pub const DEFAULT_WRITE_MAX_BYTES: usize = 10 * 1024 * 1024;
+
+/// Default maximum number of entries rendered by [`ListFiles`].
+///
+/// Hosts can override this per run by inserting a [`ListFilesConfig`] into
+/// [`ToolCtx::extensions`].
+pub const DEFAULT_LIST_MAX_ENTRIES: usize = 500;
+
+/// High-volume metadata, dependency, and generated-output names hidden by the
+/// stock [`ListFiles`] tool unless the host supplies another configuration.
+///
+/// Filtering is exact-name only. Ordinary dotfiles such as `.env` remain
+/// visible, and callers of the lower-level [`list_directory`] functions keep
+/// supplying their own filter explicitly.
+pub const DEFAULT_LIST_SKIP_NAMES: &[&str] = &[
+    ".DS_Store",
+    ".git",
+    "node_modules",
+    ".next",
+    "dist",
+    ".turbo",
+];
+
+/// Per-run limits for the stock [`WriteFile`] tool.
+///
+/// Install this value in [`ToolCtx::extensions`] to override the default. The
+/// ceiling applies to UTF-8 bytes and decoded binary bytes. Base64 input is
+/// rejected from its encoded length before decoding whenever it cannot
+/// possibly fit, then checked again after decoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteFileConfig {
+    pub max_payload_bytes: usize,
+}
+
+impl Default for WriteFileConfig {
+    fn default() -> Self {
+        Self {
+            max_payload_bytes: DEFAULT_WRITE_MAX_BYTES,
+        }
+    }
+}
+
+/// Per-run output policy for the stock [`ListFiles`] tool.
+///
+/// Install this value in [`ToolCtx::extensions`] to override the default.
+/// `skip_names` are exact basenames and apply before `max_entries`; `total` in
+/// the truncation note therefore describes the filtered directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListFilesConfig {
+    pub max_entries: usize,
+    pub skip_names: Vec<String>,
+    pub sort: bool,
+}
+
+impl Default for ListFilesConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: DEFAULT_LIST_MAX_ENTRIES,
+            skip_names: DEFAULT_LIST_SKIP_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            sort: true,
+        }
+    }
+}
+
+/// What a host-specific read-path recovery wants AC to do after the exact
+/// [`PathPolicy`](ac_tool::PathPolicy) authorization failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadPathRecoveryAction {
+    /// Retry authorization with another spelling or identity. AC passes the
+    /// candidate through the same policy; this action never grants authority.
+    Retry(PathBuf),
+    /// Return host-authored, model-facing diagnostic text.
+    Diagnostic(String),
+    /// Preserve the original policy error.
+    Unhandled,
+}
+
+/// Optional host seam for recovering a model-supplied read path.
+///
+/// The stock file tools always try the exact path through
+/// [`ToolCtx::policy`] first. A recovery is consulted only after that verdict
+/// fails. This is useful when a host has explicit path identities whose
+/// Unicode or platform spelling can be transcribed imperfectly. A returned
+/// [`ReadPathRecoveryAction::Retry`] is re-authorized by AC, so the resolver
+/// can suggest an identity but cannot widen filesystem authority.
+pub trait ReadPathRecovery: Send + Sync {
+    fn recover<'a>(
+        &'a self,
+        tool_name: &'static str,
+        requested: &'a Path,
+        rejection: &'a PolicyError,
+    ) -> BoxFuture<'a, ReadPathRecoveryAction>;
+}
+
+/// Run-scoped [`ToolCtx::extensions`] entry for [`ReadPathRecovery`].
+#[derive(Clone)]
+pub struct ReadPathRecoveryConfig {
+    recovery: Arc<dyn ReadPathRecovery>,
+}
+
+impl ReadPathRecoveryConfig {
+    pub fn new(recovery: impl ReadPathRecovery + 'static) -> Self {
+        Self {
+            recovery: Arc::new(recovery),
+        }
+    }
+
+    async fn recover(
+        &self,
+        tool_name: &'static str,
+        requested: &Path,
+        rejection: &PolicyError,
+    ) -> ReadPathRecoveryAction {
+        self.recovery.recover(tool_name, requested, rejection).await
+    }
+}
+
+/// Apply exact host policy first, then the optional path-recovery extension.
+///
+/// Retry candidates always pass through the same policy again. When that
+/// second verdict fails, the original rejection is retained so a resolver
+/// cannot turn an ungranted candidate into either authority or an information
+/// oracle.
+pub async fn authorize_read_with_recovery(
+    ctx: &ToolCtx,
+    requested: &Path,
+    tool_name: &'static str,
+) -> Result<AuthorizedPath, String> {
+    let rejection = match ctx.policy.authorize_read(requested) {
+        Ok(authorized) => return Ok(authorized),
+        Err(rejection) => rejection,
+    };
+    let Some(config) = ctx.extensions.get::<ReadPathRecoveryConfig>() else {
+        return Err(rejection.to_string());
+    };
+    match config.recover(tool_name, requested, &rejection).await {
+        ReadPathRecoveryAction::Retry(candidate) => ctx
+            .policy
+            .authorize_read(&candidate)
+            .map_err(|_| rejection.to_string()),
+        ReadPathRecoveryAction::Diagnostic(message) => Err(message),
+        ReadPathRecoveryAction::Unhandled => Err(rejection.to_string()),
+    }
+}
 
 /// Render a resolved absolute path relative to the policy root for model-facing
 /// output; falls back to the absolute path when it is not under the root.
@@ -45,9 +199,9 @@ fn mtime_ms(t: SystemTime) -> Option<u64> {
 
 /// Full-precision milliseconds since the Unix epoch.
 ///
-/// Some host protocols preserve fractional milliseconds while AC's stock tool
-/// rounds to a `u64`; the mutation primitive carries both without making a
-/// host repeat the write transaction.
+/// Host protocols can round-trip this fractional value through the stock tool;
+/// the mutation primitive also retains a coarse whole-millisecond variant for
+/// callers whose source format cannot preserve sub-millisecond precision.
 pub fn mtime_ms_f64(t: SystemTime) -> f64 {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(d) => d.as_secs() as f64 * 1000.0 + f64::from(d.subsec_nanos()) / 1e6,
@@ -110,7 +264,7 @@ pub enum FileCommit {
 pub enum ExpectedMtime {
     /// Full-precision millisecond value.
     Exact(f64),
-    /// Whole milliseconds as exposed by AC's stock `WriteFileInput`.
+    /// Whole milliseconds for callers whose source format is integer-only.
     Milliseconds(u64),
 }
 
@@ -414,7 +568,7 @@ async fn read_all(file: std::fs::File) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Read a UTF-8 text file within the workspace and return its contents.
+/// Read an authorized UTF-8 text file and return its contents.
 ///
 /// The file is recorded in the read-before-write ledger, which later lets
 /// `write_file` and `edit_file` overwrite it. Files larger than 256 KiB are
@@ -422,8 +576,8 @@ async fn read_all(file: std::fs::File) -> std::io::Result<Vec<u8>> {
 /// tool error, not a crash.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReadFileInput {
-    /// Path to the file to read, relative to the workspace root (or absolute
-    /// inside it).
+    /// Path to an authorized file. Relative paths resolve from the active
+    /// root; absolute paths are accepted only when host policy grants them.
     pub path: String,
 }
 
@@ -438,9 +592,11 @@ impl Tool for ReadFile {
     }
 
     fn description(&self) -> String {
-        "Read a UTF-8 text file inside the workspace and return its contents. \
-         Files over 256 KiB are truncated. Records the file so it can later be \
-         overwritten with write_file/edit_file (read-before-write)."
+        "Read an authorized UTF-8 text file and return its contents. Relative \
+         paths resolve from the active root; host policy may grant additional \
+         absolute read paths. Files over 256 KiB are truncated. Records the \
+         file so it can later be overwritten with write_file/edit_file \
+         (read-before-write)."
             .into()
     }
 
@@ -840,14 +996,15 @@ async fn read_text_slice_from_open_file(
     })
 }
 
-/// Create or overwrite a file inside the workspace.
+/// Create or overwrite a file under the active writable root.
 ///
 /// An existing file may only be overwritten if it was read this run (via
 /// `read_file`) and has not changed on disk since — otherwise the write is
 /// refused and you must read it first. Missing parent directories are created.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct WriteFileInput {
-    /// Destination path, relative to the workspace root (or absolute inside it).
+    /// Destination path under the active writable root. Relative paths resolve
+    /// from that root; absolute paths must be authorized by host policy.
     pub path: String,
     /// Full new contents as UTF-8 text. Set exactly one of this or
     /// `content_base64`.
@@ -860,11 +1017,62 @@ pub struct WriteFileInput {
     /// longer exists), the write is refused before anything is written and a
     /// structured conflict (`kind: "conflict"`, carrying both mtimes) is
     /// returned so the caller can re-read and retry.
-    pub expected_mtime_ms: Option<u64>,
+    pub expected_mtime_ms: Option<f64>,
 }
 
 /// Writes a file, enforcing read-before-write on existing files.
 pub struct WriteFile;
+
+fn base64_encoded_ceiling(max_decoded_bytes: usize) -> usize {
+    max_decoded_bytes
+        .checked_add(2)
+        .map(|value| value / 3)
+        .and_then(|groups| groups.checked_mul(4))
+        .unwrap_or(usize::MAX)
+}
+
+fn write_payload_bytes(
+    content: Option<String>,
+    content_base64: Option<String>,
+    max_payload_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+
+    match (content, content_base64) {
+        (Some(text), None) => {
+            if text.len() > max_payload_bytes {
+                return Err(format!(
+                    "write payload too large: text content is {} bytes; limit is {max_payload_bytes} bytes",
+                    text.len()
+                ));
+            }
+            Ok(text.into_bytes())
+        }
+        (None, Some(encoded)) => {
+            let encoded_ceiling = base64_encoded_ceiling(max_payload_bytes);
+            if encoded.len() > encoded_ceiling {
+                return Err(format!(
+                    "write payload too large: base64 input is {} encoded bytes; at most {encoded_ceiling} encoded bytes can represent a {max_payload_bytes}-byte payload",
+                    encoded.len()
+                ));
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .map_err(|error| format!("invalid content_base64: {error}"))?;
+            if decoded.len() > max_payload_bytes {
+                return Err(format!(
+                    "write payload too large: decoded content is {} bytes; limit is {max_payload_bytes} bytes",
+                    decoded.len()
+                ));
+            }
+            Ok(decoded)
+        }
+        (Some(_), Some(_)) => {
+            Err("set exactly one of content or content_base64, not both".to_string())
+        }
+        (None, None) => Err("set exactly one of content or content_base64".to_string()),
+    }
+}
 
 impl Tool for WriteFile {
     type Input = WriteFileInput;
@@ -874,14 +1082,17 @@ impl Tool for WriteFile {
     }
 
     fn description(&self) -> String {
-        "Create a new file or overwrite an existing one inside the workspace. \
-         Provide exactly one of 'content' (UTF-8 text) or 'content_base64' \
-         (base64-encoded bytes, for binary files). An existing file must have \
-         been read this run (read_file) and be unchanged on disk, or the write \
-         is refused. Optionally pass 'expected_mtime_ms': if the target's \
-         current mtime (ms) differs, the write is refused with a structured \
-         conflict ({\"kind\":\"conflict\", ...} carrying both mtimes) so you \
-         can re-read and retry. Parent directories are created as needed."
+        "Create a new file or overwrite an existing one under the active \
+         writable root. Relative paths resolve from that root. Provide exactly \
+         one of 'content' (UTF-8 text) or 'content_base64' (base64-encoded \
+         bytes, for binary files). An existing file must have been read this \
+         run (read_file) and be unchanged on disk, or the write is refused. \
+         When the host's reader returns an exact 'mtime_ms', optionally pass it \
+         as 'expected_mtime_ms': if the target's mtime differs, the write is \
+         refused with a structured conflict ({\"kind\":\"conflict\", ...} \
+         carrying both mtimes) so you can re-read and retry. Parent directories \
+         are created as needed. Payloads are bounded by host policy (10 MiB by \
+         default)."
             .into()
     }
 
@@ -895,23 +1106,18 @@ impl Tool for WriteFile {
         ctx: Arc<ToolCtx>,
     ) -> BoxFuture<'static, ToolOutput> {
         Box::pin(async move {
-            use base64::Engine as _;
-            let bytes: Vec<u8> = match (input.content, input.content_base64) {
-                (Some(text), None) => text.into_bytes(),
-                (None, Some(b64)) => {
-                    match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
-                        Ok(b) => b,
-                        Err(e) => return ToolOutput::error(format!("invalid content_base64: {e}")),
-                    }
-                }
-                (Some(_), Some(_)) => {
-                    return ToolOutput::error(
-                        "set exactly one of content or content_base64, not both",
-                    );
-                }
-                (None, None) => {
-                    return ToolOutput::error("set exactly one of content or content_base64");
-                }
+            let config = ctx
+                .extensions
+                .get::<WriteFileConfig>()
+                .map(|config| *config)
+                .unwrap_or_default();
+            let bytes = match write_payload_bytes(
+                input.content,
+                input.content_base64,
+                config.max_payload_bytes,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => return ToolOutput::error(error),
             };
 
             let mutation = match FileMutation::begin(ctx.clone(), PathBuf::from(&input.path)).await
@@ -922,10 +1128,7 @@ impl Tool for WriteFile {
             // Preserve the built-in's historic ordering: an explicit
             // optimistic guard is checked before read-before-write.
             match mutation
-                .commit(
-                    &bytes,
-                    input.expected_mtime_ms.map(ExpectedMtime::Milliseconds),
-                )
+                .commit(&bytes, input.expected_mtime_ms.map(ExpectedMtime::Exact))
                 .await
             {
                 Ok(FileCommit::Written(result)) => ToolOutput::ok(format!(
@@ -937,7 +1140,7 @@ impl Tool for WriteFile {
                     serde_json::json!({
                         "kind": "conflict",
                         "expected_mtime_ms": input.expected_mtime_ms,
-                        "actual_mtime_ms": actual.and_then(|snapshot| mtime_ms(snapshot.mtime)),
+                        "actual_mtime_ms": actual.map(|snapshot| mtime_ms_f64(snapshot.mtime)),
                     })
                     .to_string(),
                 ),
@@ -954,7 +1157,8 @@ impl Tool for WriteFile {
 /// disproportionately large matches.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct EditFileInput {
-    /// Path to the file to edit, relative to the workspace root.
+    /// Path under the active writable root. Relative paths resolve from that
+    /// root; absolute paths must be authorized by host policy.
     pub path: String,
     /// The text to find, with enough surrounding context to be unambiguous.
     pub old_string: String,
@@ -1055,12 +1259,15 @@ impl Tool for EditFile {
     }
 }
 
-/// List the immediate entries of a directory inside the workspace.
+/// List the immediate entries of an authorized directory.
 ///
-/// Non-recursive. Directories are suffixed with `/`. Results are sorted.
+/// Non-recursive. Directories are suffixed with `/`. Results are sorted by
+/// default; a host can disable sorting through [`ListFilesConfig`].
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ListFilesInput {
-    /// Directory to list, relative to the workspace root. Defaults to the root.
+    /// Directory to list. Relative paths resolve from the active root; absolute
+    /// paths are accepted only when host policy grants them. Defaults to the
+    /// active root.
     pub path: Option<String>,
 }
 
@@ -1089,6 +1296,103 @@ pub struct DirectoryListing {
     /// Number of entries after filtering but before clipping.
     pub total: usize,
     pub truncated: bool,
+}
+
+#[derive(Debug)]
+struct NameOrderedEntry(DirectoryEntry);
+
+impl PartialEq for NameOrderedEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.name == other.0.name
+    }
+}
+
+impl Eq for NameOrderedEntry {}
+
+impl PartialOrd for NameOrderedEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NameOrderedEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.name.cmp(&other.0.name)
+    }
+}
+
+enum RetainedEntries {
+    EncounterOrder(Vec<DirectoryEntry>),
+    SortedBounded(BinaryHeap<NameOrderedEntry>),
+}
+
+/// Retain at most the requested entries while still counting the complete
+/// filtered directory. For sorted bounded listings, a max-heap keeps the
+/// lexicographically first `limit` names without accumulating every entry.
+struct DirectoryCollector {
+    retained: RetainedEntries,
+    total: usize,
+    limit: Option<usize>,
+    sort: bool,
+}
+
+impl DirectoryCollector {
+    fn new(limit: Option<usize>, sort: bool) -> Self {
+        let retained = if sort && limit.is_some() {
+            RetainedEntries::SortedBounded(BinaryHeap::new())
+        } else {
+            RetainedEntries::EncounterOrder(Vec::new())
+        };
+        Self {
+            retained,
+            total: 0,
+            limit,
+            sort,
+        }
+    }
+
+    fn push(&mut self, entry: DirectoryEntry) {
+        self.total = self.total.saturating_add(1);
+        match &mut self.retained {
+            RetainedEntries::EncounterOrder(entries) => {
+                if self.limit.is_none_or(|limit| entries.len() < limit) {
+                    entries.push(entry);
+                }
+            }
+            RetainedEntries::SortedBounded(entries) => {
+                let limit = self.limit.expect("sorted bounded collector has a limit");
+                if limit == 0 {
+                    return;
+                }
+                if entries.len() < limit {
+                    entries.push(NameOrderedEntry(entry));
+                } else if entries
+                    .peek()
+                    .is_some_and(|largest| entry.name < largest.0.name)
+                {
+                    entries.pop();
+                    entries.push(NameOrderedEntry(entry));
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> DirectoryListing {
+        let mut entries = match self.retained {
+            RetainedEntries::EncounterOrder(entries) => entries,
+            RetainedEntries::SortedBounded(entries) => {
+                entries.into_iter().map(|entry| entry.0).collect()
+            }
+        };
+        if self.sort {
+            entries.sort_by(|left, right| left.name.cmp(&right.name));
+        }
+        DirectoryListing {
+            truncated: self.total > entries.len(),
+            entries,
+            total: self.total,
+        }
+    }
 }
 
 /// AC-owned one-level directory enumeration used by both the stock list tool
@@ -1122,34 +1426,25 @@ pub fn list_directory_authorized_blocking(
     sort: bool,
 ) -> std::io::Result<DirectoryListing> {
     let rooted = RootedPath::new(authorized);
+    let mut collector = DirectoryCollector::new(max_entries, sort);
     #[cfg(unix)]
-    let mut entries = enumerate_directory(rooted.open_dir()?, skip_names)?;
+    enumerate_directory(rooted.open_dir()?, skip_names, &mut collector)?;
     #[cfg(not(unix))]
-    let mut entries = enumerate_directory(rooted.path(), skip_names)?;
-    if sort {
-        entries.sort_by(|left, right| left.name.cmp(&right.name));
-    }
-    let total = entries.len();
-    let limit = max_entries.unwrap_or(total);
-    entries.truncate(limit);
-    Ok(DirectoryListing {
-        entries,
-        total,
-        truncated: total > limit,
-    })
+    enumerate_directory(rooted.path(), skip_names, &mut collector)?;
+    Ok(collector.finish())
 }
 
 #[cfg(unix)]
 fn enumerate_directory(
     dir: std::fs::File,
     skip_names: &[&str],
-) -> std::io::Result<Vec<DirectoryEntry>> {
+    collector: &mut DirectoryCollector,
+) -> std::io::Result<()> {
     use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 
     use rustix::fs::{AtFlags, Dir, FileType, readlinkat, statat};
 
     let mut stream = Dir::read_from(&dir).map_err(std::io::Error::from)?;
-    let mut entries = Vec::new();
     for entry in &mut stream {
         let entry = entry.map_err(std::io::Error::from)?;
         let name_bytes = entry.file_name().to_bytes();
@@ -1181,20 +1476,23 @@ fn enumerate_directory(
             ),
             _ => (DirectoryEntryKind::Other, None, None),
         };
-        entries.push(DirectoryEntry {
+        collector.push(DirectoryEntry {
             name,
             kind,
             size_bytes,
             symlink_target,
         });
     }
-    Ok(entries)
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn enumerate_directory(path: &Path, skip_names: &[&str]) -> std::io::Result<Vec<DirectoryEntry>> {
+fn enumerate_directory(
+    path: &Path,
+    skip_names: &[&str],
+    collector: &mut DirectoryCollector,
+) -> std::io::Result<()> {
     let dir = std::fs::read_dir(path)?;
-    let mut entries = Vec::new();
     for entry in dir {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1217,14 +1515,14 @@ fn enumerate_directory(path: &Path, skip_names: &[&str]) -> std::io::Result<Vec<
             ),
             _ => (DirectoryEntryKind::Other, None, None),
         };
-        entries.push(DirectoryEntry {
+        collector.push(DirectoryEntry {
             name,
             kind,
             size_bytes,
             symlink_target,
         });
     }
-    Ok(entries)
+    Ok(())
 }
 
 impl Tool for ListFiles {
@@ -1235,9 +1533,12 @@ impl Tool for ListFiles {
     }
 
     fn description(&self) -> String {
-        "List the immediate entries of a directory inside the workspace \
-         (non-recursive). Directories end with '/'. Defaults to the workspace \
-         root."
+        "List the immediate entries of an authorized directory (non-recursive). \
+         Relative paths resolve from the active root; host policy may grant \
+         additional absolute read paths. Directories end with '/'. Defaults to \
+         the active root. Results are bounded, sorted, and omit common metadata, \
+         dependency, and generated-output noise by default; the host may \
+         configure those defaults."
             .into()
     }
 
@@ -1252,12 +1553,30 @@ impl Tool for ListFiles {
     ) -> BoxFuture<'static, ToolOutput> {
         Box::pin(async move {
             let path = input.path.unwrap_or_else(|| ".".to_string());
-            let authorized = match ctx.policy.authorize_read(Path::new(&path)) {
-                Ok(p) => p,
-                Err(e) => return ToolOutput::error(e.to_string()),
-            };
+            let authorized =
+                match authorize_read_with_recovery(&ctx, Path::new(&path), "list_files").await {
+                    Ok(p) => p,
+                    Err(e) => return ToolOutput::error(e),
+                };
 
-            let listing = match list_directory_authorized(authorized, &[], None, true).await {
+            let config = ctx
+                .extensions
+                .get::<ListFilesConfig>()
+                .map(|config| (*config).clone())
+                .unwrap_or_default();
+            let skip_names = config
+                .skip_names
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let listing = match list_directory_authorized(
+                authorized,
+                &skip_names,
+                Some(config.max_entries),
+                config.sort,
+            )
+            .await
+            {
                 Ok(listing) => listing,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return ToolOutput::error(format!("directory not found: {path}"));
@@ -1276,7 +1595,15 @@ impl Tool for ListFiles {
                 })
                 .collect();
 
-            if names.is_empty() {
+            if listing.truncated {
+                let mut output = names;
+                let shown = output.len();
+                output.push(format!(
+                    "[truncated: {} entries after filtering; showing first {}]",
+                    listing.total, shown
+                ));
+                ToolOutput::ok(output.join("\n"))
+            } else if names.is_empty() {
                 ToolOutput::ok("(empty)")
             } else {
                 ToolOutput::ok(names.join("\n"))
@@ -1288,7 +1615,9 @@ impl Tool for ListFiles {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ac_tool::{AuthorizedPath, PathPolicy, PolicyError, SubtreePolicy};
+    use ac_tool::{
+        AuthorizedPath, GrantedReadPolicy, PathPolicy, PolicyError, ReadGrants, SubtreePolicy,
+    };
     use std::path::PathBuf;
     use std::sync::{Barrier, Mutex};
 
@@ -1340,8 +1669,8 @@ mod tests {
         }
     }
 
-    fn disk_mtime_ms(path: &Path) -> u64 {
-        mtime_ms(std::fs::metadata(path).unwrap().modified().unwrap()).unwrap()
+    fn disk_mtime_ms(path: &Path) -> f64 {
+        mtime_ms_f64(std::fs::metadata(path).unwrap().modified().unwrap())
     }
 
     #[tokio::test]
@@ -1503,19 +1832,170 @@ mod tests {
     #[tokio::test]
     async fn resolved_directory_listing_filters_and_clips() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("z.txt"), "zzz").unwrap();
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
         std::fs::write(dir.path().join("b.txt"), "bb").unwrap();
         std::fs::write(dir.path().join(".skip"), "x").unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let listing = list_directory(&root, &[".skip"], Some(1), true)
+        let listing = list_directory(&root, &[".skip"], Some(2), true)
             .await
             .unwrap();
-        assert_eq!(listing.total, 2);
+        assert_eq!(listing.total, 3);
         assert!(listing.truncated);
-        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries.len(), 2);
         assert_eq!(listing.entries[0].name, "a.txt");
         assert_eq!(listing.entries[0].kind, DirectoryEntryKind::File);
         assert_eq!(listing.entries[0].size_bytes, Some(1));
+        assert_eq!(listing.entries[1].name, "b.txt");
+    }
+
+    #[tokio::test]
+    async fn resolved_directory_listing_zero_limit_retains_nothing_but_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        let listing = list_directory(&root, &[], Some(0), true).await.unwrap();
+
+        assert_eq!(listing.total, 2);
+        assert!(listing.truncated);
+        assert!(listing.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stock_list_filters_noise_and_bounds_output_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        for skipped in DEFAULT_LIST_SKIP_NAMES {
+            std::fs::create_dir_all(dir.path().join(skipped)).unwrap();
+        }
+        std::fs::write(dir.path().join(".env"), "visible").unwrap();
+        for index in 0..=DEFAULT_LIST_MAX_ENTRIES {
+            std::fs::write(dir.path().join(format!("f{index:03}.txt")), "x").unwrap();
+        }
+        let ctx = ctx_in(dir.path());
+
+        let out = list(&ctx, ".").await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains(".env"));
+        for skipped in DEFAULT_LIST_SKIP_NAMES {
+            assert!(!out.content.lines().any(|line| line == *skipped));
+            assert!(
+                !out.content
+                    .lines()
+                    .any(|line| line == format!("{skipped}/"))
+            );
+        }
+        assert!(out.content.contains(&format!(
+            "[truncated: {} entries after filtering; showing first {}]",
+            DEFAULT_LIST_MAX_ENTRIES + 2,
+            DEFAULT_LIST_MAX_ENTRIES
+        )));
+        assert_eq!(out.content.lines().count(), DEFAULT_LIST_MAX_ENTRIES + 1);
+    }
+
+    #[tokio::test]
+    async fn host_can_configure_stock_list_filter_and_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
+        let ctx = ctx_in(dir.path());
+        ctx.extensions.insert(ListFilesConfig {
+            max_entries: 1,
+            skip_names: vec!["a.txt".to_string()],
+            sort: true,
+        });
+
+        let out = list(&ctx, ".").await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.content,
+            "b.txt\n[truncated: 2 entries after filtering; showing first 1]"
+        );
+    }
+
+    struct TestReadPathRecovery {
+        requested: PathBuf,
+        action: ReadPathRecoveryAction,
+    }
+
+    impl ReadPathRecovery for TestReadPathRecovery {
+        fn recover<'a>(
+            &'a self,
+            _tool_name: &'static str,
+            requested: &'a Path,
+            _rejection: &'a PolicyError,
+        ) -> BoxFuture<'a, ReadPathRecoveryAction> {
+            Box::pin(async move {
+                if requested == self.requested {
+                    self.action.clone()
+                } else {
+                    ReadPathRecoveryAction::Unhandled
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn list_path_recovery_reauthorizes_a_unicode_spelling_candidate() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let actual = external.path().join("Reference\u{202f}Pack");
+        std::fs::create_dir(&actual).unwrap();
+        std::fs::write(actual.join("brief.md"), "brief").unwrap();
+        let actual = actual.canonicalize().unwrap();
+        let requested = external.path().join("Reference Pack");
+
+        let grants = Arc::new(ReadGrants::new());
+        grants.grant(&actual).unwrap();
+        let inner: Arc<dyn PathPolicy> = Arc::new(SubtreePolicy::new(workspace.path()).unwrap());
+        let policy: Arc<dyn PathPolicy> = Arc::new(GrantedReadPolicy::new(inner, grants));
+        let ctx = Arc::new(ToolCtx::new(policy));
+        ctx.extensions
+            .insert(ReadPathRecoveryConfig::new(TestReadPathRecovery {
+                requested: requested.clone(),
+                action: ReadPathRecoveryAction::Retry(actual),
+            }));
+
+        let out = list(&ctx, &requested.display().to_string()).await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(out.content, "brief.md");
+    }
+
+    #[tokio::test]
+    async fn list_path_recovery_can_diagnose_but_cannot_grant_a_retry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let ungranted = external.path().join("Private\u{00a0}Files");
+        std::fs::create_dir(&ungranted).unwrap();
+        let requested = external.path().join("Private Files");
+        let ctx = ctx_in(workspace.path());
+        ctx.extensions
+            .insert(ReadPathRecoveryConfig::new(TestReadPathRecovery {
+                requested: requested.clone(),
+                action: ReadPathRecoveryAction::Retry(ungranted.clone()),
+            }));
+
+        let refused = list(&ctx, &requested.display().to_string()).await;
+
+        assert!(refused.is_error);
+        assert!(refused.content.contains(&requested.display().to_string()));
+        assert!(!refused.content.contains(&ungranted.display().to_string()));
+
+        ctx.extensions
+            .insert(ReadPathRecoveryConfig::new(TestReadPathRecovery {
+                requested: requested.clone(),
+                action: ReadPathRecoveryAction::Diagnostic(
+                    "copy the exact referenced path".to_string(),
+                ),
+            }));
+        let diagnosed = list(&ctx, &requested.display().to_string()).await;
+        assert!(diagnosed.is_error);
+        assert_eq!(diagnosed.content, "copy the exact referenced path");
     }
 
     #[tokio::test]
@@ -1547,9 +2027,25 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out.content).expect("structured conflict");
         assert_eq!(v["kind"], "conflict");
         assert_eq!(v["expected_mtime_ms"], expected);
-        assert_eq!(v["actual_mtime_ms"], actual);
+        let reported_actual = v["actual_mtime_ms"].as_f64().unwrap();
+        assert!(
+            (reported_actual - actual).abs() < 0.001,
+            "JSON mtime changed by more than one microsecond: reported={reported_actual}, actual={actual}"
+        );
         // Refused BEFORE writing: the prior contents are intact.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1");
+    }
+
+    #[test]
+    fn write_input_accepts_fractional_expected_mtime() {
+        let input: WriteFileInput = serde_json::from_value(serde_json::json!({
+            "path": "a.txt",
+            "content": "v2",
+            "expected_mtime_ms": 1_785_240_585_168.581_3_f64,
+        }))
+        .unwrap();
+
+        assert_eq!(input.expected_mtime_ms, Some(1_785_240_585_168.581_3_f64));
     }
 
     #[tokio::test]
@@ -1605,6 +2101,74 @@ mod tests {
         .await;
         assert!(bad.is_error);
         assert!(bad.content.contains("content_base64"));
+    }
+
+    #[tokio::test]
+    async fn host_write_ceiling_applies_to_text_and_base64() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(dir.path());
+        ctx.extensions.insert(WriteFileConfig {
+            max_payload_bytes: 2,
+        });
+
+        let text = write(&ctx, text_input("text.txt", "abc")).await;
+        assert!(text.is_error);
+        assert_eq!(
+            text.content,
+            "write payload too large: text content is 3 bytes; limit is 2 bytes"
+        );
+        assert!(!dir.path().join("text.txt").exists());
+
+        // The encoded-size preflight rejects this before attempting to decode
+        // the deliberately malformed payload.
+        let encoded = write(
+            &ctx,
+            WriteFileInput {
+                path: "encoded.bin".into(),
+                content: None,
+                content_base64: Some("!!!!!!!!".into()),
+                expected_mtime_ms: None,
+            },
+        )
+        .await;
+        assert!(encoded.is_error);
+        assert!(encoded.content.contains("base64 input is 8 encoded bytes"));
+        assert!(!encoded.content.contains("invalid content_base64"));
+
+        // A final decoded-size check covers the partially used last quartet.
+        let decoded = write(
+            &ctx,
+            WriteFileInput {
+                path: "decoded.bin".into(),
+                content: None,
+                content_base64: Some(base64::engine::general_purpose::STANDARD.encode([1, 2, 3])),
+                expected_mtime_ms: None,
+            },
+        )
+        .await;
+        assert!(decoded.is_error);
+        assert_eq!(
+            decoded.content,
+            "write payload too large: decoded content is 3 bytes; limit is 2 bytes"
+        );
+
+        let allowed = write(
+            &ctx,
+            WriteFileInput {
+                path: "allowed.bin".into(),
+                content: None,
+                content_base64: Some(base64::engine::general_purpose::STANDARD.encode([1, 2])),
+                expected_mtime_ms: None,
+            },
+        )
+        .await;
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert_eq!(
+            std::fs::read(dir.path().join("allowed.bin")).unwrap(),
+            [1, 2]
+        );
     }
 
     #[tokio::test]

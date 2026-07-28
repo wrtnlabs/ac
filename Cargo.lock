@@ -59,6 +59,7 @@ name = "ac-cli"
 version = "0.1.0"
 dependencies = [
  "ac-context",
+ "ac-host",
  "ac-provider",
  "ac-provider-mock",
  "ac-provider-openrouter",
@@ -84,6 +85,25 @@ name = "ac-context"
 version = "0.1.0"
 dependencies = [
  "ac-types",
+]
+
+[[package]]
+name = "ac-host"
+version = "0.1.0"
+dependencies = [
+ "ac-context",
+ "ac-provider",
+ "ac-provider-mock",
+ "ac-rollout",
+ "ac-runtime",
+ "ac-tool",
+ "ac-types",
+ "futures",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
