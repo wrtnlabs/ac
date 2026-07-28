@@ -14,11 +14,15 @@ import {
 import { liveEvaluationRefusal } from "./checks.mjs";
 
 function testEnvironment(overrides = {}) {
-  const environment = { ...process.env, LIVE_AGENT: "1", ...overrides };
+  const environment = { ...process.env };
   // `node --test` uses this private channel for its own child protocol. The
   // fixture commands are ordinary subprocesses, not nested test workers.
   delete environment.NODE_TEST_CONTEXT;
-  return environment;
+  // The suite correctly refuses real live evaluations in CI. These fixtures
+  // exercise orchestration with inert local commands, so keep the ambient
+  // runner marker from turning every non-dry fixture into an early refusal.
+  delete environment.CI;
+  return { ...environment, LIVE_AGENT: "1", ...overrides };
 }
 
 test("discovers, aliases, classifies, and orders scenarios", () => {
