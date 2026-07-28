@@ -11,19 +11,25 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use ac_tool::{
-    AuthorizedPath, Capability, FileSnapshot, FileTimeError, PolicyError, Tool, ToolCtx,
-    ToolOutput, WriteObserver,
+    AuthorizedPath, Capability, FileSnapshot, FileTimeError, PathPolicy, PolicyError, Tool,
+    ToolCtx, ToolOutput, WriteObserver,
 };
 use futures::future::BoxFuture;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::edit_replace::{
     convert_to_line_ending, detect_line_ending, fuzzy_replace, normalize_line_endings,
 };
 use crate::rooted_fs::RootedPath;
 
-/// Maximum bytes `read_file` returns; larger files are truncated with a note.
-const READ_CAP: usize = 256 * 1024;
+/// Default byte ceiling for [`ReadFile`].
+pub const DEFAULT_READ_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Default line window returned by [`ReadFile`].
+pub const DEFAULT_READ_LIMIT: usize = 200;
+
+/// Default maximum line window accepted by [`ReadFile`].
+pub const DEFAULT_READ_MAX_LIMIT: usize = 2000;
 
 /// Default decoded payload ceiling for [`WriteFile`]: 10 MiB.
 ///
@@ -132,6 +138,69 @@ pub struct ReadPathRecoveryConfig {
     recovery: Arc<dyn ReadPathRecovery>,
 }
 
+/// A host-selected route for one model-supplied read path.
+///
+/// Resolver candidates do not carry authority. AC always passes a candidate
+/// through the run's [`PathPolicy`](ac_tool::PathPolicy), including the
+/// optional [`ReadPathRecovery`] step, before performing any filesystem I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadPathResolution {
+    /// Use the stock policy + recovery path for the request as supplied.
+    Default,
+    /// Try another host-selected read identity through the stock policy +
+    /// recovery path.
+    ///
+    /// This affects this read only. A host that wants an alias to compose across
+    /// reads and writes should express it in its [`PathPolicy`] instead.
+    Candidate(PathBuf),
+    /// Stop routing and return host-authored, model-facing diagnostic text.
+    Diagnostic(String),
+}
+
+/// Optional host-neutral routing seam for stock read tools.
+///
+/// A host can map a virtual path, choose between a primary and fallback tree,
+/// or provide a route-specific diagnostic without reimplementing `read_file`.
+/// The resolver is consulted before the default policy path, so it can express
+/// either precedence or fallback. It selects a candidate only; AC retains the
+/// final authorization and descriptor-safe I/O. Resolver candidates are
+/// read-only identities for the current operation; aliases that must compose
+/// with writes belong in [`PathPolicy`] (for example, a prefix-remap policy).
+///
+/// Only the active path policy is exposed to this hook. Routing must not depend
+/// on unrelated run state hidden inside [`ToolCtx`].
+pub trait ReadPathResolver: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        policy: &'a dyn PathPolicy,
+        tool_name: &'static str,
+        requested: &'a Path,
+    ) -> BoxFuture<'a, ReadPathResolution>;
+}
+
+/// Run-scoped [`ToolCtx::extensions`] entry for [`ReadPathResolver`].
+#[derive(Clone)]
+pub struct ReadPathResolverConfig {
+    resolver: Arc<dyn ReadPathResolver>,
+}
+
+impl ReadPathResolverConfig {
+    pub fn new(resolver: impl ReadPathResolver + 'static) -> Self {
+        Self {
+            resolver: Arc::new(resolver),
+        }
+    }
+
+    async fn resolve(
+        &self,
+        policy: &dyn PathPolicy,
+        tool_name: &'static str,
+        requested: &Path,
+    ) -> ReadPathResolution {
+        self.resolver.resolve(policy, tool_name, requested).await
+    }
+}
+
 impl ReadPathRecoveryConfig {
     pub fn new(recovery: impl ReadPathRecovery + 'static) -> Self {
         Self {
@@ -177,6 +246,37 @@ pub async fn authorize_read_with_recovery(
     }
 }
 
+/// Resolve one read path through the optional host router, then AC's policy and
+/// recovery chain.
+///
+/// Both the original request and a host-selected candidate ultimately pass
+/// through [`authorize_read_with_recovery`]. In particular, neither
+/// [`ReadPathResolution::Candidate`] nor [`ReadPathRecoveryAction::Retry`] can
+/// grant filesystem authority.
+pub async fn resolve_read_path(
+    ctx: &ToolCtx,
+    requested: &Path,
+    tool_name: &'static str,
+) -> Result<AuthorizedPath, String> {
+    let resolution = match ctx.extensions.get::<ReadPathResolverConfig>() {
+        Some(config) => {
+            config
+                .resolve(ctx.policy.as_ref(), tool_name, requested)
+                .await
+        }
+        None => ReadPathResolution::Default,
+    };
+    match resolution {
+        ReadPathResolution::Default => {
+            authorize_read_with_recovery(ctx, requested, tool_name).await
+        }
+        ReadPathResolution::Candidate(candidate) => {
+            authorize_read_with_recovery(ctx, &candidate, tool_name).await
+        }
+        ReadPathResolution::Diagnostic(message) => Err(message),
+    }
+}
+
 /// Render a resolved absolute path relative to the policy root for model-facing
 /// output; falls back to the absolute path when it is not under the root.
 fn rel(root: &Path, p: &Path) -> String {
@@ -185,10 +285,6 @@ fn rel(root: &Path, p: &Path) -> String {
         Ok(r) => r.display().to_string(),
         Err(_) => p.display().to_string(),
     }
-}
-
-fn mtime_of(meta: &std::fs::Metadata) -> Option<SystemTime> {
-    meta.modified().ok()
 }
 
 fn mtime_ms(t: SystemTime) -> Option<u64> {
@@ -568,17 +664,61 @@ async fn read_all(file: std::fs::File) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Read an authorized UTF-8 text file and return its contents.
+/// Per-run limits for the stock [`ReadFile`] tool.
 ///
-/// The file is recorded in the read-before-write ledger, which later lets
-/// `write_file` and `edit_file` overwrite it. Files larger than 256 KiB are
-/// truncated (a note is appended). Reading a directory or a missing file is a
-/// tool error, not a crash.
+/// Install this value in [`ToolCtx::extensions`] to override the defaults.
+/// `default_limit` and `max_limit` count lines; `max_bytes` bounds the complete
+/// file before decoding and slicing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadFileConfig {
+    pub default_limit: usize,
+    pub max_limit: usize,
+    pub max_bytes: u64,
+}
+
+impl Default for ReadFileConfig {
+    fn default() -> Self {
+        Self {
+            default_limit: DEFAULT_READ_LIMIT,
+            max_limit: DEFAULT_READ_MAX_LIMIT,
+            max_bytes: DEFAULT_READ_MAX_BYTES,
+        }
+    }
+}
+
+/// Read an authorized UTF-8 text file and return a numbered line window plus
+/// exact file metadata.
+///
+/// The file is recorded in the read-before-write ledger from the same
+/// descriptor metadata returned to the caller, which later lets `write_file`
+/// and `edit_file` safely overwrite it.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ReadFileInput {
     /// Path to an authorized file. Relative paths resolve from the active
     /// root; absolute paths are accepted only when host policy grants them.
     pub path: String,
+    /// First line to return, one-based. Defaults to 1.
+    #[schemars(range(min = 1))]
+    pub offset: Option<usize>,
+    /// Maximum lines to return. Defaults to host configuration and cannot
+    /// exceed its maximum.
+    #[schemars(range(min = 1))]
+    pub limit: Option<usize>,
+}
+
+/// Structured model-facing result returned by [`ReadFile`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReadFileResult {
+    /// The path exactly as requested by the model.
+    pub path: String,
+    pub total_lines: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub bytes: u64,
+    /// Full-precision milliseconds since the Unix epoch.
+    pub mtime_ms: f64,
+    /// Numbered lines in the requested window.
+    pub content: String,
 }
 
 /// Reads a text file so the model can inspect it before editing.
@@ -592,11 +732,12 @@ impl Tool for ReadFile {
     }
 
     fn description(&self) -> String {
-        "Read an authorized UTF-8 text file and return its contents. Relative \
-         paths resolve from the active root; host policy may grant additional \
-         absolute read paths. Files over 256 KiB are truncated. Records the \
-         file so it can later be overwritten with write_file/edit_file \
-         (read-before-write)."
+        "Read an authorized UTF-8 text file. Relative paths resolve from the \
+         active root; host policy may grant additional paths or virtual routes. \
+         Returns a structured result with numbered content, total/start/end \
+         lines, byte size, and exact mtime_ms. Use offset/limit to read a line \
+         window. Records the file so it can later be overwritten with \
+         write_file/edit_file (read-before-write)."
             .into()
     }
 
@@ -610,61 +751,89 @@ impl Tool for ReadFile {
         ctx: Arc<ToolCtx>,
     ) -> BoxFuture<'static, ToolOutput> {
         Box::pin(async move {
-            let authorized = match ctx.policy.authorize_read(Path::new(&input.path)) {
-                Ok(p) => p,
-                Err(e) => return ToolOutput::error(e.to_string()),
-            };
-            let resolved = authorized.path().to_path_buf();
-            let rooted = RootedPath::new(authorized);
-
-            let file = match rooted.open_read() {
-                Ok(file) => file,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return ToolOutput::error(format!("file not found: {}", input.path));
-                }
-                Err(e) => return ToolOutput::error(format!("cannot open {}: {e}", input.path)),
-            };
-            let meta = match file.metadata() {
-                Ok(metadata) => metadata,
-                Err(e) => return ToolOutput::error(format!("cannot stat {}: {e}", input.path)),
-            };
-            if meta.is_dir() {
-                return ToolOutput::error(format!("is a directory, not a file: {}", input.path));
+            let config = ctx
+                .extensions
+                .get::<ReadFileConfig>()
+                .map(|config| *config)
+                .unwrap_or_default();
+            if config.default_limit == 0
+                || config.max_limit == 0
+                || config.default_limit > config.max_limit
+            {
+                return ToolOutput::error(
+                    "read_file: invalid host configuration: line limits must satisfy 1 <= default_limit <= max_limit",
+                );
             }
 
-            let bytes = match read_capped(file, READ_CAP + 1).await {
-                Ok(b) => b,
-                Err(e) => return ToolOutput::error(format!("cannot read {}: {e}", input.path)),
-            };
-            let truncated = bytes.len() > READ_CAP;
-            let slice = if truncated {
-                &bytes[..READ_CAP]
-            } else {
-                &bytes[..]
-            };
-            let mut content = String::from_utf8_lossy(slice).into_owned();
-            if truncated {
-                content.push_str(&format!(
-                    "\n\n[truncated: file exceeds {READ_CAP} bytes; showing the first {READ_CAP}]"
+            let offset = input.offset.unwrap_or(1);
+            if offset == 0 {
+                return ToolOutput::error(
+                    "read_file: invalid arguments: `offset` must be an integer >= 1",
+                );
+            }
+            let limit = input.limit.unwrap_or(config.default_limit);
+            if limit == 0 || limit > config.max_limit {
+                return ToolOutput::error(format!(
+                    "read_file: invalid arguments: `limit` must be an integer between 1 and {}",
+                    config.max_limit
                 ));
             }
 
-            if let Some(mtime) = mtime_of(&meta) {
-                ctx.file_times
-                    .stamp_with_size(resolved.clone(), mtime, meta.len());
-            }
+            let requested = input.path;
+            let authorized = match resolve_read_path(&ctx, Path::new(&requested), "read_file").await
+            {
+                Ok(authorized) => authorized,
+                Err(error) => return ToolOutput::error(error),
+            };
+            let resolved = authorized.path().to_path_buf();
+            let slice =
+                match read_text_slice_authorized(authorized, offset, limit, config.max_bytes).await
+                {
+                    Ok(slice) => slice,
+                    Err(error) => return ToolOutput::error(error.to_string()),
+                };
 
-            ToolOutput::ok(content)
+            ctx.file_times
+                .stamp_with_size(resolved, slice.mtime, slice.bytes);
+
+            let available = slice.total_lines.saturating_sub(offset.saturating_sub(1));
+            let shown = available.min(limit);
+            let end_line = if shown == 0 {
+                offset.saturating_sub(1)
+            } else {
+                offset.saturating_add(shown - 1)
+            };
+            let content = if shown == 0 {
+                String::new()
+            } else {
+                let pad = end_line.to_string().len();
+                slice
+                    .content
+                    .split('\n')
+                    .take(shown)
+                    .enumerate()
+                    .map(|(index, line)| format!("{:>pad$}| {line}", offset + index))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+
+            let result = ReadFileResult {
+                path: requested,
+                total_lines: slice.total_lines,
+                start_line: offset,
+                end_line,
+                bytes: slice.bytes,
+                mtime_ms: slice.mtime_ms,
+                content,
+            };
+            match serde_json::to_string(&result) {
+                Ok(result) => ToolOutput::ok(result),
+                Err(error) => {
+                    ToolOutput::error(format!("read_file: cannot serialize result: {error}"))
+                }
+            }
         })
     }
-}
-
-async fn read_capped(file: std::fs::File, limit: usize) -> std::io::Result<Vec<u8>> {
-    use tokio::io::AsyncReadExt;
-    let file = tokio::fs::File::from_std(file);
-    let mut buf = Vec::new();
-    file.take(limit as u64).read_to_end(&mut buf).await?;
-    Ok(buf)
 }
 
 /// Bytes read from one policy-authorized file descriptor.
@@ -976,23 +1145,30 @@ async fn read_text_slice_from_open_file(
             max_bytes,
         });
     }
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let lines: Vec<&str> = text.split('\n').collect();
+    let text = String::from_utf8_lossy(&raw);
     let start = offset.saturating_sub(1);
-    let content = lines
-        .iter()
-        .skip(start)
-        .take(limit)
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let end = start.saturating_add(limit);
+    let mut total_lines = 0usize;
+    let mut selected_any = false;
+    let mut content = String::new();
+    for (index, line) in text.split('\n').enumerate() {
+        total_lines = total_lines.saturating_add(1);
+        if index < start || index >= end {
+            continue;
+        }
+        if selected_any {
+            content.push('\n');
+        }
+        content.push_str(line);
+        selected_any = true;
+    }
     let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     Ok(ReadTextSlice {
         content,
         bytes: metadata.len(),
         mtime,
         mtime_ms: mtime_ms_f64(mtime),
-        total_lines: lines.len(),
+        total_lines,
     })
 }
 
@@ -1627,8 +1803,35 @@ mod tests {
 
     async fn read(ctx: &Arc<ToolCtx>, path: &str) -> ToolOutput {
         Arc::new(ReadFile)
-            .run(ReadFileInput { path: path.into() }, ctx.clone())
+            .run(
+                ReadFileInput {
+                    path: path.into(),
+                    offset: None,
+                    limit: None,
+                },
+                ctx.clone(),
+            )
             .await
+    }
+
+    #[test]
+    fn stock_read_file_schema_advertises_one_based_positive_windows() {
+        let mut registry = ac_tool::ToolRegistry::new();
+        registry.register(ReadFile);
+        let spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "read_file")
+            .unwrap();
+
+        assert_eq!(
+            spec.input_schema["properties"]["offset"]["minimum"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["limit"]["minimum"],
+            serde_json::json!(1)
+        );
     }
 
     async fn write(ctx: &Arc<ToolCtx>, input: WriteFileInput) -> ToolOutput {
@@ -1674,6 +1877,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stock_read_file_returns_numbered_window_metadata_and_stamps_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\ntwo\nthree\nfour").unwrap();
+        let ctx = ctx_in(dir.path());
+
+        let out = Arc::new(ReadFile)
+            .run(
+                ReadFileInput {
+                    path: "a.txt".into(),
+                    offset: Some(2),
+                    limit: Some(2),
+                },
+                ctx.clone(),
+            )
+            .await;
+
+        assert!(!out.is_error, "{}", out.content);
+        let result: ReadFileResult = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(result.path, "a.txt");
+        assert_eq!(result.total_lines, 4);
+        assert_eq!(result.start_line, 2);
+        assert_eq!(result.end_line, 3);
+        assert_eq!(result.bytes, 18);
+        assert_eq!(result.content, "2| two\n3| three");
+        assert!((result.mtime_ms - disk_mtime_ms(&path)).abs() < 0.001);
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        ctx.file_times
+            .assert_write(
+                &path.canonicalize().unwrap(),
+                Some(ac_tool::FileSnapshot {
+                    mtime: metadata.modified().unwrap(),
+                    size: metadata.len(),
+                }),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_can_configure_stock_read_line_and_byte_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree").unwrap();
+        let ctx = ctx_in(dir.path());
+        ctx.extensions.insert(ReadFileConfig {
+            default_limit: 2,
+            max_limit: 2,
+            max_bytes: 64,
+        });
+
+        let defaulted = read(&ctx, "a.txt").await;
+        assert!(!defaulted.is_error, "{}", defaulted.content);
+        let result: ReadFileResult = serde_json::from_str(&defaulted.content).unwrap();
+        assert_eq!(result.content, "1| one\n2| two");
+        assert_eq!(result.end_line, 2);
+
+        let too_many = Arc::new(ReadFile)
+            .run(
+                ReadFileInput {
+                    path: "a.txt".into(),
+                    offset: None,
+                    limit: Some(3),
+                },
+                ctx.clone(),
+            )
+            .await;
+        assert!(too_many.is_error);
+        assert_eq!(
+            too_many.content,
+            "read_file: invalid arguments: `limit` must be an integer between 1 and 2"
+        );
+
+        ctx.extensions.insert(ReadFileConfig {
+            default_limit: 2,
+            max_limit: 2,
+            max_bytes: 3,
+        });
+        let too_large = read(&ctx, "a.txt").await;
+        assert!(too_large.is_error);
+        assert!(too_large.content.contains("file too large"));
+        assert!(too_large.content.contains("3 limit"));
+    }
+
+    #[tokio::test]
     async fn resolved_read_slice_owns_decode_and_line_window() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
@@ -1684,6 +1971,22 @@ mod tests {
         assert_eq!(slice.total_lines, 3);
         assert_eq!(slice.bytes, 13);
         assert!(slice.mtime_ms.is_finite());
+    }
+
+    #[tokio::test]
+    async fn resolved_read_slice_counts_all_lines_but_retains_only_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "zero\n\nsecond\n").unwrap();
+        let path = path.canonicalize().unwrap();
+
+        let slice = read_text_slice(&path, 2, 2, 1024).await.unwrap();
+        assert_eq!(slice.content, "\nsecond");
+        assert_eq!(slice.total_lines, 4);
+
+        let beyond = read_text_slice(&path, 10, 2, 1024).await.unwrap();
+        assert_eq!(beyond.content, "");
+        assert_eq!(beyond.total_lines, 4);
     }
 
     #[tokio::test]
@@ -1922,6 +2225,28 @@ mod tests {
         action: ReadPathRecoveryAction,
     }
 
+    struct TestReadPathResolver {
+        requested: PathBuf,
+        resolution: ReadPathResolution,
+    }
+
+    impl ReadPathResolver for TestReadPathResolver {
+        fn resolve<'a>(
+            &'a self,
+            _policy: &'a dyn PathPolicy,
+            _tool_name: &'static str,
+            requested: &'a Path,
+        ) -> BoxFuture<'a, ReadPathResolution> {
+            Box::pin(async move {
+                if requested == self.requested {
+                    self.resolution.clone()
+                } else {
+                    ReadPathResolution::Default
+                }
+            })
+        }
+    }
+
     impl ReadPathRecovery for TestReadPathRecovery {
         fn recover<'a>(
             &'a self,
@@ -1937,6 +2262,79 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn read_path_resolver_can_route_a_virtual_candidate_but_cannot_grant_it() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("sources")).unwrap();
+        std::fs::write(workspace.path().join("sources/brief.md"), "inside").unwrap();
+        let ctx = ctx_in(workspace.path());
+        ctx.extensions
+            .insert(ReadPathResolverConfig::new(TestReadPathResolver {
+                requested: PathBuf::from("virtual/brief.md"),
+                resolution: ReadPathResolution::Candidate(PathBuf::from("sources/brief.md")),
+            }));
+
+        let routed = read(&ctx, "virtual/brief.md").await;
+        assert!(!routed.is_error, "{}", routed.content);
+        let result: ReadFileResult = serde_json::from_str(&routed.content).unwrap();
+        assert_eq!(result.path, "virtual/brief.md");
+        assert_eq!(result.content, "1| inside");
+
+        let outside = tempfile::tempdir().unwrap();
+        let private = outside.path().join("private.md");
+        std::fs::write(&private, "outside").unwrap();
+        ctx.extensions
+            .insert(ReadPathResolverConfig::new(TestReadPathResolver {
+                requested: PathBuf::from("virtual/private.md"),
+                resolution: ReadPathResolution::Candidate(private),
+            }));
+
+        let refused = read(&ctx, "virtual/private.md").await;
+        assert!(refused.is_error);
+    }
+
+    #[tokio::test]
+    async fn stock_read_default_route_uses_recovery_and_reauthorizes_retry() {
+        let workspace = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let actual = external.path().join("Reference\u{202f}Pack.md");
+        std::fs::write(&actual, "brief").unwrap();
+        let actual = actual.canonicalize().unwrap();
+        let requested = external.path().join("Reference Pack.md");
+
+        let grants = Arc::new(ReadGrants::new());
+        grants.grant_file(&actual).unwrap();
+        let inner: Arc<dyn PathPolicy> = Arc::new(SubtreePolicy::new(workspace.path()).unwrap());
+        let policy: Arc<dyn PathPolicy> = Arc::new(GrantedReadPolicy::new(inner, grants));
+        let ctx = Arc::new(ToolCtx::new(policy));
+        ctx.extensions
+            .insert(ReadPathResolverConfig::new(TestReadPathResolver {
+                requested: requested.clone(),
+                resolution: ReadPathResolution::Default,
+            }));
+        ctx.extensions
+            .insert(ReadPathRecoveryConfig::new(TestReadPathRecovery {
+                requested: requested.clone(),
+                action: ReadPathRecoveryAction::Retry(actual),
+            }));
+
+        let recovered = read(&ctx, &requested.display().to_string()).await;
+        assert!(!recovered.is_error, "{}", recovered.content);
+        let result: ReadFileResult = serde_json::from_str(&recovered.content).unwrap();
+        assert_eq!(result.content, "1| brief");
+
+        let ungranted = external.path().join("ungranted.md");
+        std::fs::write(&ungranted, "secret").unwrap();
+        ctx.extensions
+            .insert(ReadPathRecoveryConfig::new(TestReadPathRecovery {
+                requested: requested.clone(),
+                action: ReadPathRecoveryAction::Retry(ungranted),
+            }));
+        let refused = read(&ctx, &requested.display().to_string()).await;
+        assert!(refused.is_error);
+        assert!(refused.content.contains(&requested.display().to_string()));
     }
 
     #[tokio::test]
@@ -2026,7 +2424,11 @@ mod tests {
         assert!(out.is_error);
         let v: serde_json::Value = serde_json::from_str(&out.content).expect("structured conflict");
         assert_eq!(v["kind"], "conflict");
-        assert_eq!(v["expected_mtime_ms"], expected);
+        let reported_expected = v["expected_mtime_ms"].as_f64().unwrap();
+        assert!(
+            (reported_expected - expected).abs() < 0.001,
+            "JSON mtime changed by more than one microsecond: reported={reported_expected}, expected={expected}"
+        );
         let reported_actual = v["actual_mtime_ms"].as_f64().unwrap();
         assert!(
             (reported_actual - actual).abs() < 0.001,

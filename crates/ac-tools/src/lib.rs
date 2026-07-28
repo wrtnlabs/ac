@@ -36,15 +36,17 @@ pub use fetch::{
     AllowedOrigins, DEFAULT_FETCH_TIMEOUT, Fetch, FetchInput, FetchUrl, FetchUrlPolicy,
 };
 pub use files::{
-    DEFAULT_LIST_MAX_ENTRIES, DEFAULT_LIST_SKIP_NAMES, DEFAULT_WRITE_MAX_BYTES, DirectoryEntry,
-    DirectoryEntryKind, DirectoryListing, EditFile, EditFileInput, ExpectedMtime, FileCommit,
-    FileMutation, FileMutationError, FileWriteResult, ListFiles, ListFilesConfig, ListFilesInput,
-    ReadBytes, ReadBytesError, ReadFile, ReadFileInput, ReadPathRecovery, ReadPathRecoveryAction,
-    ReadPathRecoveryConfig, ReadTextError, ReadTextSlice, WriteFile, WriteFileConfig,
+    DEFAULT_LIST_MAX_ENTRIES, DEFAULT_LIST_SKIP_NAMES, DEFAULT_READ_LIMIT, DEFAULT_READ_MAX_BYTES,
+    DEFAULT_READ_MAX_LIMIT, DEFAULT_WRITE_MAX_BYTES, DirectoryEntry, DirectoryEntryKind,
+    DirectoryListing, EditFile, EditFileInput, ExpectedMtime, FileCommit, FileMutation,
+    FileMutationError, FileWriteResult, ListFiles, ListFilesConfig, ListFilesInput, ReadBytes,
+    ReadBytesError, ReadFile, ReadFileConfig, ReadFileInput, ReadFileResult, ReadPathRecovery,
+    ReadPathRecoveryAction, ReadPathRecoveryConfig, ReadPathResolution, ReadPathResolver,
+    ReadPathResolverConfig, ReadTextError, ReadTextSlice, WriteFile, WriteFileConfig,
     WriteFileInput, authorize_read_with_recovery, ensure_directory_authorized, list_directory,
     list_directory_authorized, list_directory_authorized_blocking, mtime_ms_f64,
     read_bytes_authorized, read_bytes_authorized_blocking, read_text_slice,
-    read_text_slice_authorized, write_atomic_authorized,
+    read_text_slice_authorized, resolve_read_path, write_atomic_authorized,
 };
 pub use search::{Glob, GlobInput, Grep, GrepInput};
 pub use shell::{
@@ -120,7 +122,8 @@ mod tests {
             .run("read_file", json!({ "path": "a.txt" }), ctx.clone())
             .await;
         assert!(!read.is_error);
-        assert_eq!(read.content, "hello");
+        let read: ReadFileResult = serde_json::from_str(&read.content).unwrap();
+        assert_eq!(read.content, "1| hello");
 
         let write = r
             .run(
