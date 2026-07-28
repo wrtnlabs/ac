@@ -17,6 +17,10 @@
 //!   host persists, and [`register_cached`] registers them without dialing —
 //!   the first call dials through a host-injected [`McpDialer`] and the live
 //!   connection is memoized for the rest of the session.
+//! - The opt-in `managed` module composes the standard control plane around
+//!   those primitives: portable configuration, identity-bound catalog,
+//!   credentials, probes, refresh/backfill, lazy mounting, and status. Hosts
+//!   inject paths, process environment, and OAuth/RPC presentation policy.
 //! - Failures are data, per AC doctrine: a transport error, a server-side
 //!   `isError` result, or non-object arguments all come back as
 //!   [`ToolOutput::error`] — never a panic, never a poisoned session.
@@ -56,6 +60,14 @@ pub mod oauth;
 /// Shared loopback callback state machine for interactive OAuth.
 #[cfg(feature = "http")]
 pub mod oauth_callback;
+
+/// Managed MCP control plane: portable server configuration, offline catalog,
+/// credential persistence, connection policy, and lifecycle orchestration.
+///
+/// This layer is opt-in with `managed`. It currently includes `http` because
+/// the portable server registry supports remote OAuth servers.
+#[cfg(feature = "managed")]
+pub mod managed;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -131,7 +143,7 @@ pub enum ToolPrefix {
     /// `mcp__<server>__<tool>` — the default.
     #[default]
     ServerName,
-    /// Register the server's tool names verbatim. Collisions replace.
+    /// Register the server's tool names verbatim. Existing entries still win.
     None,
     /// A custom prefix, prepended verbatim.
     Custom(String),
@@ -423,8 +435,9 @@ impl McpConnection {
     /// whose (prefixed) name would violate the provider tool-name contract
     /// are skipped and reported in [`RegisteredTools::skipped`], never
     /// registered — one hostile or sloppy name must not 400 every subsequent
-    /// completion request. Within one server, a duplicated tool name replaces
-    /// the earlier entry — same semantics as every other registration path.
+    /// completion request. Dynamic tools never replace an existing registry
+    /// entry: built-ins and earlier MCP tools win, while the collision is
+    /// reported in [`RegisteredTools::skipped`].
     pub async fn register_tools(
         &self,
         registry: &mut ToolRegistry,
@@ -450,6 +463,13 @@ impl McpConnection {
                 result.skipped.push(SkippedTool {
                     remote_name,
                     reason,
+                });
+                continue;
+            }
+            if registry.contains(&registry_name) {
+                result.skipped.push(SkippedTool {
+                    remote_name,
+                    reason: format!("registry already contains a tool named '{registry_name}'"),
                 });
                 continue;
             }
@@ -699,6 +719,13 @@ pub fn register_cached(
             result.skipped.push(SkippedTool {
                 remote_name: cached.name.clone(),
                 reason,
+            });
+            continue;
+        }
+        if registry.contains(&registry_name) {
+            result.skipped.push(SkippedTool {
+                remote_name: cached.name.clone(),
+                reason: format!("registry already contains a tool named '{registry_name}'"),
             });
             continue;
         }

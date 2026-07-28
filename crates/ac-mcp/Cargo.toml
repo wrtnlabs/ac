@@ -18,15 +18,26 @@ http = [
     "rmcp/transport-streamable-http-client-reqwest",
     "rmcp/reqwest",
 ]
+# Standard config/catalog/credential/lifecycle assembly. It currently
+# includes remote OAuth support, while keeping low-level HTTP consumers free
+# of the control-plane and tool-search dependencies.
+managed = [
+    "http",
+    "dep:ac-tools",
+    "dep:indexmap",
+    "dep:windows-sys",
+]
 
 [dependencies]
 ac-tool.workspace = true
+ac-tools = { workspace = true, optional = true }
 ac-types.workspace = true
 base64 = { workspace = true, optional = true }
 futures.workspace = true
 # Not workspace-listed: only this crate needs it, only under `http`, and the
 # major must track rmcp's own `http` dependency.
 http = { version = "1", optional = true }
+indexmap = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rmcp = { workspace = true, features = [
     "client",
@@ -42,6 +53,9 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, optional = true }
 
 [dev-dependencies]
 ac-provider.workspace = true

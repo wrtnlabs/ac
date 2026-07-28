@@ -1,9 +1,10 @@
 # RFC: MCP integration — wire-discovered tools in the same registry
 
 **Status:** implemented — specification of record (2026-07-21). **Amended 2026-07-23:** §8
-(server configuration format) records the de-facto `mcpServers` JSON object as the host contract
-to follow — the kit stays format-agnostic (it takes connections, not files), and other tools'
-native configs are one-way importers, never the contract.
+(server configuration format) records the de-facto `mcpServers` JSON object as the portable
+contract. The low-level connection API remains format-agnostic; the opt-in managed layer ships
+that standard format and stock file persistence. Other tools' native configs are one-way
+importers, never the contract.
 **Amended 2026-07-24:** the remote-transport deferral (§9) is partially closed. A
 streamable-HTTP client connect path ships behind an opt-in `http` cargo feature (bearer token
 and extra headers at connect); an observably-unauthorized refusal — HTTP 401/403 or the
@@ -18,13 +19,20 @@ retaining the raw remote call name. A persisted catalog MUST be bound to the exa
 definition that produced it; changing a command, URL, headers, or auth policy invalidates that
 server's snapshot before registration. Hosts SHOULD translate config to connections through one
 adapter shared by probes, enumeration/OAuth, and lazy dialers (§5, §8).
+**Amended 2026-07-28 (managed MCP):** `ac_mcp::managed` now supplies that shared adapter and the
+standard control plane: ordered portable config, deterministic fingerprints, a version-2 offline
+catalog, lazy mounting, status/auth snapshots, probe, upsert/remove, refresh/backfill, stock
+atomic file stores (mode `0600` on Unix), and a generation-safe OAuth credential adapter.
+Storage and credential traits remain injectable. Hosts choose paths, inherited stdio environment,
+OAuth identity and callback presentation, import sources, and RPC/UI projection (§5, §7, §8).
 The opt-in `http` feature also owns application-agnostic OAuth 2.1 mechanics:
 protected-resource/authorization-server discovery, dynamic client registration, PKCE,
 authorization URL construction, code exchange, the loopback callback state machine, and the
 interactive coordinator. The coordinator serializes same-server flows, leases the one callback
 endpoint, observes caller and host cancellation throughout the flow, and guarantees pending-state
-cleanup. Hosts supply client metadata, browser hand-off, an async semantic credential store, and
-an authenticated enumerator (§7).
+cleanup. The managed layer supplies a stock semantic credential store and a configured
+enumerator; hosts supply client metadata, callback/browser presentation, storage paths or custom
+stores, and policy (§7).
 **Requires:** [ac-tools.md](ac-tools.md) (the tool registry, the raw (runtime-described) registration
 path, errors-as-data), [ac-provider.md](ac-provider.md) (tool specs ride every sampling request —
 the exposure that motivates the name floor defined in §2). **Required by:** nothing yet. **Interacts with:**
@@ -103,12 +111,12 @@ and per-registration — an explicit host decision, never a default.
 
 Registration walks the snapshot in server order and, for each tool: rejects an empty remote
 name; forms the registry name (default prefix `ν`; hosts MAY choose verbatim names or a custom
-prefix, accepting collisions-replace semantics as their own decision); rejects names violating
-the floor; classifies capability per `κ`; and registers the result as a raw tool
+prefix); rejects names violating the floor; rejects a name already present in the registry;
+classifies capability per `κ`; and registers the result as a raw tool
 whose spec — description and input schema — is the server's **verbatim** (a missing description
-becomes an explicit "no description provided" placeholder, not an empty string). Within one
-server, a duplicated tool name replaces the earlier entry — the same last-write-wins semantics
-as every other registration path.
+becomes an explicit "no description provided" placeholder, not an empty string). Dynamic tools
+are first-wins: a built-in, host tool, or earlier MCP tool is never overwritten by later
+wire-discovered input. Duplicate and cross-server collisions are reported as skips.
 
 The return value is the full account (R5): the sequence of registry names registered, in server
 order, and the sequence of skips, each carrying the remote name and the reason. Hosts SHOULD
@@ -155,11 +163,10 @@ arguments. The model sees a failed tool; the session continues.
   child processes waiting out then killing the child — runs detached with bounded waits; a host
   that tears down its async runtime immediately after shutdown MAY leave a child that ignores
   stdin-EOF running, and SHOULD keep the runtime alive briefly if that matters.
-- **Refresh is re-registration.** The snapshot is point-in-time; the kit does not subscribe to
-  list-changed notifications. Re-running registration replaces same-name entries and adds new
-  ones, but replacement cannot express *removal* — a tool the server dropped stays registered
-  and fails at call time as error data. Hosts that refresh SHOULD therefore rebuild the
-  registry from fresh discovery rather than mutate one in place.
+- **Refresh rebuilds the registry.** The snapshot is point-in-time; the kit does not subscribe to
+  list-changed notifications. Dynamic registration is non-destructive and therefore cannot
+  express removal or replacement inside an existing registry. Hosts that refresh SHOULD rebuild
+  the registry from fresh discovery.
 - **Lazy dial (cached catalog).** A live connection MAY export its discovered tools as a
   serializable catalog, and a host MAY register that catalog with no connection at all,
   supplying a dial factory instead. Registration performs zero dials; the first call — by any
@@ -170,12 +177,59 @@ arguments. The model sees a failed tool; the session continues.
   cached spec carries the server's read-only claim so the trust opt-in composes unchanged.
   A cached spec MAY additionally carry a host-chosen `registry_name`; dispatch still sends its
   raw `name` to the server.
-- **Catalog identity is host-enforced.** `CachedToolSpec` describes tools, not the connection
-  configuration that produced them. A host that persists specs MUST persist an identity for the
-  exact server definition beside them and MUST refuse snapshots whose identity no longer matches
-  the current definition. Keying only by a display/server name is unsafe: a same-name URL or
-  command overwrite otherwise pairs old schemas with a new dialer. Successful zero-tool
-  enumeration also needs an identity record, or it is retried on every boot.
+- **Catalog identity is enforced at persistence.** `CachedToolSpec` describes tools, not the
+  connection configuration that produced them. A persisted catalog MUST store the exact
+  definition fingerprint beside each server and refuse snapshots that no longer match. The
+  managed layer does this automatically. A custom control plane has the same obligation.
+  Successful zero-tool enumeration still needs an identity record, or it is retried every boot.
+
+### 5.1 Managed control plane
+
+`ac_mcp::managed` is the standard application-agnostic assembly of these mechanics. It is
+available with the `managed` feature (`managed` currently includes `http`) and exposes:
+
+- `ManagedMcp<S: StateStore, C: CredentialStore>`, with a synchronous `open` for the stock file
+  stores and an async constructor for injected stores;
+- ordered `mcpServers` config, definition fingerprints, and a config-bound version-2 catalog;
+- one `ConnectionPolicy` supplying a materialized stdio environment, separate connect and tool-
+  discovery timeouts, and stderr policy to probes, refresh, OAuth enumeration, and lazy dialers
+  alike; timed-out or cancelled discovery always shuts down its connection;
+- config mutation, credential removal, catalog invalidation, refresh and offline-first backfill
+  under a single mutation order;
+- `pending`, `cached`, `failed`, and `needs-auth` server snapshots plus credential status;
+- connection-free mounting from one explicit `CatalogSnapshot`, including a non-destructive
+  stock `tool_search`, an exact gated-name set for `ConditionalToolsHook`, search-install
+  accounting, and an optional host presentation transform; convenience methods load once and
+  delegate to the snapshot API;
+- a generation-bound `OAuthFlowStore` and high-level authentication that derives endpoint,
+  enabled state, scope, and client credentials from one locked durable-definition snapshot.
+
+The stock `FileStateStore` and `FileCredentialStore` keep read-only boot/status reads tolerant,
+but mutations use strict read-for-update and refuse to replace unreadable, malformed, or
+wrong-shaped files. Config mutations likewise refuse a partially rejected registry. Writes use
+same-volume atomic replacement; final files are mode `0600` and the fixed temporary directory is
+mode `0700` on Unix. Windows receives atomic replacement but this layer does not install an
+owner-only ACL. `ManagedPaths::control_paths` returns the final files plus deduplicated private
+temporary directories so an embedding can deny all of them to agent tools.
+
+Credentials are bound to the exact full server-definition fingerprint, not only server name and
+URL. Changed definitions invalidate flow generations before mutation, and authentication captures
+the definition plus flow generation under the same config lock as remove/upsert. URL-only
+unscoped rows are never claimed by bearer reads or candidate probes; a host intentionally
+migrating such data must opt in via `claim_unscoped_credentials` (or the stock synchronous
+startup variant).
+
+Both connection and provider-visible names preserve already-valid inputs. Whenever normalization
+changes an input (or catalog truncation is required), the managed layer appends a deterministic
+digest suffix. Distinct portable config keys or remote tool names therefore do not silently
+collapse merely because punctuation or delimiter repair produced the same readable prefix.
+`CatalogNamePolicy` lets an embedding preserve an established deterministic public-name contract
+for future enumerations; existing catalog names always remain verbatim.
+
+`ManagedMcp` deliberately has no application defaults. It does not choose a home directory,
+inherit ambient environment variables, discover another application's files, pick an OAuth
+callback port/path, supply product identity or browser copy, emit RPC payloads, or decide how a
+catalog description appears in a search UI.
 
 ## 6. Invariants
 
@@ -191,6 +245,8 @@ arguments. The model sees a failed tool; the session continues.
   default-prefixed name decomposes uniquely into (server, tool).
 - **I6 (total accounting).** registered ⊎ skipped = discovered, and every skip carries its
   remote name and reason.
+- **I6a (non-destructive dynamic tools).** A wire-discovered tool never replaces an existing
+  registry entry; the first entry wins and every later collision is reported as skipped.
 - **I7 (bounded results).** No rendered result exceeds the cap plus a bounded truncation note,
   cut on a character boundary.
 - **I8 (prompt failure after death).** A call on a shut-down or dead connection fails promptly
@@ -201,34 +257,37 @@ arguments. The model sees a failed tool; the session continues.
 | Concern | Owner |
 | --- | --- |
 | Handshake, discovery, registration, name floor, prefix decomposition | kit |
-| Transport choice, server naming, prefix mode, timeout, trust opt-in | host |
+| Portable server types, config fingerprint, catalog identity/invalidation | managed kit |
+| Transport translation, probe, lazy dialers, refresh/backfill, mutation ordering | managed kit |
+| Cached registration, stock `tool_search`, gated-name accounting | managed kit |
+| Config/catalog/credential persistence mechanism | injected stores; stock file stores ship in kit |
+| Storage locations and sandbox deny-read wiring | host |
+| Materialized stdio environment, timeouts, stderr mode, trust opt-in | host policy consumed by kit |
 | Argument validation against the advertised schema | server |
 | Result flattening, size cap, cancellation notification | kit |
 | Permission decisions over capability ([ac-approvals.md](ac-approvals.md)) | host |
-| Refresh policy — when to re-discover, rebuild vs. mutate | host |
-| Persisted catalog identity and invalidation on definition changes | host |
-| Surfacing skips and transport death to the operator | host |
-| Server-definition config format; importers from other tools | host (§8) |
+| When to trigger explicit refresh; surfacing status/skips | host |
+| Import sources from other applications | host (§8) |
 | OAuth metadata discovery, DCR, PKCE, authorization URL, and code exchange | kit (`http`) |
 | OAuth loopback routing, CSRF state dispatch, timeout, and cancellation | kit (`http`) |
 | OAuth stored-token probe, per-server single-flight, callback lease, cleanup, and re-enumeration sequencing | kit (`http`) |
-| OAuth client branding, browser launch, credential-store location/schema, and catalog/result mapping | host |
+| OAuth client branding, resolved callback URI, page copy, browser launch | host |
+| RPC/UI result mapping and description/search presentation | host |
 
 ## 8. Server configuration format
 
-The kit takes a **connection**, not a file: a host builds each connection from a name and a
-transport (§2) and never hands the kit a config path or document. Where server definitions come
-from is therefore host policy — but the choice is not free, because a portable definition is one
-a user can move between tools unchanged. MCP the protocol standardizes the wire, not the config;
-the standard to follow is the *de-facto* one the ecosystem converged on, not any single tool's.
+The low-level API takes a **connection**, not a file. The managed API accepts a store and ships
+the de-facto portable definition because a user should be able to move the same server block
+between tools unchanged. MCP standardizes the wire, not this file; interoperability comes from
+following the ecosystem's converged shape rather than inventing an application table.
 
-- **The de-facto shape.** A host SHOULD read and write server definitions as the `mcpServers`
-  JSON object: a map from server name to either a stdio definition
+- **The de-facto shape.** `managed::Config` reads and writes the `mcpServers` JSON object: a map
+  from server name to either a stdio definition
   `{ "command": string, "args"?: string[], "env"?: { [k]: string } }` or a remote definition
-  `{ "url": string, "headers"?: { [k]: string } }` (a host MAY tag the transport with a `type`
-  discriminant). This is the shape desktop MCP hosts, editors, and coding agents already emit, so
-  a user can paste a server block from any of them; adopting it is the difference between a config
-  a user already has and one they must translate.
+  `{ "url": string, "headers"?: { [k]: string }, "oauth"?: false | object }`. Strict per-entry
+  parsing reports malformed definitions while valid siblings remain readable; tolerant reads
+  never prevent boot, while mutations refuse any rejected registry rather than wiping it.
+  Authored map order survives read/mutate/write.
 - **Not a bespoke application table.** Embedding the same fields inside a host's own application
   config (a TOML `[mcp_servers.…]` table, say) is a valid host choice but a worse default: it
   couples the definition to one tool's config syntax, home directory, and surrounding keys, and
@@ -236,18 +295,17 @@ the standard to follow is the *de-facto* one the ecosystem converged on, not any
   SHOULD still accept the standalone `mcpServers` JSON alongside it.
 - **Other tools' configs are importers, not the contract.** A host MAY read another tool's native
   config — a JSON `mcpServers` file, or a foreign application config carrying an equivalent table
-  — and fold the definitions into its own store as a one-way convenience. Such an import is host
-  policy over untrusted input: names are re-validated against the floor (§2) and unmodeled keys
-  are dropped, never adopted. The kit sees only the resulting connections.
+  — and fold definitions into its own store as a one-way convenience. Import locations and
+  enabled sources are host policy over untrusted input; unmodeled keys are dropped. The managed
+  runtime sees only validated `ServerConfig` values.
 - **Transport reach.** The stdio definition maps onto the child-process connect path; the remote
   `url` definition maps onto the streamable-HTTP connect path (opt-in `http` feature; `headers`
   carry bearer auth). A host built without that feature MUST still report a remote definition as
   skipped with a stated reason (R5) — never silently.
-- **One translation path.** A host SHOULD implement one config-to-connection adapter and reuse it
-  for connectivity tests, live catalog export, authentication re-enumeration, and cached lazy
-  dialers. Duplicating this translation commonly drifts on inherited environment, static headers,
-  bearer applicability, or server-name normalization; those differences make a successful probe
-  poor evidence that the eventual tool call uses the same connection.
+- **One translation path.** `managed::ConnectionPolicy` and `managed::connect` are reused for
+  connectivity tests, live catalog export, authentication re-enumeration, and cached lazy dialers.
+  Hosts using the managed layer MUST inject the intended environment and deadline once rather
+  than reconstructing transports per operation.
 
 ## 9. Deferred
 
@@ -257,5 +315,9 @@ the standard to follow is the *de-facto* one the ecosystem converged on, not any
   reactive re-registration needs a story for removal (§5) first.
 - **OAuth refresh grants** — the `http` feature owns the authorization-code/PKCE protocol,
   loopback callback, and end-to-end interactive coordinator. Token refresh remains deferred.
-  Credential persistence and browser integration stay injected host seams; AC imposes semantic
-  operations and cleanup guarantees, not a storage schema or product UI.
+  AC ships semantic credential traits and a stock JSON store with Unix `0600` modes and
+  cross-platform atomic replacement; custom persistence and browser integration remain injected
+  seams. Product UI is never part of the core.
+- **Cross-process compare-and-swap** — one manager instance serializes read-modify-write
+  operations and rejects malformed inputs, but independent processes targeting the same files
+  still require a host-selected lock/CAS strategy.

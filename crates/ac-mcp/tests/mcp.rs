@@ -590,6 +590,54 @@ async fn cached_specs_register_without_a_single_dial() {
 }
 
 #[tokio::test]
+async fn dynamic_registration_never_replaces_an_existing_tool() {
+    let specs = exported_catalog().await;
+    let dialer = counting_dialer(
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mut registry = ToolRegistry::new();
+    register_cached(
+        &mut registry,
+        "test",
+        &specs,
+        dialer.clone(),
+        &RegisterOptions::default(),
+    )
+    .unwrap();
+    let before = serde_json::to_value(registry.specs()).unwrap();
+    let duplicate = register_cached(
+        &mut registry,
+        "test",
+        &specs,
+        dialer,
+        &RegisterOptions::default(),
+    )
+    .unwrap();
+    assert!(duplicate.registered.is_empty());
+    assert!(
+        duplicate
+            .skipped
+            .iter()
+            .any(|tool| tool.reason.contains("already contains"))
+    );
+    assert_eq!(serde_json::to_value(registry.specs()).unwrap(), before);
+
+    let (connection, _state) = connect().await;
+    let live = connection
+        .register_tools(&mut registry, &RegisterOptions::default())
+        .await
+        .unwrap();
+    assert!(live.registered.is_empty());
+    assert!(
+        live.skipped
+            .iter()
+            .any(|tool| tool.reason.contains("already contains"))
+    );
+    assert_eq!(serde_json::to_value(registry.specs()).unwrap(), before);
+}
+
+#[tokio::test]
 async fn cached_capability_honors_trust_annotations_opt_in_only() {
     let specs = exported_catalog().await;
     let dialer = counting_dialer(

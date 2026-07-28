@@ -114,10 +114,12 @@ dependencies = [
  "ac-provider-mock",
  "ac-runtime",
  "ac-tool",
+ "ac-tools",
  "ac-types",
  "base64",
  "futures",
  "http",
+ "indexmap 2.14.0",
  "reqwest 0.12.28",
  "rmcp",
  "serde",
@@ -128,6 +130,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

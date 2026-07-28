@@ -39,6 +39,7 @@ base64 = "0.22"
 eventsource-stream = "0.2"
 futures = "0.3"
 globset = "0.4"
+indexmap = { version = "2", features = ["serde"] }
 libc = "0.2"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -59,3 +60,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4", "v7"] }
 walkdir = "2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

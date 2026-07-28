@@ -1,7 +1,7 @@
 //! Application-agnostic loopback HTTP server that receives an OAuth
 //! `?code=&state=` redirect.
 //!
-//! Each [`OAuthCallbackServer`] owns one listener and callback registry on a
+//! Each [`crate::oauth_callback::OAuthCallbackServer`] owns one listener and callback registry on a
 //! host-configured `127.0.0.1:<port>/<path>`. It is started on demand and
 //! stopped once no auth is pending. Pending auths are keyed by the CSRF
 //! `state`: presence AND a registered match are both enforced before a code

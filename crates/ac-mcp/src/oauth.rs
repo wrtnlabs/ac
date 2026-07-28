@@ -3,8 +3,10 @@
 //! This module owns the reusable wire behavior: loopback redirect validation,
 //! RFC 9728 protected-resource discovery, RFC 8414 authorization-server
 //! discovery, RFC 7591 dynamic client registration, PKCE S256, authorization
-//! URL construction, and authorization-code exchange. Hosts still own their
-//! config and token stores, browser hand-off, RPC framing, and product copy.
+//! URL construction, and authorization-code exchange. The optional managed
+//! control plane supplies portable config, stock credential persistence, and configured
+//! enumeration; embeddings still choose storage locations, browser hand-off,
+//! RPC framing, identity, and product copy.
 
 use std::collections::HashMap;
 use std::fmt;
