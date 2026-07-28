@@ -11,10 +11,12 @@
 //! says so (`sandbox.mode == "off"`). A host that needs isolation installs a
 //! launcher (see the `ac-sandbox` crate).
 
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ac_approvals::{ApprovalConfig, RoleContainment, Verdict};
 use ac_tool::{Capability, CommandSpec, PathPolicy, SandboxMode, Tool, ToolCtx, ToolOutput};
@@ -39,7 +41,7 @@ impl RoleContainment for PolicyContainment<'_> {
 }
 
 /// Per-stream capture cap (~32 KiB); the envelope's tails stop here. Output
-/// beyond it is flagged AND spilled in full to a log file (see [`SpillSink`]).
+/// beyond it is flagged and spilled in full to a transcript.
 const STREAM_CAP: usize = 32 * 1024;
 /// Full-transcript spill cap (both streams combined); the spill file itself
 /// notes truncation when it is hit.
@@ -50,133 +52,27 @@ const SPILL_CAP: u64 = 8 * 1024 * 1024;
 /// The directory is created lazily, only when a spill actually happens.
 pub struct ShellSpillDir(pub PathBuf);
 
-/// Lazily-created spill file shared by both stream drains. Until the first
-/// overflow byte the transcript is only buffered in memory (bounded: at most
-/// both in-memory heads plus one read chunk, since overflow triggers
-/// activation); on first overflow the file is created and the buffer flushed,
-/// so the file always carries the FULL transcript from byte 0.
-///
-/// Format: both streams interleaved in arrival order, as a merged terminal
-/// shows them — chunk-granular, so ordering across the two streams is
-/// best-effort. Chosen over sectioning because it needs no second buffering
-/// pass and keeps the file readable top-to-bottom as the command ran.
-///
-/// Spill failures are never tool errors: the in-memory tails still ride the
-/// result; the sink just goes dead (`failed`) so memory stays bounded.
-struct SpillSink {
-    dir: PathBuf,
-    state: Mutex<SpillState>,
+/// Transcripts routinely carry secrets. Force 0700 on their directory and
+/// 0600/create-new on each file.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
-#[derive(Default)]
-struct SpillState {
-    prelude: Vec<u8>,
-    file: Option<std::fs::File>,
-    path: Option<PathBuf>,
-    written: u64,
-    capped: bool,
-    failed: bool,
-}
-
-impl SpillSink {
-    fn new(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            state: Mutex::new(SpillState::default()),
-        }
+fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-
-    fn push(&self, bytes: &[u8]) {
-        let mut state = self.state.lock().expect("spill lock poisoned");
-        if state.failed {
-            return;
-        }
-        if state.file.is_some() {
-            Self::append(&mut state, bytes);
-        } else {
-            state.prelude.extend_from_slice(bytes);
-        }
-    }
-
-    /// First overflow byte seen: create the file and flush everything buffered.
-    fn activate(&self) {
-        let mut state = self.state.lock().expect("spill lock poisoned");
-        if state.file.is_some() || state.failed {
-            return;
-        }
-        let created = Self::create_private_dir(&self.dir).and_then(|_| {
-            let path = self.dir.join(format!("{}.log", uuid::Uuid::new_v4()));
-            Self::create_private_file(&path).map(|f| (f, path))
-        });
-        match created {
-            Ok((file, path)) => {
-                state.file = Some(file);
-                state.path = Some(path);
-                let prelude = std::mem::take(&mut state.prelude);
-                Self::append(&mut state, &prelude);
-            }
-            Err(_) => {
-                state.failed = true;
-                state.prelude = Vec::new();
-            }
-        }
-    }
-
-    /// Spill transcripts carry whatever the command printed — routinely
-    /// secrets — and the default dir lives under the world-writable tmp root,
-    /// so on unix the directory is forced to 0700 (tightening a pre-existing
-    /// one; failing if it belongs to someone else) and each file is 0600,
-    /// opened with `create_new` so a pre-planted name can never be followed.
-    fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-        Ok(())
-    }
-
-    fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        opts.open(path)
-    }
-
-    fn append(state: &mut SpillState, bytes: &[u8]) {
-        use std::io::Write;
-        if state.capped {
-            return;
-        }
-        let take = bytes.len().min((SPILL_CAP - state.written) as usize);
-        let Some(file) = state.file.as_mut() else {
-            return;
-        };
-        if file.write_all(&bytes[..take]).is_err() {
-            state.failed = true;
-            return;
-        }
-        state.written += take as u64;
-        if take < bytes.len() {
-            state.capped = true;
-            let _ = file.write_all(b"\n[spill truncated: transcript exceeds the spill cap]\n");
-        }
-    }
-
-    /// The spill file's path, iff a spill happened (flushed).
-    fn finish(&self) -> Option<PathBuf> {
-        use std::io::Write;
-        let mut state = self.state.lock().expect("spill lock poisoned");
-        if let Some(file) = state.file.as_mut() {
-            let _ = file.flush();
-        }
-        state.path.clone()
-    }
+    opts.open(path)
 }
 /// Hard wall-clock timeout for a command.
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -189,22 +85,420 @@ const GRACE: Duration = Duration::from_secs(5);
 /// `process_group(0)` in `run`), sweeping any processes it forked. A negative
 /// pid targets the group; `ESRCH` when the group is already gone is harmless.
 #[cfg(unix)]
-fn kill_process_group(pid: Option<u32>) {
+fn kill_process_group(pid: Option<u32>, signal: libc::c_int) {
     if let Some(pid) = pid {
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(-(pid as i32), signal);
         }
     }
 }
 #[cfg(not(unix))]
-fn kill_process_group(_pid: Option<u32>) {}
+fn kill_process_group(_pid: Option<u32>, _signal: i32) {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKillReason {
+    Timeout,
+    Cancelled,
+}
+
+/// Transcript/capture policy for [`execute_shell`].
+#[derive(Debug, Clone)]
+pub struct ShellCaptureOptions {
+    pub tail_bytes: usize,
+    pub tail_lines: usize,
+    pub transcript_dir: PathBuf,
+    /// Create the transcript before spawn even when output stays under the
+    /// in-memory cap. Product hosts commonly use this for durable diagnostics.
+    pub always_transcript: bool,
+    /// Maximum transcript bytes across stdout+stderr. `None` is unlimited.
+    pub transcript_cap: Option<u64>,
+}
+
+impl ShellCaptureOptions {
+    pub fn overflow_only(transcript_dir: PathBuf) -> Self {
+        Self {
+            tail_bytes: STREAM_CAP,
+            tail_lines: usize::MAX,
+            transcript_dir,
+            always_transcript: false,
+            transcript_cap: Some(SPILL_CAP),
+        }
+    }
+}
+
+/// Host-configured command request over AC's shared shell executor.
+///
+/// The stock `shell` tool and app-specific schema/copy adapters both use this
+/// type, keeping sandbox preparation, approval classification, capture,
+/// timeout/cancel, process-group cleanup, and reaping in one implementation.
+pub struct ShellExecRequest {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Original model-authored command line used by `ac-approvals`.
+    pub command_for_approval: String,
+    pub cwd: PathBuf,
+    /// Cwd handed to the sandbox launcher when the real cwd is read-only. The
+    /// prepared process is switched back to `cwd` after policy derivation.
+    pub sandbox_cwd: Option<PathBuf>,
+    pub env: Vec<(OsString, OsString)>,
+    pub timeout: Duration,
+    pub kill_grace: Duration,
+    pub capture: ShellCaptureOptions,
+}
+
+#[derive(Debug)]
+pub struct ShellExecResult {
+    pub exit_code: Option<i32>,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub truncated: bool,
+    pub duration: Duration,
+    pub sandbox_mode: SandboxMode,
+    pub output_path: Option<PathBuf>,
+    pub killed: Option<ShellKillReason>,
+}
+
+struct Transcript {
+    dir: PathBuf,
+    cap: Option<u64>,
+    state: Mutex<TranscriptState>,
+}
+
+#[derive(Default)]
+struct TranscriptState {
+    prelude: Vec<u8>,
+    file: Option<std::fs::File>,
+    path: Option<PathBuf>,
+    written: u64,
+    capped: bool,
+    failed: bool,
+}
+
+impl Transcript {
+    fn new(dir: PathBuf, cap: Option<u64>) -> Self {
+        Self {
+            dir,
+            cap,
+            state: Mutex::new(TranscriptState::default()),
+        }
+    }
+
+    fn activate(&self) -> std::io::Result<()> {
+        let mut state = self.state.lock().expect("transcript lock poisoned");
+        if state.file.is_some() {
+            return Ok(());
+        }
+        if state.failed {
+            return Err(std::io::Error::other("transcript is unavailable"));
+        }
+        let created = create_private_dir(&self.dir).and_then(|_| {
+            let path = self.dir.join(format!("{}.log", uuid::Uuid::new_v4()));
+            create_private_file(&path).map(|file| (file, path))
+        });
+        let (file, path) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                state.failed = true;
+                state.prelude.clear();
+                return Err(error);
+            }
+        };
+        state.file = Some(file);
+        state.path = Some(path);
+        let prelude = std::mem::take(&mut state.prelude);
+        self.append_locked(&mut state, &prelude);
+        Ok(())
+    }
+
+    fn push(&self, bytes: &[u8]) {
+        let mut state = self.state.lock().expect("transcript lock poisoned");
+        if state.failed {
+            return;
+        }
+        if state.file.is_some() {
+            self.append_locked(&mut state, bytes);
+        } else {
+            state.prelude.extend_from_slice(bytes);
+        }
+    }
+
+    fn append_locked(&self, state: &mut TranscriptState, bytes: &[u8]) {
+        use std::io::Write;
+        if state.capped {
+            return;
+        }
+        let take = self
+            .cap
+            .map(|cap| bytes.len().min(cap.saturating_sub(state.written) as usize))
+            .unwrap_or(bytes.len());
+        let Some(file) = state.file.as_mut() else {
+            return;
+        };
+        if file.write_all(&bytes[..take]).is_err() {
+            state.failed = true;
+            return;
+        }
+        state.written += take as u64;
+        if take < bytes.len() {
+            state.capped = true;
+            let _ = file.write_all(b"\n[transcript truncated: output exceeds the cap]\n");
+        }
+    }
+
+    fn finish(&self) -> Option<PathBuf> {
+        use std::io::Write;
+        let mut state = self.state.lock().expect("transcript lock poisoned");
+        if let Some(file) = state.file.as_mut() {
+            let _ = file.flush();
+        }
+        state.path.clone()
+    }
+}
+
+#[derive(Default)]
+struct TailCapture {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    dropped: bool,
+}
+
+impl TailCapture {
+    fn push(&mut self, chunk: &[u8], cap: usize) {
+        self.bytes += chunk.len();
+        self.chunks.push_back(chunk.to_vec());
+        let slack = cap.saturating_mul(4).max(cap);
+        while self.bytes > slack && self.chunks.len() > 1 {
+            let removed = self.chunks.pop_front().expect("len > 1");
+            self.bytes -= removed.len();
+            self.dropped = true;
+        }
+    }
+
+    fn concat(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.bytes);
+        for chunk in &self.chunks {
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+}
+
+/// Return the last `max_bytes` and then last `max_lines` of a stream.
+pub fn tail_output(buf: &[u8], max_bytes: usize, max_lines: usize) -> (String, bool) {
+    let byte_cut = buf.len() > max_bytes;
+    let trimmed = if byte_cut {
+        &buf[buf.len() - max_bytes..]
+    } else {
+        buf
+    };
+    let text = String::from_utf8_lossy(trimmed);
+    let lines: Vec<&str> = text.split('\n').collect();
+    if !byte_cut && lines.len() <= max_lines {
+        return (text.into_owned(), false);
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    (lines[start..].join("\n"), true)
+}
+
+async fn drain_tail<R>(
+    reader: Option<R>,
+    capture: Arc<Mutex<TailCapture>>,
+    transcript: Arc<Transcript>,
+    cap: usize,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut reader) = reader else { return };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                transcript.push(&chunk[..n]);
+                let overflowed = {
+                    let mut capture = capture.lock().expect("capture lock poisoned");
+                    capture.push(&chunk[..n], cap);
+                    capture.dropped || capture.bytes > cap
+                };
+                if overflowed {
+                    // Lazy transcript failures are non-fatal; the bounded tail
+                    // remains useful. Eager activation was checked pre-spawn.
+                    let _ = transcript.activate();
+                }
+            }
+        }
+    }
+}
+
+/// Execute a command through AC's generic shell mechanisms.
+pub async fn execute_shell(
+    ctx: Arc<ToolCtx>,
+    request: ShellExecRequest,
+) -> Result<ShellExecResult, String> {
+    let started = Instant::now();
+    let (mut command, sandbox_mode) = match &ctx.sandbox {
+        Some(launcher) => {
+            let spec = CommandSpec::new(
+                &request.program,
+                request.args.iter().map(String::as_str),
+                request
+                    .sandbox_cwd
+                    .clone()
+                    .unwrap_or_else(|| request.cwd.clone()),
+            );
+            let prepared = launcher
+                .prepare(&spec)
+                .map_err(|error| format!("sandbox refused to run the command: {error}"))?;
+            (prepared.command, prepared.mode)
+        }
+        None => {
+            let mut command = tokio::process::Command::new(&request.program);
+            command.args(&request.args);
+            (command, SandboxMode::Off)
+        }
+    };
+
+    if let Some(cfg) = ctx.extensions.get::<ApprovalConfig>() {
+        let unknown = if matches!(sandbox_mode, SandboxMode::Strict) {
+            cfg.unknown
+        } else {
+            cfg.unknown.join(Verdict::Prompt)
+        };
+        let containment = PolicyContainment(ctx.policy.as_ref());
+        let class = ac_approvals::classify(
+            &request.command_for_approval,
+            &cfg.policy,
+            &containment,
+            unknown,
+        );
+        if ac_approvals::without_channel(class.verdict) == Verdict::Forbidden {
+            let mut message = String::from("command refused by approval policy");
+            let reasons = class.refusal_reasons();
+            if !reasons.is_empty() {
+                message.push_str(": ");
+                message.push_str(&reasons.join("; "));
+            }
+            return Err(message);
+        }
+    }
+
+    command
+        .current_dir(&request.cwd)
+        .envs(request.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let transcript = Arc::new(Transcript::new(
+        request.capture.transcript_dir.clone(),
+        request.capture.transcript_cap,
+    ));
+    if request.capture.always_transcript {
+        transcript
+            .activate()
+            .map_err(|error| format!("failed to open output log: {error}"))?;
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn command: {error}"))?;
+    let pid = child.id();
+    let stdout_cap = Arc::new(Mutex::new(TailCapture::default()));
+    let stderr_cap = Arc::new(Mutex::new(TailCapture::default()));
+    let out_task = tokio::spawn(drain_tail(
+        child.stdout.take(),
+        stdout_cap.clone(),
+        transcript.clone(),
+        request.capture.tail_bytes,
+    ));
+    let err_task = tokio::spawn(drain_tail(
+        child.stderr.take(),
+        stderr_cap.clone(),
+        transcript.clone(),
+        request.capture.tail_bytes,
+    ));
+
+    let mut killed = None;
+    let mut exit_code = None;
+    tokio::select! {
+        status = child.wait() => {
+            exit_code = status.ok().and_then(|status| status.code());
+        }
+        _ = tokio::time::sleep(request.timeout) => {
+            killed = Some(ShellKillReason::Timeout);
+        }
+        _ = ctx.cancel.cancelled() => {
+            killed = Some(ShellKillReason::Cancelled);
+        }
+    }
+
+    if killed.is_some() {
+        kill_process_group(pid, libc::SIGTERM);
+        match tokio::time::timeout(request.kill_grace, child.wait()).await {
+            Ok(status) => exit_code = status.ok().and_then(|status| status.code()),
+            Err(_) => {
+                kill_process_group(pid, libc::SIGKILL);
+                if let Ok(status) = tokio::time::timeout(request.kill_grace, child.wait()).await {
+                    exit_code = status.ok().and_then(|status| status.code());
+                }
+            }
+        }
+    }
+
+    // Always sweep the process group, even after a successful leader exit.
+    // Otherwise `sh -c 'job &'` can leak a background grandchild and keep its
+    // pipes alive beyond the tool call.
+    kill_process_group(pid, libc::SIGKILL);
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(request.kill_grace, child.wait()).await;
+
+    let _ = tokio::time::timeout(request.kill_grace, async {
+        let _ = out_task.await;
+        let _ = err_task.await;
+    })
+    .await;
+
+    let (stdout_bytes, stdout_dropped) = {
+        let capture = stdout_cap.lock().expect("capture lock poisoned");
+        (capture.concat(), capture.dropped)
+    };
+    let (stderr_bytes, stderr_dropped) = {
+        let capture = stderr_cap.lock().expect("capture lock poisoned");
+        (capture.concat(), capture.dropped)
+    };
+    let (stdout_tail, stdout_cut) = tail_output(
+        &stdout_bytes,
+        request.capture.tail_bytes,
+        request.capture.tail_lines,
+    );
+    let (stderr_tail, stderr_cut) = tail_output(
+        &stderr_bytes,
+        request.capture.tail_bytes,
+        request.capture.tail_lines,
+    );
+
+    Ok(ShellExecResult {
+        exit_code,
+        stdout_tail,
+        stderr_tail,
+        truncated: stdout_dropped || stderr_dropped || stdout_cut || stderr_cut,
+        duration: started.elapsed(),
+        sandbox_mode,
+        output_path: transcript.finish(),
+        killed,
+    })
+}
 
 /// Run a shell command with `sh -c` inside the workspace.
 ///
 /// The working directory defaults to the workspace root and must resolve inside
 /// it. Output is capped per stream and the command is killed after 120 seconds
-/// or on cancellation. NOTE: there is no OS sandbox in this phase — containment
-/// is the working directory only.
+/// or on cancellation. Execution is prepared by the host-provided sandbox, and
+/// the resulting capability is classified by the host approval policy before
+/// the process is spawned.
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ShellInput {
     /// The command line, executed as `sh -c "<command>"`.
@@ -214,7 +508,7 @@ pub struct ShellInput {
     pub cwd: Option<String>,
 }
 
-/// Executes shell commands (cwd-contained; no OS sandbox yet).
+/// Executes shell commands through AC's shared sandboxed process executor.
 pub struct Shell;
 
 impl Tool for Shell {
@@ -239,7 +533,7 @@ impl Tool for Shell {
     }
 
     fn capability(&self) -> Capability {
-        Capability::Mutating
+        Capability::Guarded
     }
 
     fn run(
@@ -254,194 +548,63 @@ impl Tool for Shell {
                 Err(e) => return ToolOutput::error(e.to_string()),
             };
 
-            // Build the command through the OS-sandbox seam when a launcher is
-            // installed; otherwise run it unsandboxed and mark the envelope. A
-            // launcher that cannot enforce its policy fails closed — we never
-            // fall back to an unsandboxed spawn behind the caller's back. Built
-            // here (before classification) but NOT spawned, so the achieved
-            // sandbox mode can inform the approval verdict while a `forbidden`
-            // still spawns nothing (I1).
-            let (mut command, sandbox_mode) = match &ctx.sandbox {
-                Some(launcher) => {
-                    let spec =
-                        CommandSpec::new("sh", ["-c", input.command.as_str()], resolved.clone());
-                    match launcher.prepare(&spec) {
-                        Ok(prepared) => (prepared.command, prepared.mode),
-                        Err(e) => {
-                            return ToolOutput::error(format!(
-                                "sandbox refused to run the command: {e}"
-                            ));
-                        }
-                    }
-                }
-                None => {
-                    let mut c = tokio::process::Command::new("sh");
-                    c.arg("-c").arg(&input.command).current_dir(&resolved);
-                    (c, SandboxMode::Off)
-                }
-            };
-
-            // Pre-flight intent classification (ac-approvals). When the host has
-            // installed an ApprovalConfig, classify the command line before the
-            // built command is spawned (I1): a `forbidden` verdict refuses here,
-            // as data the model reads (R3). No interactive approval channel is
-            // wired yet, so `prompt` resolves to `forbidden` (ac-approvals §3) — a
-            // host that wires a channel is where interactive prompting lands.
-            // The unknown default `U` is honored only under STRICT kernel
-            // containment; where the achieved mode is degraded or off, `U` is
-            // clamped up to at least `prompt`, so a host that set `U = safe`
-            // cannot silently allow unknown commands on an unsandboxed host (§2).
-            // Classification composes with — never replaces — the path-policy and
-            // sandbox layers (I5). Absent a config, the command runs unclassified.
-            if let Some(cfg) = ctx.extensions.get::<ApprovalConfig>() {
-                let unknown = if matches!(sandbox_mode, SandboxMode::Strict) {
-                    cfg.unknown
-                } else {
-                    cfg.unknown.join(Verdict::Prompt)
-                };
-                let containment = PolicyContainment(ctx.policy.as_ref());
-                let class =
-                    ac_approvals::classify(&input.command, &cfg.policy, &containment, unknown);
-                if ac_approvals::without_channel(class.verdict) == Verdict::Forbidden {
-                    let mut msg = String::from("command refused by approval policy");
-                    let reasons = class.refusal_reasons();
-                    if !reasons.is_empty() {
-                        msg.push_str(": ");
-                        msg.push_str(&reasons.join("; "));
-                    }
-                    return ToolOutput::error(msg);
-                }
-            }
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            // Own process group so we can kill the command AND anything it forks.
-            #[cfg(unix)]
-            command.process_group(0);
-
-            let mut child = match command.spawn() {
-                Ok(c) => c,
-                Err(e) => return ToolOutput::error(format!("failed to spawn command: {e}")),
-            };
-            let pid = child.id();
-
             let spill_dir = ctx
                 .extensions
                 .get::<ShellSpillDir>()
                 .map(|d| d.0.clone())
                 .unwrap_or_else(|| std::env::temp_dir().join("ac-shell-spill"));
-            let spill = Arc::new(SpillSink::new(spill_dir));
-
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-            let out_task = {
-                let spill = spill.clone();
-                tokio::spawn(async move { drain(stdout, spill).await })
+            let execution = match execute_shell(
+                ctx,
+                ShellExecRequest {
+                    program: "sh".to_string(),
+                    args: vec!["-c".to_string(), input.command.clone()],
+                    command_for_approval: input.command,
+                    cwd: resolved,
+                    sandbox_cwd: None,
+                    env: vec![],
+                    timeout: TIMEOUT,
+                    kill_grace: GRACE,
+                    capture: ShellCaptureOptions::overflow_only(spill_dir),
+                },
+            )
+            .await
+            {
+                Ok(execution) => execution,
+                Err(error) => return ToolOutput::error(error),
             };
-            let err_task = {
-                let spill = spill.clone();
-                tokio::spawn(async move { drain(stderr, spill).await })
-            };
-
-            let mut killed: Option<&str> = None;
-            let mut exit_code: Option<i32> = None;
-
-            tokio::select! {
-                status = child.wait() => {
-                    exit_code = status.ok().and_then(|s| s.code());
-                }
-                _ = tokio::time::sleep(TIMEOUT) => {
-                    killed = Some("timeout");
-                }
-                _ = ctx.cancel.cancelled() => {
-                    killed = Some("cancelled");
-                }
-            }
-
-            // Whether the command exited or timed out, sweep its process group so
-            // no forked/backgrounded child survives the call or keeps a pipe open
-            // past the drain grace. Then reap the leader (best-effort, bounded).
-            let _ = child.start_kill();
-            kill_process_group(pid);
-            let _ = tokio::time::timeout(GRACE, child.wait()).await;
-
-            // Killing the group closes the pipes, so the drains finish promptly;
-            // still bound them so a pathological case can't hang the tool.
-            let (stdout_tail, out_trunc) = match tokio::time::timeout(GRACE, out_task).await {
-                Ok(Ok(v)) => v,
-                _ => (String::new(), true),
-            };
-            let (stderr_tail, err_trunc) = match tokio::time::timeout(GRACE, err_task).await {
-                Ok(Ok(v)) => v,
-                _ => (String::new(), true),
-            };
-            let truncated = out_trunc || err_trunc;
 
             let mut result = serde_json::json!({
-                "exit_code": exit_code,
-                "stdout_tail": stdout_tail,
-                "stderr_tail": stderr_tail,
-                "sandbox": { "mode": sandbox_mode.as_str() },
+                "exit_code": execution.exit_code,
+                "stdout_tail": execution.stdout_tail,
+                "stderr_tail": execution.stderr_tail,
+                "sandbox": { "mode": execution.sandbox_mode.as_str() },
             });
-            if truncated {
+            if execution.truncated {
                 result["truncated"] = serde_json::Value::Bool(true);
             }
-            if let Some(path) = spill.finish() {
+            if let Some(path) = execution.output_path {
                 result["output_path"] = serde_json::Value::String(path.display().to_string());
             }
-            if let Some(reason) = killed {
-                result["killed"] = serde_json::Value::String(reason.to_string());
+            if let Some(reason) = execution.killed {
+                result["killed"] = serde_json::Value::String(
+                    match reason {
+                        ShellKillReason::Timeout => "timeout",
+                        ShellKillReason::Cancelled => "cancelled",
+                    }
+                    .to_string(),
+                );
             }
 
             let body = serde_json::to_string(&result)
                 .unwrap_or_else(|_| "{\"error\":\"failed to encode result\"}".to_string());
 
-            if killed.is_some() {
+            if execution.killed.is_some() {
                 ToolOutput::error(body)
             } else {
                 ToolOutput::ok(body)
             }
         })
     }
-}
-
-/// Read a child pipe to EOF, keeping the first [`STREAM_CAP`] bytes in memory
-/// as the envelope's tail while teeing EVERY byte into the shared spill sink;
-/// the sink is activated (file created, buffer flushed) on this stream's first
-/// overflow byte. Returns the captured text and whether output overflowed.
-async fn drain<R>(reader: Option<R>, spill: Arc<SpillSink>) -> (String, bool)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    let Some(mut reader) = reader else {
-        return (String::new(), false);
-    };
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut truncated = false;
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => {
-                spill.push(&chunk[..n]);
-                if buf.len() < STREAM_CAP {
-                    let take = (STREAM_CAP - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
-                    if take < n && !truncated {
-                        truncated = true;
-                        spill.activate();
-                    }
-                } else if !truncated {
-                    truncated = true;
-                    spill.activate();
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    (String::from_utf8_lossy(&buf).into_owned(), truncated)
 }
 
 #[cfg(test)]
@@ -482,9 +645,11 @@ mod tests {
         // ...carries bytes beyond the in-memory head...
         let spilled = std::fs::read(&path).unwrap();
         assert!(spilled.len() > STREAM_CAP, "only {} bytes", spilled.len());
-        // ...and is the transcript from byte 0: its head equals the tail head.
-        let head = v["stdout_tail"].as_str().unwrap().as_bytes();
-        assert_eq!(&spilled[..head.len()], head);
+        // ...and carries the returned tail at its end while preserving the
+        // transcript from byte zero.
+        let tail = v["stdout_tail"].as_str().unwrap().as_bytes();
+        assert!(spilled.ends_with(tail));
+        assert!(spilled.starts_with(b"1\n2\n3\n"));
     }
 
     #[cfg(unix)]

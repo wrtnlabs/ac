@@ -1,12 +1,18 @@
-//! Layered skill discovery, mirroring the codex-rs skill loader's semantics:
-//! each layer root is walked recursively (bounded depth) for files named
-//! `SKILL.md`, every candidate is validated with a loud skip reason, duplicate
-//! *paths* are deduped with the earlier layer winning, and duplicate *names*
-//! are allowed — ambiguity is resolved at mention-selection time, not by
-//! shadowing at discovery time.
+//! Layered skill discovery.
+//!
+//! AC supports two generic discovery modes:
+//! - [`ResolverMode::Recursive`] preserves the codex-style default: bounded
+//!   recursive scanning, canonical-path deduplication, and directory-name
+//!   fallback when frontmatter omits `name`.
+//! - [`ResolverMode::DirectChildren`] is AC's optional ordered direct-child
+//!   policy: only direct child directories are candidates, layers are visited
+//!   in caller order, and a successfully loaded directory shadows the same
+//!   directory name in lower-priority layers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value};
 
 use crate::frontmatter;
 
@@ -14,55 +20,62 @@ use crate::frontmatter;
 /// are truncated on a char boundary with a marker.
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// How deep below a layer root the walk looks for `SKILL.md` files
-/// (codex-rs uses the same depth-6 bound).
 const MAX_SCAN_DEPTH: usize = 6;
-
-/// Directories scanned per layer root before the walk stops (codex-rs bounds
-/// its walk the same way). Hitting the cap is reported loudly in
-/// [`Listing::skipped`], never silently.
 const MAX_SCAN_DIRS: usize = 2000;
 
-/// A validated skill: one `SKILL.md` file on disk.
-#[derive(Debug, Clone)]
-pub struct Skill {
-    /// From frontmatter `name`, falling back to the directory name when the
-    /// field is absent.
+/// Standard agentskills manifest fields, with nested metadata preserved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkillManifest {
     pub name: String,
     pub description: String,
-    /// The skill directory (containing SKILL.md); companion `scripts/`,
-    /// `references/`, `assets/` live under it.
-    pub dir: PathBuf,
-    /// Absolute (canonicalized) path to the SKILL.md file — the locator the
-    /// model sees in the catalog and reads itself.
-    pub skill_md: PathBuf,
-    /// Name of the [`SkillLayer`] that supplied it.
-    pub layer: String,
-    /// Every frontmatter field as written, unknown keys included — hosts pick
-    /// the ones they understand without re-parsing SKILL.md.
-    pub fields: BTreeMap<String, String>,
+    pub license: Option<String>,
+    pub compatibility: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub metadata: Option<Map<String, Value>>,
 }
 
-/// A candidate that did not make the listing, and why — nothing is ever left
-/// out silently.
+#[derive(Debug, Clone)]
+pub struct ParsedSkillMd {
+    pub manifest: SkillManifest,
+    pub fields: Map<String, Value>,
+    pub body: String,
+}
+
+/// A validated skill backed by one SKILL.md file.
+#[derive(Debug, Clone)]
+pub struct Skill {
+    pub name: String,
+    pub description: String,
+    /// Direct child entry name. For recursively discovered skills this is the
+    /// immediate parent directory of SKILL.md.
+    pub dir_name: String,
+    /// Canonical skill directory.
+    pub dir: PathBuf,
+    /// Path as encountered beneath the configured layer root.
+    pub source_dir: PathBuf,
+    /// Canonical SKILL.md path.
+    pub skill_md: PathBuf,
+    pub layer: String,
+    /// Every parsed frontmatter field, including unknown nested fields.
+    pub fields: Map<String, Value>,
+    pub manifest: SkillManifest,
+    /// Markdown after the frontmatter delimiter.
+    pub body: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SkippedSkill {
     pub dir: PathBuf,
     pub reason: String,
 }
 
-/// One place skills live: a root whose subtree is scanned for `SKILL.md`
-/// files. Hosts hand [`SkillsResolver`] layers in precedence order (e.g.
-/// user, then project, then bundled); precedence decides listing order and
-/// which layer wins when two roots reach the *same* file on disk.
+/// One skill root, supplied in precedence order.
 #[derive(Debug, Clone)]
 pub struct SkillLayer {
     pub name: String,
     pub root: PathBuf,
 }
 
-/// Everything a scan found: the valid skills plus every candidate that was
-/// left out, with the reason.
 #[derive(Debug, Clone, Default)]
 pub struct Listing {
     pub skills: Vec<Skill>,
@@ -81,27 +94,50 @@ pub enum LoadError {
     Invalid { path: PathBuf, reason: String },
 }
 
-/// Scans an ordered set of [`SkillLayer`]s. Disk is read fresh on every
-/// call — skills added or edited between calls are picked up without cache
-/// invalidation, and a missing or unreadable layer root simply contributes
-/// zero skills (hosts may point at directories that don't exist yet).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResolverMode {
+    /// Recursively scan each root and deduplicate canonical files.
+    #[default]
+    Recursive,
+    /// Scan direct child directories and shadow by directory name.
+    DirectChildren,
+}
+
+/// Fresh-scanning resolver over an ordered set of layers.
 pub struct SkillsResolver {
     layers: Vec<SkillLayer>,
+    mode: ResolverMode,
 }
 
 impl SkillsResolver {
-    /// `layers` in precedence order — earlier layers list first, and win
-    /// path-dedup when two roots reach the same SKILL.md.
+    /// Recursive/canonical-path default.
     pub fn new(layers: Vec<SkillLayer>) -> Self {
-        Self { layers }
+        Self {
+            layers,
+            mode: ResolverMode::Recursive,
+        }
     }
 
-    /// Scan every layer and report both the skills and the skipped
-    /// candidates. Within a layer skills sort by path; across layers they
-    /// follow layer precedence order. Duplicate names are kept (mention
-    /// selection treats them as ambiguous); duplicate canonical paths are
-    /// skipped with a reason.
+    /// Ordered direct-child scanning with directory-name shadowing.
+    pub fn direct_children(layers: Vec<SkillLayer>) -> Self {
+        Self {
+            layers,
+            mode: ResolverMode::DirectChildren,
+        }
+    }
+
+    pub fn mode(&self) -> ResolverMode {
+        self.mode
+    }
+
     pub fn list(&self) -> Listing {
+        match self.mode {
+            ResolverMode::Recursive => self.list_recursive(),
+            ResolverMode::DirectChildren => self.list_direct_children(),
+        }
+    }
+
+    fn list_recursive(&self) -> Listing {
         let mut listing = Listing::default();
         let mut seen_paths: BTreeSet<PathBuf> = BTreeSet::new();
         for layer in &self.layers {
@@ -116,18 +152,14 @@ impl SkillsResolver {
                 });
             }
             for skill_md in files {
-                match read_skill(&skill_md, &layer.name) {
-                    Ok(skill) => {
-                        if seen_paths.contains(&skill.skill_md) {
-                            listing.skipped.push(SkippedSkill {
-                                dir: skill.dir,
-                                reason: "already listed via an earlier layer".to_string(),
-                            });
-                        } else {
-                            seen_paths.insert(skill.skill_md.clone());
-                            listing.skills.push(skill);
-                        }
+                match read_skill(&skill_md, &layer.name, ManifestPolicy::recursive()) {
+                    Ok(skill) if seen_paths.insert(skill.skill_md.clone()) => {
+                        listing.skills.push(skill);
                     }
+                    Ok(skill) => listing.skipped.push(SkippedSkill {
+                        dir: skill.source_dir,
+                        reason: "already listed via an earlier layer's canonical path".to_string(),
+                    }),
                     Err(reason) => listing.skipped.push(SkippedSkill {
                         dir: skill_md.parent().unwrap_or(&layer.root).to_path_buf(),
                         reason,
@@ -138,16 +170,91 @@ impl SkillsResolver {
         listing
     }
 
-    /// First listed skill with this exact name, against a fresh scan. Never
-    /// joins `name` into a filesystem path — a traversal-shaped name cannot
-    /// resolve to anything.
+    fn list_direct_children(&self) -> Listing {
+        let mut listing = Listing::default();
+        let mut seen_directories: BTreeSet<String> = BTreeSet::new();
+
+        for layer in &self.layers {
+            let Ok(entries) = std::fs::read_dir(&layer.root) else {
+                continue;
+            };
+            let mut entries: Vec<_> = entries.flatten().collect();
+            entries.sort_by_key(|entry| entry.file_name());
+
+            for entry in entries {
+                let Ok(file_type) = entry.file_type() else {
+                    listing.skipped.push(SkippedSkill {
+                        dir: entry.path(),
+                        reason: "cannot determine directory entry type".to_string(),
+                    });
+                    continue;
+                };
+                // Symlinked directories are not direct-child candidates.
+                if !file_type.is_dir() {
+                    continue;
+                }
+                let Some(dir_name) = entry.file_name().to_str().map(str::to_string) else {
+                    listing.skipped.push(SkippedSkill {
+                        dir: entry.path(),
+                        reason: "skill directory name is not valid UTF-8".to_string(),
+                    });
+                    continue;
+                };
+                if !is_valid_direct_skill_name(&dir_name) {
+                    listing.skipped.push(SkippedSkill {
+                        dir: entry.path(),
+                        reason: format!(
+                            "invalid direct-child skill directory {dir_name:?}: expected ^[a-z][a-z0-9-]*$"
+                        ),
+                    });
+                    continue;
+                }
+                let skill_md = entry.path().join("SKILL.md");
+                if !skill_md.is_file() {
+                    continue;
+                }
+                if seen_directories.contains(&dir_name) {
+                    listing.skipped.push(SkippedSkill {
+                        dir: entry.path(),
+                        reason: format!("directory {dir_name:?} is shadowed by an earlier layer"),
+                    });
+                    continue;
+                }
+
+                match read_direct_skill(&layer.root, &skill_md, &layer.name) {
+                    Ok(skill) => {
+                        seen_directories.insert(dir_name);
+                        listing.skills.push(skill);
+                    }
+                    Err(reason) => listing.skipped.push(SkippedSkill {
+                        dir: entry.path(),
+                        reason,
+                    }),
+                }
+            }
+        }
+
+        listing.skills.sort_by(|a, b| a.name.cmp(&b.name));
+        listing
+    }
+
+    /// First listed skill with this manifest name.
     pub fn resolve(&self, name: &str) -> Option<Skill> {
-        self.list().skills.into_iter().find(|s| s.name == name)
+        self.list()
+            .skills
+            .into_iter()
+            .find(|skill| skill.name == name)
+    }
+
+    /// First listed skill whose directory entry has this exact name.
+    pub fn resolve_directory(&self, dir_name: &str) -> Option<Skill> {
+        self.list()
+            .skills
+            .into_iter()
+            .find(|skill| skill.dir_name == dir_name)
     }
 }
 
-/// Read a skill's SKILL.md verbatim (frontmatter included — the injected
-/// text is the file as the author wrote it), capped at [`MAX_BODY_BYTES`].
 pub fn read_skill_text(skill: &Skill) -> Result<String, LoadError> {
     let bytes = std::fs::read(&skill.skill_md).map_err(|source| LoadError::Io {
         path: skill.skill_md.clone(),
@@ -168,15 +275,6 @@ pub fn read_skill_text(skill: &Skill) -> Result<String, LoadError> {
     Ok(text)
 }
 
-/// Every `SKILL.md` under `root` within [`MAX_SCAN_DEPTH`], sorted for
-/// deterministic listings, plus whether the walk hit [`MAX_SCAN_DIRS`].
-/// Dot-prefixed directories are not descended (VCS/editor dirs would
-/// otherwise surface as candidates). Directory symlinks are followed, but
-/// each *physical* directory is scanned once (canonical-path dedup — a
-/// symlink cycle terminates and an aliased dir cannot list a skill twice).
-/// A SKILL.md that is itself a file symlink is not a candidate (codex-rs
-/// parity — the walk reports real files only). Missing or unreadable
-/// directories contribute nothing.
 fn discover_skill_files(root: &Path) -> (Vec<PathBuf>, bool) {
     let mut found = Vec::new();
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
@@ -204,7 +302,10 @@ fn discover_skill_files(root: &Path) -> (Vec<PathBuf>, bool) {
                     stack.push((path, depth + 1));
                 }
             } else if name == "SKILL.md"
-                && !entry.file_type().map(|t| t.is_symlink()).unwrap_or(true)
+                && !entry
+                    .file_type()
+                    .map(|kind| kind.is_symlink())
+                    .unwrap_or(true)
             {
                 found.push(path);
             }
@@ -214,69 +315,202 @@ fn discover_skill_files(root: &Path) -> (Vec<PathBuf>, bool) {
     (found, truncated)
 }
 
-fn read_skill(skill_md: &Path, layer: &str) -> Result<Skill, String> {
-    let bytes = std::fs::read(skill_md).map_err(|e| format!("cannot read SKILL.md: {e}"))?;
-    let text = String::from_utf8(bytes).map_err(|_| "SKILL.md is not valid UTF-8".to_string())?;
-    let fm = frontmatter::parse(&text).map_err(|e| e.to_string())?;
+fn read_direct_skill(root: &Path, skill_md: &Path, layer: &str) -> Result<Skill, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize layer root: {error}"))?;
+    let canonical_md = skill_md
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize SKILL.md: {error}"))?;
+    if canonical_md == canonical_root || !canonical_md.starts_with(&canonical_root) {
+        return Err("SKILL.md resolves outside its layer root".to_string());
+    }
+    read_skill(skill_md, layer, ManifestPolicy::direct())
+}
 
-    let dir = skill_md
+#[derive(Clone, Copy)]
+struct ManifestPolicy {
+    require_name: bool,
+    direct_name_rule: bool,
+    max_description_chars: Option<usize>,
+}
+
+impl ManifestPolicy {
+    fn recursive() -> Self {
+        Self {
+            require_name: false,
+            direct_name_rule: false,
+            max_description_chars: Some(1024),
+        }
+    }
+
+    fn direct() -> Self {
+        Self {
+            require_name: true,
+            direct_name_rule: true,
+            max_description_chars: None,
+        }
+    }
+}
+
+fn read_skill(skill_md: &Path, layer: &str, policy: ManifestPolicy) -> Result<Skill, String> {
+    let bytes =
+        std::fs::read(skill_md).map_err(|error| format!("cannot read SKILL.md: {error}"))?;
+    let text = String::from_utf8(bytes).map_err(|_| "SKILL.md is not valid UTF-8".to_string())?;
+    let source_dir = skill_md
         .parent()
-        .ok_or_else(|| "SKILL.md has no parent directory".to_string())?;
-    // Frontmatter `name` wins; absent, the directory name is the name
-    // (codex-rs behavior). Either way the result must satisfy the name
-    // contract — a directory like "My Skills" is not silently mangled into
-    // an identity, it is skipped with a reason.
-    let name = match fm.fields.get("name") {
-        Some(name) => name.clone(),
-        None => dir
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    };
-    if !valid_name(&name) {
-        return Err(format!(
-            "invalid skill name {name:?}: must be 1-64 characters of [a-z0-9-], not starting or ending with '-'"
-        ));
-    }
-    let description = fm
-        .fields
-        .get("description")
-        .ok_or_else(|| "frontmatter is missing the required 'description' field".to_string())?;
-    if description.is_empty() {
-        return Err("description must not be empty".to_string());
-    }
-    if description.chars().count() > 1024 {
-        return Err("description exceeds 1024 characters".to_string());
-    }
+        .ok_or_else(|| "SKILL.md has no parent directory".to_string())?
+        .to_path_buf();
+    let dir_name = source_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "skill directory name is not valid UTF-8".to_string())?
+        .to_string();
+    let parsed = parse_skill_md_with_policy(&text, &dir_name, policy)?;
 
     let canonical = skill_md
         .canonicalize()
-        .map_err(|e| format!("cannot canonicalize SKILL.md path: {e}"))?;
+        .map_err(|error| format!("cannot canonicalize SKILL.md path: {error}"))?;
     let dir = canonical
         .parent()
         .ok_or_else(|| "SKILL.md has no parent directory".to_string())?
         .to_path_buf();
     Ok(Skill {
-        name,
-        description: description.clone(),
+        name: parsed.manifest.name.clone(),
+        description: parsed.manifest.description.clone(),
+        dir_name,
         dir,
+        source_dir,
         skill_md: canonical,
         layer: layer.to_string(),
-        fields: fm.fields,
+        fields: parsed.fields,
+        manifest: parsed.manifest,
+        body: parsed.body,
     })
 }
 
-/// `[a-z0-9]([a-z0-9-]*[a-z0-9])?`, at most 64 chars — the skill-name
-/// contract (the agentskills.io charset; also exactly the shape the `$name`
-/// mention syntax can express).
-fn valid_name(name: &str) -> bool {
+/// Parse and validate a standalone agentskills SKILL.md using strict
+/// direct-child manifest semantics (`name` is required).
+pub fn parse_skill_md(text: &str) -> Result<ParsedSkillMd, String> {
+    parse_skill_md_with_policy(text, "", ManifestPolicy::direct())
+}
+
+fn parse_skill_md_with_policy(
+    text: &str,
+    directory_name: &str,
+    policy: ManifestPolicy,
+) -> Result<ParsedSkillMd, String> {
+    let frontmatter = frontmatter::parse(text).map_err(|error| error.to_string())?;
+    let manifest = manifest_from(&frontmatter.fields, directory_name, policy)?;
+    Ok(ParsedSkillMd {
+        manifest,
+        fields: frontmatter.fields,
+        body: frontmatter.body.to_string(),
+    })
+}
+
+fn manifest_from(
+    fields: &Map<String, Value>,
+    directory_name: &str,
+    policy: ManifestPolicy,
+) -> Result<SkillManifest, String> {
+    let name = match fields.get("name") {
+        Some(Value::String(name)) => name.clone(),
+        Some(_) => return Err("frontmatter 'name' must be a string".to_string()),
+        None if policy.require_name => {
+            return Err("frontmatter is missing the required 'name' field".to_string());
+        }
+        None => directory_name.to_string(),
+    };
+    let valid = if policy.direct_name_rule {
+        is_valid_direct_skill_name(&name)
+    } else {
+        valid_recursive_name(&name)
+    };
+    if !valid {
+        let expected = if policy.direct_name_rule {
+            "must match ^[a-z][a-z0-9-]*$"
+        } else {
+            "must be 1-64 characters of [a-z0-9-], not starting or ending with '-'"
+        };
+        return Err(format!("invalid skill name {name:?}: {expected}"));
+    }
+
+    let description = fields
+        .get("description")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "frontmatter is missing the required string 'description' field".to_string()
+        })?
+        .trim()
+        .to_string();
+    if description.is_empty() {
+        return Err("description must not be empty".to_string());
+    }
+    if let Some(max) = policy.max_description_chars
+        && description.chars().count() > max
+    {
+        return Err(format!("description exceeds {max} characters"));
+    }
+
+    let license = optional_string(fields, "license")?;
+    let compatibility = optional_string(fields, "compatibility")?;
+    let allowed_tools = match fields.get("allowed-tools") {
+        None => None,
+        Some(Value::Array(values)) => Some(
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "'allowed-tools' entries must all be strings".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Some(_) => return Err("'allowed-tools' must be an array of strings".to_string()),
+    };
+    let metadata = match fields.get("metadata") {
+        None => None,
+        Some(Value::Object(metadata)) => Some(metadata.clone()),
+        Some(_) => return Err("'metadata' must be a mapping".to_string()),
+    };
+
+    Ok(SkillManifest {
+        name,
+        description,
+        license,
+        compatibility,
+        allowed_tools,
+        metadata,
+    })
+}
+
+fn optional_string(fields: &Map<String, Value>, key: &str) -> Result<Option<String>, String> {
+    match fields.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("'{key}' must be a string")),
+    }
+}
+
+fn valid_recursive_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
             .bytes()
-            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
         && !name.starts_with('-')
         && !name.ends_with('-')
+}
+
+pub fn is_valid_direct_skill_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
 }
 
 #[cfg(test)]
@@ -284,16 +518,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_contract() {
-        assert!(valid_name("a"));
-        assert!(valid_name("skill-2"));
-        assert!(valid_name(&"a".repeat(64)));
-        assert!(!valid_name(""));
-        assert!(!valid_name(&"a".repeat(65)));
-        assert!(!valid_name("-leading"));
-        assert!(!valid_name("trailing-"));
-        assert!(!valid_name("Upper"));
-        assert!(!valid_name("under_score"));
-        assert!(!valid_name("../evil"));
+    fn name_contracts() {
+        assert!(valid_recursive_name("a"));
+        assert!(valid_recursive_name("skill-2"));
+        assert!(!valid_recursive_name("trailing-"));
+        assert!(valid_recursive_name("2-start"));
+        assert!(is_valid_direct_skill_name("skill-"));
+        assert!(!is_valid_direct_skill_name("2-start"));
+        assert!(!is_valid_direct_skill_name("Upper"));
+        assert!(!is_valid_direct_skill_name("../evil"));
     }
 }

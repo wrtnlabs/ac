@@ -20,14 +20,13 @@
 //!   that turn's input. Per-turn only — skills don't persist across turns
 //!   unless re-mentioned.
 //!
-//! Discovery ([`SkillsResolver`]) walks layer roots recursively (bounded
-//! depth) for `SKILL.md` files. The frontmatter dialect stays deliberately
-//! tiny — single-line `key: value` scalars, bare or quoted; anything richer
-//! rejects the skill with a reason instead of risking a value a real YAML
-//! parser would read differently. `name` falls back to the directory name;
-//! `description` is required. Duplicate names are allowed (they are only
-//! unreachable by *plain* mention); duplicate paths dedupe to the earlier
-//! layer.
+//! Discovery ([`SkillsResolver`]) supports both bounded recursive scanning
+//! with canonical-path deduplication and ordered direct-child layers with
+//! directory-name shadowing. Frontmatter is real YAML-shaped agentskills
+//! data: nested metadata, sequences, flow collections, quoted and block
+//! scalars are preserved; anchors/aliases/tags are rejected. The recursive
+//! default permits directory-name fallback, while direct-child mode requires
+//! the manifest name.
 //!
 //! What this deliberately does not do, matching codex: no per-skill
 //! permission or sandbox widening (hosts that contain reads grant their
@@ -52,6 +51,7 @@ pub use frontmatter::{Frontmatter, FrontmatterError, parse as parse_frontmatter}
 pub use inject::{SkillInjection, build_skill_injections};
 pub use mention::{SkillMention, extract_skill_mentions, select_skills_for_mentions};
 pub use resolver::{
-    Listing, LoadError, MAX_BODY_BYTES, Skill, SkillLayer, SkillsResolver, SkippedSkill,
+    Listing, LoadError, MAX_BODY_BYTES, ParsedSkillMd, ResolverMode, Skill, SkillLayer,
+    SkillManifest, SkillsResolver, SkippedSkill, is_valid_direct_skill_name, parse_skill_md,
     read_skill_text,
 };

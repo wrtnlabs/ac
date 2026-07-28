@@ -50,6 +50,34 @@ pub struct ResourceLimits {
     pub max_file_size: Option<u64>,
 }
 
+/// A component-aware write deny applied recursively below every writable root.
+///
+/// This is intentionally a semantic rule rather than a platform regex. Hosts
+/// name the control paths they own; `ac-sandbox` translates the rule only on a
+/// backend that can enforce it in the kernel. macOS Seatbelt can. Linux
+/// Landlock is allow-only and cannot subtract a name at arbitrary depth from a
+/// granted writable tree, so a non-empty rule set makes that backend
+/// `Degraded` (or fail-closed) rather than silently pretending parity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteDenyRule {
+    /// Deny a write whose final path component equals this name.
+    Basename(String),
+    /// Deny a write to this adjacent component sequence or anything below it,
+    /// wherever the sequence occurs under a writable root. A one-component
+    /// sequence therefore protects a directory name at every nesting depth.
+    Subtree(Vec<String>),
+}
+
+impl WriteDenyRule {
+    pub fn basename(name: impl Into<String>) -> Self {
+        Self::Basename(name.into())
+    }
+
+    pub fn subtree(components: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self::Subtree(components.into_iter().map(Into::into).collect())
+    }
+}
+
 /// The platform-neutral sandbox intent. A host builds one; the launcher
 /// translates it into the platform mechanism. All roots should be canonical
 /// absolute paths (the launcher does not re-resolve them — resolving at
@@ -66,6 +94,11 @@ pub struct SandboxPolicy {
     /// Independent of the allow-set by design (defense against config
     /// tampering that would re-grant the child a way out).
     pub deny_paths: Vec<PathBuf>,
+    /// Component-aware write denies at any nesting depth below write roots.
+    ///
+    /// Unlike `deny_paths`, these are not read denies. See [`WriteDenyRule`]
+    /// for the platform-enforcement contract.
+    pub write_deny_rules: Vec<WriteDenyRule>,
     pub network: NetworkMode,
     pub limits: ResourceLimits,
     /// When true (the default posture), any inability to enforce the requested
@@ -85,6 +118,7 @@ impl SandboxPolicy {
             read_roots: vec![root.clone()],
             write_roots: vec![root],
             deny_paths: default_deny_paths(),
+            write_deny_rules: Vec::new(),
             network: NetworkMode::Off,
             limits: ResourceLimits::default(),
             fail_closed: true,
@@ -107,6 +141,11 @@ impl SandboxPolicy {
 
     pub fn with_limits(mut self, limits: ResourceLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    pub fn with_write_deny_rules(mut self, rules: impl IntoIterator<Item = WriteDenyRule>) -> Self {
+        self.write_deny_rules = rules.into_iter().collect();
         self
     }
 

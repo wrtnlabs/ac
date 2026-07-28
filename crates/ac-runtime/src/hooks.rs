@@ -37,11 +37,11 @@
 //! value is authority-by-shape at the point of use, so each phase arrives with
 //! the code that needs it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ac_provider::{CompletionRequest, ToolChoice};
-use ac_types::{ContentPart, Message};
+use ac_types::{CacheMark, CacheTtl, ContentPart, Message};
 
 /// The step-prepare phase: edits the request about to be sampled. Composes in
 /// registration order; each edit lives for one request (the loop rebuilds from
@@ -49,6 +49,150 @@ use ac_types::{ContentPart, Message};
 /// the module docs on stateless derivation.
 pub trait StepPrepareHook: Send + Sync {
     fn prepare(&self, iteration: usize, request: &mut CompletionRequest);
+}
+
+/// Mark the last `message_count` cacheable messages, and optionally the system
+/// prompt, as provider-cache breakpoints on every step.
+///
+/// Marks are rebuilt from the request each time: messages that leave the tail
+/// are explicitly cleared, so the hook carries no process-local state. A
+/// message is cacheable when its wire encoding can actually carry a mark:
+/// it has a text part or a tool result. Image-only transient rows are skipped.
+pub struct TailCacheHook {
+    message_count: usize,
+    mark: CacheMark,
+    cache_system: bool,
+}
+
+impl TailCacheHook {
+    pub fn new(message_count: usize, ttl: CacheTtl, cache_system: bool) -> Self {
+        Self {
+            message_count,
+            mark: CacheMark::WithTtl(ttl),
+            cache_system,
+        }
+    }
+}
+
+impl StepPrepareHook for TailCacheHook {
+    fn prepare(&self, _iteration: usize, request: &mut CompletionRequest) {
+        for message in &mut request.messages {
+            message.cache = CacheMark::Off;
+        }
+        for message in request
+            .messages
+            .iter_mut()
+            .rev()
+            .filter(|message| {
+                message.content.iter().any(|part| {
+                    matches!(part, ContentPart::Text { .. } | ContentPart::ToolResult(_))
+                })
+            })
+            .take(self.message_count)
+        {
+            message.cache = self.mark;
+        }
+        request.cache_system = if self.cache_system && request.system.is_some() {
+            self.mark
+        } else {
+            CacheMark::Off
+        };
+    }
+}
+
+/// Keep provider-executed server tools on step zero and remove them from every
+/// later step of the turn.
+///
+/// This is useful for request-level capabilities such as automatic web search:
+/// unlike a client tool, they can fire merely because they are present on the
+/// request, so repeating them after tool results is both costly and surprising.
+pub struct FirstStepServerToolsOnly;
+
+impl StepPrepareHook for FirstStepServerToolsOnly {
+    fn prepare(&self, iteration: usize, request: &mut CompletionRequest) {
+        if iteration > 0 {
+            request.server_tools.clear();
+        }
+    }
+}
+
+/// Stateless visibility for a set of latent tools.
+///
+/// The configured tools remain in the registry, but their schemas stay out of
+/// completion requests until a successful `reveal_tool` result names them in
+/// `{"matched":[{"name":"..."}]}`. Visibility is derived from effective
+/// message history on every step, never retained in process-local state, so
+/// resume, fork, and compaction cannot desynchronize it.
+///
+/// Dispatch enforcement is owned by `Session`: a provider-emitted call is
+/// executable only when that tool was actually offered on the corresponding
+/// request. Filtering here is therefore both a context-cost optimization and a
+/// capability boundary.
+pub struct ConditionalToolsHook {
+    gated: HashSet<String>,
+    reveal_tool: String,
+}
+
+impl ConditionalToolsHook {
+    pub fn new(gated: impl IntoIterator<Item = String>, reveal_tool: impl Into<String>) -> Self {
+        Self {
+            gated: gated.into_iter().collect(),
+            reveal_tool: reveal_tool.into(),
+        }
+    }
+
+    pub fn gated(&self) -> &HashSet<String> {
+        &self.gated
+    }
+
+    fn revealed(&self, messages: &[Message]) -> HashSet<String> {
+        let mut uses: HashMap<&str, &str> = HashMap::new();
+        let mut revealed = HashSet::new();
+
+        for part in messages.iter().flat_map(|message| message.content.iter()) {
+            match part {
+                ContentPart::ToolUse(tool_use) => {
+                    uses.insert(tool_use.id.as_str(), tool_use.name.as_str());
+                }
+                ContentPart::ToolResult(result)
+                    if !result.is_error
+                        && uses.get(result.tool_use_id.as_str()).copied()
+                            == Some(self.reveal_tool.as_str()) =>
+                {
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&result.content)
+                    else {
+                        continue;
+                    };
+                    let Some(matched) = value.get("matched").and_then(|value| value.as_array())
+                    else {
+                        continue;
+                    };
+                    for hit in matched {
+                        if let Some(name) = hit.get("name").and_then(|value| value.as_str())
+                            && self.gated.contains(name)
+                        {
+                            revealed.insert(name.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        revealed
+    }
+}
+
+impl StepPrepareHook for ConditionalToolsHook {
+    fn prepare(&self, _iteration: usize, request: &mut CompletionRequest) {
+        if self.gated.is_empty() {
+            return;
+        }
+        let revealed = self.revealed(&request.messages);
+        request
+            .tools
+            .retain(|tool| !self.gated.contains(&tool.name) || revealed.contains(&tool.name));
+    }
 }
 
 /// What an [`ObservationHook`] is told. Immutable by construction — observation
@@ -158,6 +302,61 @@ impl StepPrepareHook for ForcedChainHook {
     }
 }
 
+/// A [`ForcedChainHook`] that releases after `max_error_attempts` failed calls.
+///
+/// Both success and the retry budget are derived from effective history, so
+/// resume and fork preserve the verdict without a mutable counter. Releasing
+/// the hard tool choice does not make the precondition true; host tools must
+/// still enforce their own policy when the model continues unbound.
+pub struct BoundedForcedChainHook {
+    inner: ForcedChainHook,
+    tool: String,
+    max_error_attempts: usize,
+}
+
+impl BoundedForcedChainHook {
+    pub fn new(tool: impl Into<String>, max_error_attempts: usize) -> Self {
+        let tool = tool.into();
+        Self {
+            inner: ForcedChainHook::new(tool.clone()),
+            tool,
+            max_error_attempts,
+        }
+    }
+
+    fn error_attempts(&self, messages: &[Message]) -> usize {
+        let ids: HashSet<&str> = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::ToolUse(tool_use) if tool_use.name == self.tool => {
+                    Some(tool_use.id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|part| {
+                matches!(
+                    part,
+                    ContentPart::ToolResult(result)
+                        if result.is_error && ids.contains(result.tool_use_id.as_str())
+                )
+            })
+            .count()
+    }
+}
+
+impl StepPrepareHook for BoundedForcedChainHook {
+    fn prepare(&self, iteration: usize, request: &mut CompletionRequest) {
+        if self.error_attempts(&request.messages) < self.max_error_attempts {
+            self.inner.prepare(iteration, request);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +381,24 @@ mod tests {
                 tool_use_id: tool_use_id.into(),
                 content: "r".into(),
                 is_error,
+            })],
+            cache: CacheMark::Off,
+        }
+    }
+
+    fn search_result(tool_use_id: &str, names: &[&str]) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentPart::ToolResult(ToolResult {
+                tool_use_id: tool_use_id.to_string(),
+                content: serde_json::json!({
+                    "matched": names
+                        .iter()
+                        .map(|name| serde_json::json!({"name": name}))
+                        .collect::<Vec<_>>()
+                })
+                .to_string(),
+                is_error: false,
             })],
             cache: CacheMark::Off,
         }
@@ -267,5 +484,166 @@ mod tests {
         });
         // Both observers ran, in order; the pre-registration event left nothing.
         assert_eq!(*log.lock().unwrap(), vec!["seen", "seen"]);
+    }
+
+    #[test]
+    fn conditional_tools_are_derived_from_durable_history() {
+        let hook =
+            ConditionalToolsHook::new(["mcp__tracker__create_item".to_string()], "tool_search");
+        let mut request = CompletionRequest::new("model");
+        request.tools = vec![
+            ac_types::ToolSpec {
+                name: "tool_search".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            ac_types::ToolSpec {
+                name: "mcp__tracker__create_item".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+        ];
+
+        hook.prepare(0, &mut request);
+        assert_eq!(
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tool_search"]
+        );
+
+        request.messages = vec![
+            tool_use("search-1", "tool_search"),
+            search_result("search-1", &["mcp__tracker__create_item"]),
+        ];
+        request.tools.push(ac_types::ToolSpec {
+            name: "mcp__tracker__create_item".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        hook.prepare(1, &mut request);
+        assert!(
+            request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "mcp__tracker__create_item")
+        );
+    }
+
+    #[test]
+    fn conditional_tools_ignore_unknown_names() {
+        let hook = ConditionalToolsHook::new(["mcp__known".to_string()], "tool_search");
+        let mut request = CompletionRequest::new("model");
+        request.tools = vec![ac_types::ToolSpec {
+            name: "mcp__known".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type":"object"}),
+        }];
+        request.messages = vec![
+            tool_use("search-1", "tool_search"),
+            search_result("search-1", &["mcp__unknown"]),
+        ];
+        hook.prepare(0, &mut request);
+        assert!(request.tools.is_empty());
+    }
+
+    #[test]
+    fn bounded_forced_chain_releases_after_the_error_budget() {
+        let hook = BoundedForcedChainHook::new("bind", 2);
+        let mut request = CompletionRequest::new("model");
+        hook.prepare(0, &mut request);
+        assert_eq!(request.tool_choice, ToolChoice::Force("bind".into()));
+
+        request.messages = vec![
+            tool_use("c1", "bind"),
+            tool_result("c1", true),
+            tool_use("c2", "bind"),
+            tool_result("c2", true),
+        ];
+        request.tool_choice = ToolChoice::Auto;
+        hook.prepare(2, &mut request);
+        assert_eq!(request.tool_choice, ToolChoice::Auto);
+    }
+
+    #[test]
+    fn tail_cache_rebuilds_marks_and_marks_system_only_when_present() {
+        let hook = TailCacheHook::new(2, CacheTtl::OneHour, true);
+        let mut request = CompletionRequest::new("model");
+        request.messages = vec![
+            Message::text(Role::User, "one"),
+            Message::text(Role::Assistant, "two"),
+            Message::text(Role::User, "three"),
+        ];
+        request.messages[0].cache = CacheMark::On;
+        request.system = Some("system".to_string());
+
+        hook.prepare(0, &mut request);
+        assert_eq!(request.messages[0].cache, CacheMark::Off);
+        assert_eq!(
+            request.messages[1].cache,
+            CacheMark::WithTtl(CacheTtl::OneHour)
+        );
+        assert_eq!(
+            request.messages[2].cache,
+            CacheMark::WithTtl(CacheTtl::OneHour)
+        );
+        assert_eq!(request.cache_system, CacheMark::WithTtl(CacheTtl::OneHour));
+    }
+
+    #[test]
+    fn tail_cache_skips_transient_image_only_rows() {
+        let hook = TailCacheHook::new(2, CacheTtl::OneHour, false);
+        let mut request = CompletionRequest::new("model");
+        request.messages = vec![
+            Message::text(Role::User, "one"),
+            Message {
+                role: Role::User,
+                content: vec![ContentPart::ToolResult(ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "result".into(),
+                    is_error: false,
+                })],
+                cache: CacheMark::Off,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentPart::Image {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+                cache: CacheMark::On,
+            },
+        ];
+
+        hook.prepare(0, &mut request);
+
+        assert_eq!(
+            request.messages[0].cache,
+            CacheMark::WithTtl(CacheTtl::OneHour)
+        );
+        assert_eq!(
+            request.messages[1].cache,
+            CacheMark::WithTtl(CacheTtl::OneHour)
+        );
+        assert_eq!(
+            request.messages[2].cache,
+            CacheMark::Off,
+            "the provider encoder cannot attach a mark to an image-only row"
+        );
+    }
+
+    #[test]
+    fn provider_server_tools_are_first_step_only() {
+        let hook = FirstStepServerToolsOnly;
+        let mut request = CompletionRequest::new("model");
+        request.server_tools = vec![ac_provider::ServerTool::WebSearch {
+            max_results: Some(5),
+        }];
+        hook.prepare(0, &mut request);
+        assert_eq!(request.server_tools.len(), 1);
+        hook.prepare(1, &mut request);
+        assert!(request.server_tools.is_empty());
     }
 }

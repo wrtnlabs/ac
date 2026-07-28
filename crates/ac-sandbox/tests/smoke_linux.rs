@@ -18,6 +18,7 @@ use std::thread;
 use ac_sandbox::OsSandbox;
 use ac_tool::{
     CommandSpec, NetworkMode, ResourceLimits, SandboxLauncher, SandboxMode, SandboxPolicy,
+    WriteDenyRule,
 };
 
 struct Run {
@@ -66,6 +67,33 @@ async fn a_plain_command_runs() {
     assert_eq!(r.exit, Some(0), "stderr: {}", r.stderr);
     assert_eq!(r.stdout.trim(), "hello-sandbox");
     eprintln!("mode = {:?}", r.mode);
+}
+
+#[test]
+fn recursive_component_denies_are_honestly_degraded_or_fail_closed() {
+    let ws = workspace();
+    let root = ws.path().canonicalize().unwrap();
+    let strict = SandboxPolicy::workspace(&root)
+        .with_write_deny_rules([WriteDenyRule::subtree([".git", "hooks"])]);
+    let launcher = OsSandbox::new(strict);
+    assert_eq!(
+        launcher.mode(),
+        SandboxMode::Degraded,
+        "Landlock cannot subtract an arbitrary nested component from a write root"
+    );
+    let spec = CommandSpec::new("sh", ["-c", "true"], root.clone());
+    assert!(
+        launcher.prepare(&spec).is_err(),
+        "a fail-closed policy must not pretend recursive denies are enforced"
+    );
+
+    let degraded = SandboxPolicy::workspace(&root)
+        .with_write_deny_rules([WriteDenyRule::basename(".zshrc")])
+        .allow_degraded();
+    let prepared = OsSandbox::new(degraded)
+        .prepare(&spec)
+        .expect("explicitly degraded policy may run");
+    assert_eq!(prepared.mode, SandboxMode::Degraded);
 }
 
 #[tokio::test]

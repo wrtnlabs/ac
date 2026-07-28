@@ -11,6 +11,70 @@ pub enum PolicyError {
     Invalid(String),
 }
 
+/// A policy-authorized absolute path together with the directory capability
+/// that contains it.
+///
+/// Path policies still expose [`PathPolicy::resolve_read`] and
+/// [`PathPolicy::resolve_write`] for display and compatibility. Filesystem
+/// implementations should prefer the `authorize_*` variants: on Unix, AC's
+/// stock tools open `root` first and traverse `relative` with descriptor-
+/// relative, no-follow operations. That keeps the policy verdict attached to
+/// the later I/O even if another process swaps a not-yet-existing parent for a
+/// symlink between authorization and use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedPath {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl AuthorizedPath {
+    pub fn new(root: PathBuf, path: PathBuf) -> Result<Self, PolicyError> {
+        if !root.is_absolute() || !path.is_absolute() || !path.starts_with(&root) {
+            return Err(PolicyError::Invalid(format!(
+                "{} is not beneath authorization root {}",
+                path.display(),
+                root.display()
+            )));
+        }
+        let relative = path.strip_prefix(&root).expect("starts_with checked above");
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(PolicyError::Invalid(format!(
+                "{} is not a normalized path beneath {}",
+                path.display(),
+                root.display()
+            )));
+        }
+        Ok(Self { root, path })
+    }
+
+    /// Wrap a previously resolved absolute path. The filesystem root is the
+    /// capability in this compatibility form; every component is still opened
+    /// descriptor-relatively with no-follow semantics on Unix.
+    pub fn from_resolved(path: impl Into<PathBuf>) -> Result<Self, PolicyError> {
+        let path = path.into();
+        let root = filesystem_root(&path)
+            .ok_or_else(|| PolicyError::Invalid(path.display().to_string()))?;
+        Self::new(root, path)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn relative(&self) -> &Path {
+        self.path
+            .strip_prefix(&self.root)
+            .expect("AuthorizedPath validates containment")
+    }
+}
+
 /// The containment seam. Built-in tools never decide where they may act — the
 /// host does, by implementing this. Implementations must be symlink-safe:
 /// resolve what exists on disk, not just the lexical path.
@@ -21,6 +85,20 @@ pub trait PathPolicy: Send + Sync {
     fn root(&self) -> PathBuf;
     fn resolve_read(&self, path: &Path) -> Result<PathBuf, PolicyError>;
     fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError>;
+
+    /// Resolve a read and retain an authorization root for race-safe I/O.
+    ///
+    /// Custom policies get a safe compatibility default rooted at the
+    /// filesystem root. Policies that know a narrower capability should
+    /// override this, as AC's built-in combinators do.
+    fn authorize_read(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        AuthorizedPath::from_resolved(self.resolve_read(path)?)
+    }
+
+    /// Resolve a write and retain an authorization root for race-safe I/O.
+    fn authorize_write(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        AuthorizedPath::from_resolved(self.resolve_write(path)?)
+    }
 }
 
 /// The generic-host policy: reads and writes confined to one directory
@@ -36,6 +114,16 @@ impl SubtreePolicy {
         Ok(Self {
             root: root.as_ref().canonicalize()?,
         })
+    }
+
+    /// Build a subtree from an identity that was already authorized by a
+    /// parent capability. This intentionally does not canonicalize again:
+    /// hosts use it when a bind transition must retain the exact path
+    /// identity established by an earlier descriptor-relative operation.
+    pub fn from_authorized_root(authorized: AuthorizedPath) -> Self {
+        Self {
+            root: authorized.path,
+        }
     }
 
     fn resolve(&self, path: &Path) -> Result<PathBuf, PolicyError> {
@@ -66,6 +154,14 @@ impl PathPolicy for SubtreePolicy {
     fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
         self.resolve(path)
     }
+
+    fn authorize_read(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        AuthorizedPath::new(self.root.clone(), self.resolve(path)?)
+    }
+
+    fn authorize_write(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        AuthorizedPath::new(self.root.clone(), self.resolve(path)?)
+    }
 }
 
 /// Combinator: reads delegate to the inner policy, writes are always denied.
@@ -93,6 +189,17 @@ impl PathPolicy for ReadOnlyPolicy {
     }
 
     fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        Err(PolicyError::Denied(format!(
+            "writes are not permitted yet: {}",
+            path.display()
+        )))
+    }
+
+    fn authorize_read(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        self.inner.authorize_read(path)
+    }
+
+    fn authorize_write(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
         Err(PolicyError::Denied(format!(
             "writes are not permitted yet: {}",
             path.display()
@@ -136,6 +243,14 @@ impl PathPolicy for SplitPolicy {
 
     fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
         self.write.resolve_write(&self.rebase(path))
+    }
+
+    fn authorize_read(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        self.read.authorize_read(&self.rebase(path))
+    }
+
+    fn authorize_write(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        self.write.authorize_write(&self.rebase(path))
     }
 }
 
@@ -184,6 +299,14 @@ impl PathPolicy for SwapPolicy {
     fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
         self.current().resolve_write(path)
     }
+
+    fn authorize_read(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        self.current().authorize_read(path)
+    }
+
+    fn authorize_write(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        self.current().authorize_write(path)
+    }
 }
 
 /// A shared, grow-only set of read-root grants. A host creates one, installs
@@ -218,11 +341,21 @@ impl ReadGrants {
     /// symlink planted in the meantime redirect the grant).
     pub fn grant(&self, dir: impl AsRef<Path>) -> std::io::Result<()> {
         let policy = SubtreePolicy::new(dir)?;
+        self.insert_root(policy);
+        Ok(())
+    }
+
+    /// Grant a directory identity already established through a parent
+    /// capability, without re-canonicalizing its mutable pathname.
+    pub fn grant_authorized(&self, dir: AuthorizedPath) {
+        self.insert_root(SubtreePolicy::from_authorized_root(dir));
+    }
+
+    fn insert_root(&self, policy: SubtreePolicy) {
         let mut roots = self.roots.write().expect("read-grants lock poisoned");
         if !roots.iter().any(|p| p.root == policy.root) {
             roots.push(policy);
         }
-        Ok(())
     }
 
     /// Grant read access to exactly one file — never its siblings, never a
@@ -267,10 +400,10 @@ impl ReadGrants {
             .collect()
     }
 
-    fn resolve_read(&self, path: &Path) -> Option<PathBuf> {
+    fn authorize_read(&self, path: &Path) -> Option<AuthorizedPath> {
         {
             let roots = self.roots.read().expect("read-grants lock poisoned");
-            if let Some(resolved) = roots.iter().find_map(|p| p.resolve_read(path).ok()) {
+            if let Some(resolved) = roots.iter().find_map(|p| p.authorize_read(path).ok()) {
                 return Some(resolved);
             }
         }
@@ -289,9 +422,13 @@ impl ReadGrants {
                 // with zero containment. Resolve the leaf and require the real
                 // file to still be this exact entry.
                 let real = g.parent.join(&g.name).canonicalize().ok()?;
-                (real.parent() == Some(g.parent.as_path())
-                    && real.file_name() == Some(g.name.as_os_str()))
-                .then_some(real)
+                if real.parent() == Some(g.parent.as_path())
+                    && real.file_name() == Some(g.name.as_os_str())
+                {
+                    AuthorizedPath::new(g.parent.clone(), real).ok()
+                } else {
+                    None
+                }
             })
     }
 }
@@ -320,11 +457,19 @@ impl PathPolicy for GrantedReadPolicy {
     }
 
     fn resolve_read(&self, path: &Path) -> Result<PathBuf, PolicyError> {
-        match self.inner.resolve_read(path) {
+        self.authorize_read(path).map(|authorized| authorized.path)
+    }
+
+    fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        self.inner.resolve_write(path)
+    }
+
+    fn authorize_read(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        match self.inner.authorize_read(path) {
             Ok(resolved) => Ok(resolved),
             Err(inner_err) => {
                 if path.is_absolute()
-                    && let Some(resolved) = self.grants.resolve_read(path)
+                    && let Some(resolved) = self.grants.authorize_read(path)
                 {
                     return Ok(resolved);
                 }
@@ -333,8 +478,8 @@ impl PathPolicy for GrantedReadPolicy {
         }
     }
 
-    fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
-        self.inner.resolve_write(path)
+    fn authorize_write(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        self.inner.authorize_write(path)
     }
 }
 
@@ -392,6 +537,20 @@ impl PathPolicy for PrefixRemapPolicy {
             None => self.inner.resolve_write(path),
         }
     }
+
+    fn authorize_read(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        match self.route(path) {
+            Some((mount, rest)) => mount.authorize_read(&rest),
+            None => self.inner.authorize_read(path),
+        }
+    }
+
+    fn authorize_write(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        match self.route(path) {
+            Some((mount, rest)) => mount.authorize_write(&rest),
+            None => self.inner.authorize_write(path),
+        }
+    }
 }
 
 /// Combinator: a deny-list applied AFTER the inner policy resolves — the check
@@ -433,6 +592,15 @@ impl DenyPolicy {
         }
         Ok(resolved)
     }
+
+    fn check_authorized(
+        authorized: AuthorizedPath,
+        denies: &[PathBuf],
+        candidate: &Path,
+    ) -> Result<AuthorizedPath, PolicyError> {
+        Self::check(authorized.path.clone(), denies, candidate)?;
+        Ok(authorized)
+    }
 }
 
 impl PathPolicy for DenyPolicy {
@@ -446,6 +614,31 @@ impl PathPolicy for DenyPolicy {
 
     fn resolve_write(&self, path: &Path) -> Result<PathBuf, PolicyError> {
         Self::check(self.inner.resolve_write(path)?, &self.deny_write, path)
+    }
+
+    fn authorize_read(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        Self::check_authorized(self.inner.authorize_read(path)?, &self.deny_read, path)
+    }
+
+    fn authorize_write(&self, path: &Path) -> Result<AuthorizedPath, PolicyError> {
+        Self::check_authorized(self.inner.authorize_write(path)?, &self.deny_write, path)
+    }
+}
+
+fn filesystem_root(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    match components.next()? {
+        Component::Prefix(prefix) => {
+            let mut root = PathBuf::from(prefix.as_os_str());
+            if matches!(components.next(), Some(Component::RootDir)) {
+                root.push(Component::RootDir.as_os_str());
+                Some(root)
+            } else {
+                None
+            }
+        }
+        Component::RootDir => Some(PathBuf::from(Component::RootDir.as_os_str())),
+        _ => None,
     }
 }
 
@@ -515,6 +708,11 @@ mod tests {
             .unwrap();
         assert!(resolved.starts_with(policy.root()));
         assert!(resolved.ends_with("new/nested/file.txt"));
+        let authorized = policy
+            .authorize_write(Path::new("new/nested/file.txt"))
+            .unwrap();
+        assert_eq!(authorized.root(), policy.root());
+        assert_eq!(authorized.path(), resolved);
     }
 
     #[test]
@@ -588,6 +786,16 @@ mod tests {
             widened,
             parent.path().canonicalize().unwrap().join("sibling.txt")
         );
+        let widened_authorized = split.authorize_read(Path::new("../sibling.txt")).unwrap();
+        assert_eq!(
+            widened_authorized.root(),
+            parent.path().canonicalize().unwrap()
+        );
+        assert_eq!(widened_authorized.path(), widened);
+        assert_eq!(
+            split.authorize_write(Path::new("file.txt")).unwrap().root(),
+            write_root
+        );
         // ...but the same escape as a WRITE is out, relative or absolute.
         assert!(matches!(
             split.resolve_write(Path::new("../sibling.txt")),
@@ -640,6 +848,9 @@ mod tests {
 
         // After: the read resolves — but the same path as a WRITE stays denied.
         assert_eq!(granted.resolve_read(&companion).unwrap(), companion);
+        let authorized = granted.authorize_read(&companion).unwrap();
+        assert_eq!(authorized.root(), outside_root);
+        assert_eq!(authorized.path(), companion);
         assert!(matches!(
             granted.resolve_write(&companion),
             Err(PolicyError::Outside(_))
@@ -694,6 +905,10 @@ mod tests {
         assert_eq!(
             remap.resolve_read(Path::new("aux/f.txt")).unwrap(),
             mount_root.join("f.txt")
+        );
+        assert_eq!(
+            remap.authorize_read(Path::new("aux/f.txt")).unwrap().root(),
+            mount_root
         );
         let wrote = remap.resolve_write(Path::new("aux/new.txt")).unwrap();
         assert!(wrote.starts_with(&mount_root));

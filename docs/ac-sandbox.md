@@ -46,7 +46,8 @@ reference implementation omits:
 
 | Containment | v1 | Mechanism | Grade |
 |---|---|---|---|
-| **Filesystem** | ✅ | macOS Seatbelt deny-default profile; Linux `landlock` (LSM) | actual |
+| **Filesystem roots** | ✅ | macOS Seatbelt deny-default profile; Linux `landlock` (LSM) | actual |
+| **Recursive component write denies** | macOS ✅ / Linux partial | Seatbelt path regex; Landlock is allow-only and cannot subtract descendants | `actual` on macOS; `degraded`/refused on Linux |
 | **Process / syscall** | ✅ | macOS Seatbelt process scoping; Linux `seccompiler` BPF (block `ptrace`, `io_uring`, and `socket()` per network mode) | actual |
 | **Resource limits** | ✅ | `setrlimit` (`RLIMIT_NPROC`/`AS`/`CPU`/`FSIZE`) via `pre_exec`; cgroup-v2 slice on Linux if available | actual |
 | **Network — on/off** | ✅ | OFF = Seatbelt deny-default (macOS) / seccomp blocks `socket()` (Linux). ON = unrestricted egress. | actual |
@@ -105,7 +106,9 @@ macOS has no in-process equivalent; the only actual mechanism is `sandbox-exec` 
 which we invoke by wrapping the command's argv with a generated deny-default profile. It is
 Apple-deprecated (compile-time warning) but **functional on current macOS (Tahoe 26)** and used
 in production by Chrome, codex, and `sandbox-runtime`. No host dependency to install, so macOS is
-strict-or-throw with no degraded tier.
+strict-or-throw with no degraded tier. File contents are readable only below the policy's
+read/write roots and narrowly scoped system/runtime roots; the profile keeps only global metadata
+lookup plus root-directory data, which dyld/AMFI requires to start signed binaries.
 
 ### Confidence, stated plainly
 
@@ -172,9 +175,10 @@ built-in registration stays app-agnostic, the host injects the launcher.
 2. **Three honest modes on the result envelope.** `SandboxMode::{Strict, Degraded, Off}` rides
    the `shell` result JSON (as `sandbox.mode`), so a host UI can banner non-strict runs. `Strict`
    = every requested layer enforced (on Linux, `landlock` reported `Fully` and the seccomp
-   filter installed). `Degraded` = kernel too old for full landlock ABI, or cgroups unavailable
-   — a real-but-partial sandbox, surfaced. `Off` = native Windows, or the host explicitly
-   disabled it — surfaced on every call.
+   filter installed). `Degraded` = kernel too old for full landlock ABI, a requested absolute
+   deny overlaps a granted Landlock root, recursive component write denies were requested on
+   Linux, or cgroups are unavailable — a real-but-partial sandbox, surfaced. `Off` = native
+   Windows, or the host explicitly disabled it — surfaced on every call.
 3. **Two layers that both must hold.** The in-process `PathPolicy` containment check stays; the
    OS sandbox is defense-in-depth beneath it. Neither replaces the other.
 4. **Detect, don't assume.** Use `landlock`'s `RestrictionStatus` to know what actually got
@@ -185,10 +189,13 @@ built-in registration stays app-agnostic, the host injects the launcher.
 
 Stated up front because an honest sandbox names its holes:
 
-- **Reads are the operator's policy, not globally denied.** We deny a mandatory secret-set (SSH
-  keys, cloud creds, `.git/hooks`, `.git/config`, shell rc files, `.mcp.json`) regardless of the
-  allow-set, but a command with a network grant plus broad read access can still exfiltrate —
-  the same posture Zed ships. Network-off closes the exfil channel entirely.
+- **Reads are the operator's policy.** macOS and Linux both allow file contents only under
+  explicit read/write roots plus their narrowly scoped system/runtime roots. A command with a
+  network grant can still exfiltrate anything inside those roots; network-off closes that channel.
+- **Linux Landlock has no subtractive rule.** Once a root is writable/readable, Landlock cannot
+  carve out an absolute descendant or a component name at arbitrary depth. AC detects that
+  mismatch: fail-closed policies are refused, and explicitly degradable policies report
+  `degraded`. macOS Seatbelt enforces both absolute and recursive component denies.
 - **No domain-level network policy in v1** (that is v2). v1 network is all-or-nothing.
 - **Inherited/`SCM_RIGHTS`-passed socket fds** are not neutralized by a `socket()` filter; this
   is a known seccomp limitation the references share. Acceptable for v1's threat model
@@ -212,9 +219,9 @@ advisory mechanism masquerading as enforcement.
    spawn.
 2. ✅ `ac-sandbox` macOS: deny-default Seatbelt profile (base allow-set adapted from codex's
    Apache SBPL), argv wrapped with the pinned `/usr/bin/sandbox-exec`, paths passed as `-D`
-   params (never interpolated into SBPL), `setrlimit` via `pre_exec`. Live-verified: 8 smoke
-   tests spawn real `sandbox-exec` and prove write-escape/secret-read denial, the network gate,
-   and `RLIMIT_FSIZE` truncation.
+   params (never interpolated into SBPL), `setrlimit` via `pre_exec`. Live-verified: 12 smoke
+   tests spawn real `sandbox-exec` and prove explicit read roots, write-escape/secret-read denial,
+   recursive mixed-case component denies, the network gate, and `RLIMIT_FSIZE` truncation.
 3. ✅ `ac-sandbox` Linux: `landlock` FS grants (system roots + read/write roots; secrets denied
    by omission) + `seccompiler` filter (ptrace/process_vm always; socket/socketpair/io_uring when
    network-off) + `setrlimit`, all self-applied in `pre_exec` after `PR_SET_NO_NEW_PRIVS` — no

@@ -10,9 +10,13 @@ use std::sync::{Arc, Mutex};
 
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
 use ac_runtime::{AgentConfig, AgentEvent, ReferenceSpawner, Session};
-use ac_tool::{SpawnRequest, SubtreePolicy, ToolCtx, ToolRegistry, as_dyn};
+use ac_tool::{
+    AgentSpawner, SpawnRequest, SpawnResult, SpawnStatus, SubtreePolicy, ToolCtx, ToolRegistry,
+    as_dyn,
+};
 use ac_tools::Task;
 use ac_types::{ContentPart, StopReason};
+use futures::future::BoxFuture;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -224,5 +228,77 @@ async fn a_child_cannot_recurse_even_when_it_holds_the_task_tool() {
         assembled.load(Ordering::SeqCst),
         1,
         "a grandchild must never be assembled"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_task_calls_keep_their_exact_invocation_ids() {
+    struct RecordingSpawner {
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl AgentSpawner for RecordingSpawner {
+        fn spawn(&self, req: SpawnRequest) -> BoxFuture<'static, SpawnResult> {
+            let seen = self.seen.clone();
+            Box::pin(async move {
+                seen.lock()
+                    .unwrap()
+                    .push((req.prompt.clone(), req.tool_call_id));
+                // Complete in the opposite order from the provider's call
+                // order. Identity must come from each invocation context, not
+                // a start/finish observation queue.
+                if req.prompt == "slow" {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                SpawnResult {
+                    session_id: format!("s_{}", req.prompt),
+                    output: req.prompt,
+                    status: SpawnStatus::Completed,
+                }
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let spawner = as_dyn(RecordingSpawner { seen: seen.clone() });
+    let mut registry = ToolRegistry::new();
+    registry.register(Task);
+    let ctx = Arc::new(
+        ToolCtx::new(Arc::new(SubtreePolicy::new(dir.path()).unwrap())).with_spawner(spawner),
+    );
+    let provider = MockProvider::new(vec![
+        vec![
+            tool_use(
+                "call_slow",
+                "task",
+                json!({ "agent": "general", "prompt": "slow" }),
+            ),
+            tool_use(
+                "call_fast",
+                "task",
+                json!({ "agent": "general", "prompt": "fast" }),
+            ),
+            stop_tool_use(),
+        ],
+        vec![text("done"), stop_end()],
+    ]);
+    let parent = Session::new(
+        Arc::new(provider),
+        Arc::new(registry),
+        ctx,
+        config("mock/parent"),
+    );
+
+    let (stop, _events) = run(parent, "delegate").await;
+    assert_eq!(stop, StopReason::EndTurn);
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            ("fast".into(), "call_fast".into()),
+            ("slow".into(), "call_slow".into()),
+        ]
     );
 }

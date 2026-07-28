@@ -14,6 +14,7 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
+rustix = { workspace = true }
 seccompiler = "0.5"
 
 [dev-dependencies]

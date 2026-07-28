@@ -30,11 +30,12 @@ never: *this* command, now — yes or no? The kit already has two enforcement la
 can ask it.
 
 **Capability classification** (live) is tool-level and static: every tool declares itself
-read-only or mutating as part of the tool contract — an unclassified tool cannot exist — and a
-tool that arrives over a wire registers as mutating unless the host explicitly opts into
-trusting the server's read-only claim. This answers *which tools could change the world*, and
-for a dedicated tool it is the whole answer. For a shell tool it answers nothing per call:
-any useful shell is mutating, so a capability gate prompts on every command or on none.
+read-only, policy-guarded, or mutating as part of the tool contract — an unclassified tool cannot
+exist — and a tool that arrives over a wire registers as mutating unless the host explicitly opts
+into trusting the server's read-only claim. This answers *which tools could change the world*,
+and for a dedicated tool it is the whole answer. A guarded shell deliberately defers the finer
+answer to its command classifier plus kernel policy; a name-only gate would still prompt on every
+command or on none.
 
 **Kernel containment** ([ac-sandbox.md](ac-sandbox.md)) bounds what a spawned command can do —
 the blast radius. It is intent-blind by construction: the permitted region must include
@@ -112,10 +113,10 @@ raises that match's verdict to at least `prompt` (R4). This is the point of role
 not one trusted string but a readable `a` and a writable `b`, each judged by where it lands.
 
 **Permission modes.** A mode is a floor `φ : Capability → Verdict` applied per tool call:
-a read-only mode is `φ(read-only) = safe, φ(mutating) = prompt` (or `forbidden`, host's
-choice); an unrestricted mode floors both at `safe`. For dedicated tools the floor is the
-verdict. For the shell tool the intent verdict *replaces* the floor — it may fall below it
-(a command whose matched roles are all read-only auto-approves through a mutating tool: the
+a read-only mode is `φ(read-only) = safe, φ(guarded|mutating) = prompt` (or `forbidden`, host's
+choice); an unrestricted mode floors all three at `safe`. For dedicated tools the floor is the
+verdict. For a guarded shell the intent verdict *replaces* the floor — it may fall below it
+(a command whose matched roles are all read-only auto-approves through a guarded tool: the
 recovered granularity is the payoff) and may rise above it (`forbidden` refuses outright).
 The soundness of falling below the floor is exactly the role check above: the verdict is
 grounded in what the command binds, not the tool's worst case.

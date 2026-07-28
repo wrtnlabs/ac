@@ -2,7 +2,10 @@
 
 **Status:** implemented — specification of record (2026-07-21). **Amended 2026-07-24:** §3.3
 gains the *prefix-remap* and *deny* combinators and single-file grants; the composition laws are
-restated to cover them. **Requires:** nothing. **Required by:** [ac-mcp.md](ac-mcp.md) (wire tools enter through the raw form), [ac-sandbox.md](ac-sandbox.md)
+restated to cover them. **Amended 2026-07-28:** §4.3 adds the host-injected URL policy for
+`fetch`; §4.2 and §4.4 make file and shell execution reusable by host adapters with
+different schemas or presentation; §2.3
+specifies durable and transient tool output. **Requires:** nothing. **Required by:** [ac-mcp.md](ac-mcp.md) (wire tools enter through the raw form), [ac-sandbox.md](ac-sandbox.md)
 (implements the launcher seam carried here). **Interacts with:** [ac-skills.md](ac-skills.md) (hosts admit skill roots as read grants), [ac-loop.md](ac-loop.md) (every
 call dispatches through the registry), [ac-approvals.md](ac-approvals.md) (capability is the hook a
 read-only permission mode gates on).
@@ -52,16 +55,50 @@ unknown name is error data (R3).
 
 ### 2.2 Capability
 
-Capability is a two-valued classification — **read-only** (cannot alter state the host answers for)
-or **mutating** (may) — total by construction: the class is part of the tool's definition, so an
-unclassified tool is unrepresentable (R4). Its one intended consumer is the permission mode of
-[ac-approvals.md](ac-approvals.md) — design of record, not yet implemented — which lets read-only
-tools run freely and gates the rest; the class is carried and exposed, gating is that layer's job.
+Capability is a three-valued classification — **read-only** (cannot alter host-owned state),
+**guarded** (may mutate normally, but a host policy can collapse its effects to a read-only-safe
+surface), or **mutating** — total by construction: the class is part of the tool's definition, so an
+unclassified tool is unrepresentable (R4). `ToolRegistry::retain_for_read_only` keeps read-only and
+guarded tools and drops mutating ones for both typed and raw registrations. A guarded tool is safe
+there only because the host installs the matching policy; `shell` is the canonical case, with the
+kernel write set collapsed to scratch space.
 
 The **untrusted-claims rule** (its wire-side formalization lives in [ac-mcp.md](ac-mcp.md) §2): a compiled-in declaration is the host's own code — trusted. Wire
 annotations are self-claimed hints the MCP specification itself forbids trust decisions on, so every
 wire tool defaults to **mutating**; a host MAY opt in to honoring a read-only claim, per server it
-trusts. A lying server gains nothing: it is already in the gated class.
+trusts. Wire hints never produce **guarded** — that classification asserts host enforcement, not a
+server claim. A lying server gains nothing: it is already in the gated class.
+
+### 2.3 Output lifetime
+
+`ToolOutput` separates three things that must not share a persistence lifetime:
+
+- `content` is the current result string. The runtime emits it in the live `ToolResult` event and
+  projects it onto the next request in the producing turn.
+- `durable_content`, when present, is the truthful fallback recorded in the rollout instead.
+  When absent, `content` is itself durable.
+- `transient_parts` are live-only typed parts. The implemented part is an image carrying
+  `(media_type, Arc<str> base64)`; `Arc` lets a host share the allocation with a preview cache.
+
+The runtime retains transient outputs in a turn-local, call-id-keyed FIFO with a configurable byte
+budget (`AgentConfig::transient_tool_output_bytes`, 128 MiB by default). It overlays only entries
+whose durable `ToolResult` is present, placing their image parts in a user message after the whole
+tool-result message; this preserves `assistant(tool_calls) -> tool* -> user(image)` when calls ran
+concurrently. Oldest entries that cross the budget are evicted as a unit and naturally fall back to
+their recorded result, so no orphan image remains. An individually oversized entry is evicted too.
+
+Projection happens **before** step-prepare hooks. Hooks therefore see the exact live request and
+retain their established final authority to redact or remove it. `TailCacheHook` skips image-only
+rows and marks the last cacheable text/tool-result messages instead. The rollout, `Session::messages`,
+a later turn, resume, and fork never contain transient parts or base64; they see only the durable
+fallback. This boundary is structural, not a convention delegated to hosts.
+
+One semantic invariant spans both views: if history-derived control logic reads a tool result
+(forced-chain release, conditional tool reveal, or any similar predicate), `content` and its
+durable fallback MUST preserve the same control facts. Otherwise the producing turn and a
+resume/fork make different policy decisions from the same call. Ordinary control-plane results
+such as `tool_search` should normally omit the override entirely; durable divergence is for
+stripping transient representation, not changing the result's meaning.
 
 ## 3. The path-policy algebra
 
@@ -147,14 +184,68 @@ type, the kit never knowing the types; and the two ledgers of §4.2.
 ### 4.2 Read-before-write
 
 The context carries a per-run **file-times ledger**: the file-reading tool stamps the modification
-time it observed; the file-writing tools consult it before overwriting. Observation via search or
+time and size it observed, plus the time of that read; the file-writing tools consult it before
+overwriting. Observation via search or
 listing deliberately confers no overwrite right — only a content read does. The check yields one of
 four verdicts — *new* (target absent; free to create), *fresh* (read this run, unchanged since),
 *never-read*, *stale* (read, but changed on disk since) — and a write proceeds only on *new* or
 *fresh*; the other two return as error data telling the model to read first (or again), and a
-successful write re-stamps, so a writer retains freshness. The context also carries per-path
+successful write re-stamps, so a writer retains freshness. The ledger and its app-actionable
+never-read/stale errors are one `ToolCtx` field; a host MUST NOT install a second freshness tracker
+in extensions. The context also carries per-path
 **locks**: a file-writing tool holds its resolved path's lock across check→modify→write, so
 concurrent edits of one file serialize instead of losing an update; distinct paths never contend.
+Those locks coordinate calls inside one run; they are not a defense against another process changing
+the directory tree.
+
+`FileMutation` is the reusable transaction behind the compiled write and edit tools. A host that
+needs different schema/copy or result envelopes begins one mutation on a model-supplied or already
+policy-resolved path, optionally reads/transforms under its lock, and commits full replacement
+bytes. The mutation authorizes the path itself. AC owns the
+metadata checks, optimistic-mtime guard, shared ledger assertion, `WriteObserver` call, parent
+creation, write, post-write stat, and re-stamp. `WriteObserver` is the host seam for an undo/history
+ring and is called with prior bytes only for a content-changing overwrite. `read_text_slice` and
+`list_directory` similarly own resolved-path read/enumeration mechanics while leaving routing and
+presentation to the host. The pure `fuzzy_replace` cascade is shared by the compiled edit tool and
+host adapters; it tolerates common textual drift but refuses ambiguity and disproportionate spans.
+
+A policy's `authorize_read` / `authorize_write` verdict retains both the resolved path and the
+specific policy root that contains it. On Unix, every stock file operation opens that root as a
+directory descriptor, traverses each later component with descriptor-relative `O_NOFOLLOW`, and
+creates missing parents with `mkdirat` followed by the same no-follow open. Reads inspect and consume
+one opened descriptor; mutation commits read prior bytes and truncate/write that same leaf
+descriptor. Therefore a concurrent absent-parent or existing-parent symlink swap can make the
+operation fail, but cannot redirect it outside the authorized root. This is intentionally stronger
+than re-canonicalizing immediately before a path-based open, which merely moves the race window.
+
+The non-Unix implementation is an explicit compatibility fallback over standard path APIs. It
+preserves policy authorization and tool behavior, but is not yet hardened against directory-symlink
+TOCTOU; its cfg-gated test fixes that claim in place until a Windows handle-relative traversal
+replaces it.
+
+### 4.3 Network fetch policy
+
+The compiled `fetch` tool accepts a host-supplied URL policy. The tool parses the initial URL,
+admits only HTTP(S), and asks that policy before opening the request. Redirects are followed
+manually so every resolved redirect target passes the same scheme and host-policy checks before its
+socket is opened. A refusal is model-facing tool-error data. AC supplies an exact-origin policy
+(scheme + host + effective port); hosts may inject another policy through the same trait, register
+unrestricted `fetch`, or omit the tool entirely. This policy governs in-process `fetch` only and
+does not widen the sandboxed `shell` tool's independent network mode. The run's cancellation signal
+and one wall-clock deadline bound the complete redirect/request/body sequence; the default is 30
+seconds and a host may override it with `Fetch::with_timeout`. The deadline is total, not renewed at
+each redirect, and both cancellation and expiry return model-facing error data.
+
+### 4.4 Shell execution adapters
+
+`execute_shell` is the one command-execution mechanism. The compiled `shell` tool supplies its
+typed schema and default `sh -c` policy; a product host may supply a login shell, environment
+overlay, timeout, cwd presentation, transcript policy, and result envelope through
+`ShellExecRequest`. Both paths use the same sandbox preparation, approval classification,
+stdout/stderr bounding, transcript capture, cancel/timeout handling, process-group termination, and
+reaping. The process group is swept even after a successful leader exit, so background children
+cannot survive a tool call. A host shell adapter MUST use this executor rather than spawning a
+second runtime above AC.
 
 ## 5. Invariants
 
@@ -173,6 +264,13 @@ concurrent edits of one file serialize instead of losing an update; distinct pat
   *fresh* verdict from the ledger, serialized by the path lock.
 - **I7 (model-attributable failure is data).** Unknown name, undecodable input, policy refusal, and
   tool-level failure all return as error output; the registry and dispatcher do not fault.
+- **I8 (redirects cannot widen fetch authority).** Every URL the compiled `fetch` tool requests,
+  including each redirect target, was admitted by the same host policy before that request opened.
+- **I9 (fetch cannot hold a cancelled turn).** The complete redirect/request/body operation races
+  the run's cancellation signal and one total host-configurable deadline.
+- **I10 (one mutation and process plane).** Host-specific file/shell presentation may wrap AC's
+  execution primitives, but does not replace their ledgers, locks, observer ordering, sandbox,
+  approval, cancellation, or cleanup mechanics.
 
 ## 6. Division of responsibility
 
@@ -184,6 +282,10 @@ concurrent edits of one file serialize instead of losing an update; distinct pat
 | Resolution and the containment verdict | the policy (kit combinators or the host's own) |
 | Calling the resolver before touching any path | every tool |
 | Capability truth for wire tools | host (per-server trust opt-in) |
+| URL authority exposed through compiled `fetch` | host policy; AC enforces it on every hop |
+| Fetch cancellation and total timeout | AC; host may configure the deadline |
+| File read/write transaction, freshness, locking, fuzzy replacement | AC; host supplies path policy, copy/result mapping, and optional observer |
+| Command execution, approval, capture, cancellation, process cleanup | AC `execute_shell`; host supplies command/cwd/env/transcript policy |
 | Kernel containment of spawned processes | the launcher ([ac-sandbox.md](ac-sandbox.md)) |
 
 ## 7. Deferred

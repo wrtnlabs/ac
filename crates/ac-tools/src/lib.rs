@@ -6,8 +6,9 @@
 //! - [`ReadFile`], [`WriteFile`], [`EditFile`], [`ListFiles`] — file I/O with a
 //!   per-run read-before-write ledger.
 //! - [`Glob`], [`Grep`] — filename and content search.
-//! - [`Shell`] — run commands (cwd-contained; no OS sandbox in this phase).
-//! - [`Fetch`] — HTTP(S) GET (the one network tool).
+//! - [`Shell`] — run commands through the host sandbox and approval policy.
+//! - [`Fetch`] — HTTP(S) GET under an optional host-supplied [`FetchUrlPolicy`]
+//!   (the one network tool).
 //!
 //! Every path a tool touches is first run through the host-supplied
 //! [`ac_tool::PathPolicy`] on the [`ac_tool::ToolCtx`]; these tools never act on
@@ -18,20 +19,38 @@
 //! structs to expose only a subset (e.g. drop [`Shell`]/[`Fetch`] for a
 //! read-only, offline host).
 
+mod edit_replace;
 mod fetch;
 mod files;
+mod rooted_fs;
 mod search;
 mod shell;
 mod task;
+mod tool_search;
 
-pub use fetch::{Fetch, FetchInput};
+pub use edit_replace::{
+    EMPTY_OLD_STRING_MESSAGE, convert_to_line_ending, detect_line_ending, fuzzy_replace,
+    is_disproportionate_match, normalize_line_endings,
+};
+pub use fetch::{
+    AllowedOrigins, DEFAULT_FETCH_TIMEOUT, Fetch, FetchInput, FetchUrl, FetchUrlPolicy,
+};
 pub use files::{
-    EditFile, EditFileInput, ListFiles, ListFilesInput, ReadFile, ReadFileInput, WriteFile,
-    WriteFileInput,
+    DirectoryEntry, DirectoryEntryKind, DirectoryListing, EditFile, EditFileInput, ExpectedMtime,
+    FileCommit, FileMutation, FileMutationError, FileWriteResult, ListFiles, ListFilesInput,
+    ReadBytes, ReadBytesError, ReadFile, ReadFileInput, ReadTextError, ReadTextSlice, WriteFile,
+    WriteFileInput, ensure_directory_authorized, list_directory, list_directory_authorized,
+    list_directory_authorized_blocking, mtime_ms_f64, read_bytes_authorized,
+    read_bytes_authorized_blocking, read_text_slice, read_text_slice_authorized,
+    write_atomic_authorized,
 };
 pub use search::{Glob, GlobInput, Grep, GrepInput};
-pub use shell::{Shell, ShellInput, ShellSpillDir};
+pub use shell::{
+    Shell, ShellCaptureOptions, ShellExecRequest, ShellExecResult, ShellInput, ShellKillReason,
+    ShellSpillDir, execute_shell, tail_output,
+};
 pub use task::{Task, TaskInput};
+pub use tool_search::{TOOL_SEARCH_NAME, ToolSearch, ToolSearchEntry, ToolSearchInput};
 
 use ac_tool::ToolRegistry;
 
@@ -49,7 +68,7 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(Glob);
     registry.register(Grep);
     registry.register(Shell);
-    registry.register(Fetch);
+    registry.register(Fetch::default());
 }
 
 #[cfg(test)]
@@ -131,7 +150,8 @@ mod tests {
             )
             .await;
         assert!(write.is_error);
-        assert!(write.content.contains("must read_file"));
+        assert!(write.content.contains("You must read file"));
+        assert!(write.content.contains("Use the Read tool first"));
     }
 
     #[tokio::test]
@@ -183,7 +203,12 @@ mod tests {
             )
             .await;
         assert!(write.is_error, "{}", write.content);
-        assert!(write.content.contains("changed on disk"));
+        assert!(
+            write
+                .content
+                .contains("has been modified since it was last read")
+        );
+        assert!(write.content.contains("Please read the file again"));
     }
 
     #[tokio::test]
@@ -220,7 +245,7 @@ mod tests {
             )
             .await;
         assert!(dup.is_error);
-        assert!(dup.content.contains("must be unique"));
+        assert!(dup.content.contains("multiple matches"));
 
         // "zzz" absent -> error.
         let none = r
@@ -231,7 +256,7 @@ mod tests {
             )
             .await;
         assert!(none.is_error);
-        assert!(none.content.contains("not found"));
+        assert!(none.content.contains("Could not find"));
     }
 
     #[tokio::test]

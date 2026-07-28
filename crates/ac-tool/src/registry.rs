@@ -109,6 +109,22 @@ impl ToolRegistry {
         self.tools.get(name).map(|t| t.capability())
     }
 
+    /// Retain tools selected by their declared capability.
+    ///
+    /// Hosts should compose name-based [`ToolScope`](crate::ToolScope) while
+    /// registering a child surface, then use this filter for effect modes.
+    /// This keeps both typed and [`RawTool`] registrations on the same
+    /// authority path and makes unknown future tools fail closed naturally.
+    pub fn retain_capabilities(&mut self, mut keep: impl FnMut(&str, Capability) -> bool) {
+        self.tools
+            .retain(|name, tool| keep(name, tool.capability()));
+    }
+
+    /// Drop mutating tools while retaining read-only and policy-guarded tools.
+    pub fn retain_for_read_only(&mut self) {
+        self.retain_capabilities(|_, capability| capability.allowed_in_read_only());
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
@@ -240,6 +256,30 @@ mod tests {
         }
     }
 
+    struct GuardedRawEcho;
+
+    impl RawTool for GuardedRawEcho {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "guarded_echo".into(),
+                description: "A policy-guarded raw tool.".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        fn capability(&self) -> Capability {
+            Capability::Guarded
+        }
+
+        fn run(
+            self: Arc<Self>,
+            input: Value,
+            _ctx: Arc<ToolCtx>,
+        ) -> BoxFuture<'static, ToolOutput> {
+            Box::pin(std::future::ready(ToolOutput::ok(input.to_string())))
+        }
+    }
+
     #[tokio::test]
     async fn raw_tool_spec_is_verbatim_and_input_passes_through() {
         let mut registry = ToolRegistry::new();
@@ -277,5 +317,19 @@ mod tests {
         let out = registry.run("missing", serde_json::json!({}), ctx()).await;
         assert!(out.is_error);
         assert!(out.content.contains("unknown tool"));
+    }
+
+    #[test]
+    fn read_only_filter_uses_typed_and_raw_capabilities() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Echo);
+        registry.register_raw(RawEcho);
+        registry.register_raw(GuardedRawEcho);
+
+        registry.retain_for_read_only();
+
+        assert!(registry.contains("echo"));
+        assert!(registry.contains("guarded_echo"));
+        assert!(!registry.contains("raw_echo"));
     }
 }
