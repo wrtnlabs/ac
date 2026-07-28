@@ -3,6 +3,8 @@
 //! unified [`CompletionEvent`] enum. Owns the parts a generic SDK gets wrong:
 //! Anthropic `cache_control` breakpoints, usage accounting, error taxonomy.
 
+pub mod images;
+
 use ac_provider::{CompletionRequest, EventStream, Provider, ServerTool, ToolChoice};
 use ac_types::{
     CacheMark, Citation, CompletionError, CompletionEvent, ContentPart, Effort, Role, StopReason,
@@ -563,6 +565,55 @@ mod tests {
         let messages = build_messages(&request);
         assert_eq!(messages[0]["role"], json!("tool"));
         assert_eq!(messages[0]["tool_call_id"], json!("call_1"));
+    }
+
+    #[test]
+    fn transient_image_sequence_encodes_as_assistant_tool_then_user_image() {
+        let mut request = CompletionRequest::new("test/model");
+        request.messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentPart::ToolUse(ac_types::ToolUse {
+                    id: "call_1".into(),
+                    name: "see".into(),
+                    input: json!({}),
+                })],
+                cache: CacheMark::Off,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentPart::ToolResult(ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "live envelope".into(),
+                    is_error: false,
+                })],
+                cache: CacheMark::Off,
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentPart::Image {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                }],
+                cache: CacheMark::Off,
+            },
+        ];
+
+        let messages = build_messages(&request);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["assistant", "tool", "user"]
+        );
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[1]["content"], "live envelope");
+        assert_eq!(messages[2]["content"][0]["type"], "image_url");
+        assert_eq!(
+            messages[2]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
     }
 
     fn tool_result_part(id: &str, content: &str) -> ContentPart {

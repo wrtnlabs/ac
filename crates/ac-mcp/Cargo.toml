@@ -8,15 +8,26 @@ license.workspace = true
 [features]
 # Streamable-HTTP client transport (remote servers). Off by default: it pulls
 # an HTTP client + TLS stack that stdio-only hosts should not pay for.
-http = ["dep:http", "rmcp/transport-streamable-http-client-reqwest", "rmcp/reqwest"]
+http = [
+    "dep:base64",
+    "dep:http",
+    "dep:reqwest",
+    "dep:sha2",
+    "dep:tokio-util",
+    "dep:uuid",
+    "rmcp/transport-streamable-http-client-reqwest",
+    "rmcp/reqwest",
+]
 
 [dependencies]
 ac-tool.workspace = true
 ac-types.workspace = true
+base64 = { workspace = true, optional = true }
 futures.workspace = true
 # Not workspace-listed: only this crate needs it, only under `http`, and the
 # major must track rmcp's own `http` dependency.
 http = { version = "1", optional = true }
+reqwest = { workspace = true, optional = true }
 rmcp = { workspace = true, features = [
     "client",
     "transport-async-rw",
@@ -25,8 +36,12 @@ rmcp = { workspace = true, features = [
 ] }
 serde.workspace = true
 serde_json.workspace = true
+# Only the opt-in OAuth/HTTP path needs PKCE S256.
+sha2 = { version = "0.10", optional = true }
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 ac-provider.workspace = true

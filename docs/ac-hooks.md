@@ -8,7 +8,10 @@ return, so it cannot mutate what it watches — I4/I6). The runtime ships the RF
 **stateless forced chain** (`ForcedChainHook`): it forces a tool until the *effective history*
 (`request.messages`) shows a successful result of it, deriving the verdict from `E(L)` and
 never from a process-local flag — so resume and fork are correct for free (§3, I5), proven by
-an integration test that resumes past the bind and does not re-force. The two **contributing**
+an integration test that resumes past the bind and does not re-force. Reusable request-shaping
+hooks also ship for a bounded failed-call release (`BoundedForcedChainHook`), history-derived
+conditional tool visibility (`ConditionalToolsHook`), tail cache marks (`TailCacheHook`), and
+first-step-only provider tools (`FirstStepServerToolsOnly`). The two **contributing**
 phases — *session-context* (durable per-window fragments) and *turn-input* (per-turn mention
 injections) — are deferred: their contributions enter history as *marked* fragments
 ([ac-context.md](ac-context.md) R1), so they land with ac-context's window/turn cadence drivers
@@ -89,6 +92,7 @@ turn start (input I₀):
   H ← H ⧺ I₀ ⧺ (⧺ contribute_turn(I₀, E(L)) over turn-input contributors, in order)
 step i:
   ρ ← base_request(E(L))
+  ρ ← project_turn_local_tool_output(ρ)      live-only, bounded; never writes H
   for h in step-prepare contributors, in order:   ρ ← h(i, ρ, E(L))
   sample ρ; run tools                        — observation sees each start and finish
 ```
@@ -141,6 +145,23 @@ log shows the bind does not re-force; a branch cut before the bind forces again;
 second source of truth to desynchronize (R3). Caches are permitted only as memoization of
 such a derivation, scoped to a phase boundary and rebuilt there; the private stores lifecycle
 seeds are exactly this — runtime-enforced lifetimes, never ground truth.
+
+**Reusable request policies.** Common request-shaping mechanics live with the phase instead
+of being reimplemented by hosts:
+
+- `BoundedForcedChainHook` adds a history-derived failed-call budget to the forced chain. It
+  releases the hard choice after the budget; the host tool still enforces the precondition.
+- `ConditionalToolsHook` filters a configured latent set until a successful discovery-tool
+  result names tools in its `matched` array. Reveal state is reconstructed from `E(L)` on
+  every step, never mirrored in a host-side set.
+- `TailCacheHook` clears stale marks and marks the last cacheable (text/tool-result)
+  messages plus optional system prompt with a configured TTL. It skips transient image-only
+  rows, whose provider encoding has nowhere to attach the mark.
+- `FirstStepServerToolsOnly` removes provider-executed server tools after step zero.
+
+These hooks shape what the provider sees. The runtime separately refuses to dispatch a local
+tool whose exact name was not offered on that step; a filter is therefore an enforceable
+capability boundary, not merely a context optimization.
 
 **Neighboring seams.** The step boundaries the drain discipline acts at
 ([ac-queue-steer.md](ac-queue-steer.md) §4) are the boundaries step-prepare fires at; the

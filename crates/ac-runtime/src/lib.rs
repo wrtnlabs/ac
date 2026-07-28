@@ -9,17 +9,19 @@
 
 mod compaction;
 mod fragments;
+mod history;
 mod hooks;
 mod spawn;
 mod steer;
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ac_context::{FragmentRegistry, ReactiveSection, reactive_fragment};
 use ac_provider::{CompletionRequest, Provider, ServerTool};
 use ac_rollout::Rollout;
-use ac_tool::{ToolCtx, ToolRegistry};
+use ac_tool::{ToolCtx, ToolOutput, ToolOutputPart, ToolRegistry};
 use ac_types::{
     CacheMark, CompletionError, CompletionEvent, ContentPart, Effort, Message, Role, StopReason,
     TokenUsage, ToolResult, ToolUse,
@@ -31,7 +33,13 @@ use tokio_util::sync::CancellationToken;
 pub use compaction::{
     CompactionConfig, CompactionError, CompactionOutcome, CompactionStrategy, CompactionTrigger,
 };
-pub use hooks::{ForcedChainHook, HookRegistry, Observation, ObservationHook, StepPrepareHook};
+pub use history::{
+    ABORTED_TOOL_RESULT, is_contentless, repair_dangling_tool_uses, sanitize_messages,
+};
+pub use hooks::{
+    BoundedForcedChainHook, ConditionalToolsHook, FirstStepServerToolsOnly, ForcedChainHook,
+    HookRegistry, Observation, ObservationHook, StepPrepareHook, TailCacheHook,
+};
 pub use spawn::ReferenceSpawner;
 pub use steer::{SteerError, SteerHandle, SteerInput, TurnClass};
 
@@ -39,12 +47,207 @@ use steer::SteerState;
 
 pub use ac_types::INTERRUPTION_MARKER;
 
+/// Default upper bound for live-only tool result data retained during one turn.
+///
+/// This is intentionally independent of the durable rollout: when the budget
+/// evicts an entry, the next request simply sees that call's recorded fallback.
+pub const DEFAULT_TRANSIENT_TOOL_OUTPUT_BYTES: usize = 128 * 1024 * 1024;
+
 /// Deactivates the active turn when the turn's scope ends, on every exit path
 /// including a panic unwind — so a stale active turn never outlives its
 /// `run_turn`.
 struct ActiveTurnGuard {
     state: Arc<SteerState>,
     id: String,
+}
+
+/// A tool result's live form, retained only while its producing turn runs.
+///
+/// The rollout contains the tool's durable fallback. On the next provider
+/// sample, matching results are overlaid with this content and followed by user
+/// image messages. Keeping this map inside `run_turn` makes the
+/// persistence boundary structural: a later turn, resume, or fork cannot
+/// accidentally replay base64 payloads.
+#[derive(Debug)]
+struct TransientToolOutput {
+    content: String,
+    parts: Vec<ToolOutputPart>,
+}
+
+impl TransientToolOutput {
+    fn retained_bytes(&self) -> usize {
+        self.content.len()
+            + self
+                .parts
+                .iter()
+                .map(|part| match part {
+                    ToolOutputPart::Image { media_type, data } => media_type.len() + data.len(),
+                })
+                .sum::<usize>()
+    }
+}
+
+/// FIFO-bounded turn-local outputs, keyed by provider tool-call id.
+struct TransientToolOutputs {
+    entries: HashMap<String, TransientToolOutput>,
+    order: VecDeque<String>,
+    retained_bytes: usize,
+    max_bytes: usize,
+}
+
+impl TransientToolOutputs {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            retained_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn insert(&mut self, id: String, output: TransientToolOutput) {
+        if let Some(previous) = self.entries.remove(&id) {
+            self.retained_bytes = self
+                .retained_bytes
+                .saturating_sub(previous.retained_bytes());
+            self.order.retain(|key| key != &id);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(output.retained_bytes());
+        self.order.push_back(id.clone());
+        self.entries.insert(id, output);
+
+        while self.retained_bytes > self.max_bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(evicted.retained_bytes());
+            }
+        }
+    }
+
+    /// Forget outputs after their one eligible provider sample.
+    fn consume(&mut self, ids: &HashSet<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            if let Some(output) = self.entries.remove(id) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(output.retained_bytes());
+            }
+        }
+        self.order.retain(|id| !ids.contains(id));
+    }
+}
+
+/// Project live tool output onto the request before host step hooks run.
+///
+/// A provider may encode all `ToolResult`s from one AC user message as a run of
+/// `role:"tool"` wire messages. Images therefore follow the whole result
+/// message, preserving the required `assistant(tool_calls) -> tool* -> user`
+/// ordering when several calls ran concurrently.
+fn overlay_transient_tool_outputs(
+    messages: &mut Vec<Message>,
+    outputs: &HashMap<String, TransientToolOutput>,
+) -> HashSet<String> {
+    let mut overlaid = HashSet::new();
+    if outputs.is_empty() {
+        return overlaid;
+    }
+
+    let mut index = 0usize;
+    while index < messages.len() {
+        let mut images = Vec::new();
+        for part in &mut messages[index].content {
+            let ContentPart::ToolResult(result) = part else {
+                continue;
+            };
+            let Some(output) = outputs.get(&result.tool_use_id) else {
+                continue;
+            };
+            overlaid.insert(result.tool_use_id.clone());
+            result.content.clone_from(&output.content);
+            for part in &output.parts {
+                match part {
+                    ToolOutputPart::Image { media_type, data } => {
+                        images.push(ContentPart::Image {
+                            media_type: media_type.clone(),
+                            data: data.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !images.is_empty() {
+            messages.insert(
+                index + 1,
+                Message {
+                    role: Role::User,
+                    content: images,
+                    cache: CacheMark::Off,
+                },
+            );
+            index += 1;
+        }
+        index += 1;
+    }
+    overlaid
+}
+
+/// Reconstruct only the transient calls from a tool step that compaction is
+/// about to replace.
+///
+/// The returned messages contain durable result bodies. They live only in
+/// `run_turn`; the ordinary transient projection overlays their live content
+/// immediately before the next provider sample. Replaying the matching
+/// `ToolUse` alongside each result preserves provider call/result ordering
+/// without putting either the replay or its pixels into the rollout.
+fn compacted_transient_replay(
+    tool_uses: &[ToolUse],
+    tool_results: &[ContentPart],
+    outputs: &HashMap<String, TransientToolOutput>,
+) -> Vec<Message> {
+    if outputs.is_empty() {
+        return Vec::new();
+    }
+
+    let uses: Vec<ContentPart> = tool_uses
+        .iter()
+        .filter(|tool_use| outputs.contains_key(&tool_use.id))
+        .cloned()
+        .map(ContentPart::ToolUse)
+        .collect();
+    if uses.is_empty() {
+        return Vec::new();
+    }
+
+    let results: Vec<ContentPart> = tool_results
+        .iter()
+        .filter(|part| {
+            matches!(
+                part,
+                ContentPart::ToolResult(result) if outputs.contains_key(&result.tool_use_id)
+            )
+        })
+        .cloned()
+        .collect();
+    if results.is_empty() {
+        return Vec::new();
+    }
+
+    vec![
+        Message {
+            role: Role::Assistant,
+            content: uses,
+            cache: CacheMark::Off,
+        },
+        Message {
+            role: Role::User,
+            content: results,
+            cache: CacheMark::Off,
+        },
+    ]
 }
 
 impl Drop for ActiveTurnGuard {
@@ -72,6 +275,10 @@ pub struct AgentConfig {
     /// §3). A default, not a freeze — a step-prepare hook may override it per
     /// step. `None` uses the provider's default.
     pub effort: Option<Effort>,
+    /// Maximum live-only tool-output bytes retained during one turn. Oldest
+    /// call ids are evicted first; their durable results remain intact.
+    /// Defaults to 128 MiB. Set to zero to disable transient replay.
+    pub transient_tool_output_bytes: usize,
 }
 
 impl Default for AgentConfig {
@@ -84,6 +291,7 @@ impl Default for AgentConfig {
             idle_timeout: Some(Duration::from_secs(300)),
             compaction: None,
             effort: None,
+            transient_tool_output_bytes: DEFAULT_TRANSIENT_TOOL_OUTPUT_BYTES,
         }
     }
 }
@@ -208,8 +416,9 @@ impl Session {
         registry: Arc<ToolRegistry>,
         ctx: Arc<ToolCtx>,
         config: AgentConfig,
-        history: Vec<Message>,
+        mut history: Vec<Message>,
     ) -> Self {
+        sanitize_messages(&mut history);
         let mut rollout = Rollout::create();
         for m in history {
             rollout.record_message(m);
@@ -247,7 +456,9 @@ impl Session {
         session.turn_counter = highest;
         // Seed `τ` from a size estimate so a resumed session over budget can
         // compact on its first turn instead of waiting one turn for real usage.
-        let estimate = compaction::estimate_tokens(&rollout.project());
+        let mut model_history = rollout.project();
+        sanitize_messages(&mut model_history);
+        let estimate = compaction::estimate_tokens(&model_history);
         session.last_usage = TokenUsage {
             input_tokens: estimate,
             ..TokenUsage::default()
@@ -291,7 +502,7 @@ impl Session {
         }
         let sections = self.reactive.clone();
         for section in sections {
-            let history = self.rollout.project();
+            let history = self.model_messages();
             let texts: Vec<String> = history.iter().map(compaction::message_text).collect();
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             if let Some(fragment) = reactive_fragment(section.as_ref(), &refs) {
@@ -304,7 +515,7 @@ impl Session {
     /// turn started now (post-compaction, post-rewind). Owned: it is a
     /// projection of the log, not a field.
     pub fn messages(&self) -> Vec<Message> {
-        self.rollout.project()
+        self.model_messages()
     }
 
     /// The underlying append-only log, for hosts that persist or fork it.
@@ -321,6 +532,17 @@ impl Session {
 
     fn record(&mut self, msg: Message) {
         self.rollout.record_message(msg);
+    }
+
+    /// Provider-safe projection of the effective history.
+    ///
+    /// New turns satisfy these invariants at the source; sanitization remains
+    /// here so a legacy/imported full rollout cannot poison every future
+    /// request.
+    fn model_messages(&self) -> Vec<Message> {
+        let mut messages = self.rollout.project();
+        sanitize_messages(&mut messages);
+        messages
     }
 
     fn next_turn(&mut self) -> u64 {
@@ -390,6 +612,15 @@ impl Session {
         // before new user intent lands, so the next step's drain is skipped once
         // ([docs/ac-compaction.md] §5, [docs/ac-queue-steer.md] §4).
         let mut defer_drain_once = false;
+        // Live-only tool payloads belong to this invocation of `run_turn`, not
+        // to Session state. The next user turn and every resumed/forked session
+        // see only the durable results recorded in the rollout.
+        let mut transient_tool_outputs =
+            TransientToolOutputs::new(self.config.transient_tool_output_bytes);
+        // A mid-turn compaction removes the just-recorded tool exchange from
+        // H′. Keep a durable-only reconstruction here until the next ordinary
+        // provider sample can receive the transient overlay exactly once.
+        let mut pending_compacted_transient_replay = Vec::new();
 
         // Pre-turn trigger: clear the runway before the first step.
         if self.over_budget() {
@@ -451,16 +682,37 @@ impl Session {
             let mut req = CompletionRequest::new(&self.config.model);
             req.system = self.config.system.clone();
             req.cache_system = self.config.system.is_some().into();
-            req.messages = self.rollout.project();
+            req.messages = self.model_messages();
             req.tools = self.registry.specs();
             req.server_tools = self.config.server_tools.clone();
             req.effort = self.config.effort;
+
+            // A successful mid-turn compaction has removed the matching
+            // call/result pair from the durable projection. Restore that pair
+            // only in this outgoing request so the existing overlay can attach
+            // live content and images without persisting them.
+            req.messages.append(&mut pending_compacted_transient_replay);
+
+            // Transient results are an ephemeral projection over the durable
+            // rollout. Apply them before hooks so step-prepare remains the
+            // final authority over the outgoing request (redaction included).
+            let overlaid =
+                overlay_transient_tool_outputs(&mut req.messages, &transient_tool_outputs.entries);
 
             // Step-prepare hooks fold last, so a hook MAY override the effort
             // default per step ([docs/ac-ultra.md] §3, [docs/ac-hooks.md]).
             for hook in self.hooks.step_prepare() {
                 hook.prepare(iteration, &mut req);
             }
+            // The request now owns its cloned live payload. Drop the turn-local
+            // source before sampling so no later same-turn request can replay
+            // an already-offered image or live result.
+            transient_tool_outputs.consume(&overlaid);
+            // The exact local-tool authority granted to this sampling request.
+            // A provider-emitted call to a registered-but-filtered tool must
+            // fail as data instead of bypassing a visibility/permission hook.
+            let offered_tools: Arc<HashSet<String>> =
+                Arc::new(req.tools.iter().map(|tool| tool.name.clone()).collect());
 
             // Await the connection, but let a cancel break out of it.
             let mut stream = tokio::select! {
@@ -550,17 +802,19 @@ impl Session {
             }
 
             let mut assistant_content: Vec<ContentPart> = Vec::new();
-            if !text.is_empty() {
+            if !text.trim().is_empty() {
                 assistant_content.push(ContentPart::Text { text });
             }
             for tu in &tool_uses {
                 assistant_content.push(ContentPart::ToolUse(tu.clone()));
             }
-            self.record(Message {
-                role: Role::Assistant,
-                content: assistant_content,
-                cache: CacheMark::Off,
-            });
+            if !assistant_content.is_empty() {
+                self.record(Message {
+                    role: Role::Assistant,
+                    content: assistant_content,
+                    cache: CacheMark::Off,
+                });
+            }
 
             // A completed step makes the queue drainable from here on.
             drainable = true;
@@ -596,19 +850,89 @@ impl Session {
                     name: tu.name.clone(),
                 });
                 let registry = self.registry.clone();
-                let ctx = self.ctx.clone();
+                // Every concurrent dispatch gets the exact provider call id in
+                // its own shallow context clone. Run-scoped policy/state remain
+                // shared; invocation identity cannot be reordered by task
+                // scheduling or observation hooks.
+                let ctx = Arc::new(self.ctx.for_invocation(tu.id.clone()));
                 let name = tu.name.clone();
                 let input = tu.input.clone();
-                let handle = tokio::spawn(async move { registry.run(&name, input, ctx).await });
+                let offered_tools = offered_tools.clone();
+                let handle = tokio::spawn(async move {
+                    if !offered_tools.contains(&name) {
+                        ToolOutput::error(format!(
+                            "tool '{name}' was not available on this step; use an offered discovery tool first"
+                        ))
+                    } else {
+                        registry.run(&name, input, ctx).await
+                    }
+                });
                 handles.push((tu.id.clone(), tu.name.clone(), handle));
             }
 
             let mut user_content: Vec<ContentPart> = Vec::with_capacity(handles.len());
-            for (id, name, handle) in handles {
-                let (content, is_error) = match handle.await {
-                    Ok(out) => (out.content, out.is_error),
-                    Err(e) => (format!("tool '{name}' panicked: {e}"), true),
+            let mut handles = handles.into_iter();
+            while let Some((id, name, mut handle)) = handles.next() {
+                let joined = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        handle.abort();
+                        let mut aborted = vec![(id.clone(), name.clone())];
+                        for (pending_id, pending_name, pending_handle) in handles {
+                            pending_handle.abort();
+                            aborted.push((pending_id, pending_name));
+                        }
+                        for (aborted_id, aborted_name) in aborted {
+                            self.hooks.observe(&Observation::ToolFinish {
+                                id: aborted_id.clone(),
+                                name: aborted_name.clone(),
+                                is_error: true,
+                            });
+                            let _ = sink.send(AgentEvent::ToolResult {
+                                id: aborted_id.clone(),
+                                name: aborted_name,
+                                output: ABORTED_TOOL_RESULT.to_string(),
+                                is_error: true,
+                            });
+                            user_content.push(ContentPart::ToolResult(ToolResult {
+                                tool_use_id: aborted_id,
+                                content: ABORTED_TOOL_RESULT.to_string(),
+                                is_error: true,
+                            }));
+                        }
+                        // Close every call before recording the interruption
+                        // marker. A cancelled turn is immediately valid
+                        // provider history, not something each host must heal
+                        // while reloading it.
+                        self.record(Message {
+                            role: Role::User,
+                            content: user_content,
+                            cache: CacheMark::Off,
+                        });
+                        self.on_user_cancel(turn_no);
+                        return Err(RuntimeError::Cancelled);
+                    }
+                    joined = &mut handle => joined,
                 };
+                let (content, durable_content, transient_parts, is_error) = match joined {
+                    Ok(out) => {
+                        let durable = out.durable_content.unwrap_or_else(|| out.content.clone());
+                        (out.content, durable, out.transient_parts, out.is_error)
+                    }
+                    Err(e) => {
+                        let content = format!("tool '{name}' panicked: {e}");
+                        (content.clone(), content, Vec::new(), true)
+                    }
+                };
+                if content != durable_content || !transient_parts.is_empty() {
+                    transient_tool_outputs.insert(
+                        id.clone(),
+                        TransientToolOutput {
+                            content: content.clone(),
+                            parts: transient_parts,
+                        },
+                    );
+                }
                 self.hooks.observe(&Observation::ToolFinish {
                     id: id.clone(),
                     name: name.clone(),
@@ -622,10 +946,15 @@ impl Session {
                 });
                 user_content.push(ContentPart::ToolResult(ToolResult {
                     tool_use_id: id,
-                    content,
+                    content: durable_content,
                     is_error,
                 }));
             }
+            let replay_after_compaction = compacted_transient_replay(
+                &tool_uses,
+                &user_content,
+                &transient_tool_outputs.entries,
+            );
             self.record(Message {
                 role: Role::User,
                 content: user_content,
@@ -640,7 +969,10 @@ impl Session {
                     .compact_inner(CompactionTrigger::MidTurn, &cancel, &provider, &sink)
                     .await
                 {
-                    Ok(_) => defer_drain_once = true,
+                    Ok(_) => {
+                        defer_drain_once = true;
+                        pending_compacted_transient_replay = replay_after_compaction;
+                    }
                     Err(CompactionError::NothingToCompact) => {}
                     Err(CompactionError::Cancelled) => {
                         self.on_user_cancel(turn_no);
@@ -693,7 +1025,7 @@ impl Session {
             .clone()
             .ok_or(CompactionError::Disabled)?;
 
-        let view = self.rollout.project();
+        let view = self.model_messages();
         let messages_before = view.len();
         let tokens_before =
             compaction::context_occupancy(&self.last_usage, cfg.exclude_cached_prefix);

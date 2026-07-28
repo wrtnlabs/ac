@@ -84,7 +84,10 @@ themselves; [ac-tools.md](ac-tools.md) specifies the two forms.
 
 **Record.** Results are appended to `H` as a single message, **in the order the model issued
 the calls** — never completion order — so `H` is deterministic under concurrency. Result
-events emit in the same order. The loop then re-checks its bounds and begins the next step.
+events emit in the same order. A tool may provide a different durable fallback plus transient
+image parts ([ac-tools.md](ac-tools.md) §2.3): the event carries current content, `H` records
+only the fallback, and a bounded turn-local projection restores current content and images for
+the next step before request hooks. The loop then re-checks its bounds and begins the next step.
 
 ## 4. Errors as data
 
@@ -115,14 +118,13 @@ fires before a record phase leaves `H` exactly as the last completed phase left 
 
 - **The cancellation token** (host-triggered, shared with every tool through the tool
   context). Observed at the step boundary, while awaiting the provider connection, and
-  between stream events — always with priority over forward progress. Cancellation mid-
+  between stream events or tool completions — always with priority over forward progress. Cancellation mid-
   sampling discards the partial response entirely: no half-recorded assistant message, `H`
-  ends at the previous boundary (R3). Cancellation is **not** observed between dispatch and
-  record: once tool calls are dispatched, the loop waits for their results, records them, and
-  terminates at the next boundary — so `H` never ends with an unanswered call. Cancellation
-  MUST come through the token: a host that instead abandons an in-flight turn, dropping its
-  computation mid-await, voids I2 and I3 — `H` would end with unanswered calls (R3). Tools
-  that block SHOULD observe the shared token themselves; the runtime does not preempt them.
+  ends at the previous boundary (R3). During tool execution the runtime aborts unfinished
+  tasks, synthesizes one errored result per unfinished call in issue order, records that
+  result row, then records the interruption marker and closes the turn. Thus `H` is valid
+  immediately; no host replay repair is required. Tools SHOULD still observe the shared
+  token for their own subprocess/resource cleanup.
 - **The idle timeout** (default five minutes; disable-able). Bounds *silence*, not duration:
   the clock arms once the provider accepts the request, re-arms on every stream event, and a
   stalled or never-closing stream terminates the turn with a timeout error. The connection
@@ -175,7 +177,5 @@ session. The initiating input, appended at turn start, persists in `H` however t
 
 - **Mid-turn input** — designed in [ac-queue-steer.md](ac-queue-steer.md); its drain
   discipline lands at the step boundaries specified here, changing nothing inside a step.
-- **Preemptive tool abort** — cancellation during execution is cooperative (the shared
-  token); forcibly killing a dispatched tool while preserving I2 is future work.
 - **Context-window management** — compaction is a distinct turn class over this same loop
   ([ac-compaction.md](ac-compaction.md)); the loop carries no truncation logic of its own.

@@ -63,14 +63,16 @@ The primitive has requirements the rest of this document satisfies:
 **The capability.** Delegation is an **injected context capability** — the same pattern as the OS
 sandbox launcher ([ac-sandbox.md](ac-sandbox.md)): the run context carries an optional **spawner**;
 `None` means delegation is unavailable here, and a delegation tool then refuses as data (§5). The
-kit expresses only *intent* across the seam: a **spawn request** — which agent to run, the child's
-initial input, an optional per-child model override, an optional per-child effort override (reserved
-and inert until effort lands on the wire, §6), and the parent's cancellation signal — and a **spawn
-result** — the child's session identifier, its final text, and a status (completed, aborted, or
-errored). The request carries no depth or parent handle: a host that opts into bounded recursion
-tracks depth in its own spawner state (§4), so the agnostic request stays minimal. The seam is pure
-data: it names no session, rollout, or provider type, because it lives in the tool contract, beneath
-the runtime.
+kit expresses only *intent* across the seam: a **spawn request** — the exact parent tool-call id,
+which agent to run, the child's initial input, optional per-child model and effort overrides, and
+the parent's cancellation signal — and a **spawn result** — the child's session identifier, its
+final text, and a status (completed, aborted, or errored). The runtime shallow-clones `ToolCtx` per
+dispatch and installs the provider's call id on that invocation; the delegation tool copies it into
+the spawn request. A host therefore never reconstructs call identity from observation order (which
+would permute concurrent delegations). The request carries no depth or parent handle: a host that
+opts into bounded recursion tracks depth in its own spawner state (§4), so the agnostic request stays
+minimal. The seam is pure data: it names no session, rollout, or provider type, because it lives in
+the tool contract, beneath the runtime.
 
 **What the spawner does.** To run a child, a spawner assembles a complete, independent run and drives
 it to completion: a provider; a **tool surface filtered** to the child's agent definition and
@@ -94,8 +96,8 @@ text, not as a system-prompt constant.
 
 **Agent definitions.** An **agent definition** is host-supplied data: a name and description (what
 the parent model reads when choosing whom to delegate to), an optional system prompt, a **tool
-scope** (the allow/deny filter over the registry), an optional default model, and a **read-only**
-flag. "Sub-agent" is not a type: a definition is just a definition, and "sub" exists only
+scope** (the allow/deny filter over the registry), optional default model and effort values, and a
+**read-only** flag. "Sub-agent" is not a type: a definition is just a definition, and "sub" exists only
 relationally — in the tool scope that omits delegation, the fresh child context, and the host's
 spawner→child link. The kit ships the *shape*; the definitions themselves are host content, like a
 skill catalog ([ac-tools.md](ac-tools.md) R3, host-owned trust).
@@ -143,9 +145,10 @@ MUST NOT foreclose that with a hard assertion. But the kit itself never propagat
 structural depth-1 is the floor.
 
 **Containment (R4).** A child inherits the parent's containment as an upper bound and may narrow it.
-A read-only definition resolves to reads-only in-process containment, a tool surface restricted to
-read-only-capability tools, and — where a launcher is installed — a kernel policy with an empty write
-set. A child MUST NOT carry the **containment-rebinding tools** — those that swap the active path
+A read-only definition resolves to reads-only in-process containment, a tool surface restricted by
+the registry to read-only and policy-guarded capabilities, and — where a launcher is installed — a
+kernel policy whose workspace write set is empty. A child MUST NOT carry the
+**containment-rebinding tools** — those that swap the active path
 policy ([ac-tools.md](ac-tools.md) §3.3) — that would let it *widen* its own reach; its binding is
 inherited from the parent, never re-negotiated by a child. The two containment layers
 compose for a child exactly as they compose for the parent ([ac-tools.md](ac-tools.md) I1,
@@ -235,6 +238,9 @@ coordinated sub-agents. Three guarantees keep that composable later without reop
 - **I6 (fresh root, not a fork).** A child log has no fork lineage; the delegation parentage lives in
   host metadata, never in the fork-lineage field. Forking remains peer-branch only
   ([ac-fork.md](ac-fork.md)).
+- **I7 (exact call identity).** Every spawn request carries the provider id from its own
+  invocation-scoped tool context. Concurrent delegations cannot exchange ids through scheduling or
+  observation order.
 
 ## 8. Division of responsibility
 

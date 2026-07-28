@@ -49,6 +49,14 @@ use serde_json::Value;
 /// declaring their own dependency (and without version skew).
 pub use rmcp;
 
+/// OAuth 2.1 protocol mechanics for remote MCP servers.
+#[cfg(feature = "http")]
+pub mod oauth;
+
+/// Shared loopback callback state machine for interactive OAuth.
+#[cfg(feature = "http")]
+pub mod oauth_callback;
+
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     /// The host-chosen server name can't be used (see [`McpConnection::connect`]).
@@ -403,6 +411,7 @@ impl McpConnection {
             .iter()
             .map(|tool| CachedToolSpec {
                 name: tool.name.to_string(),
+                registry_name: None,
                 description: tool.description.as_deref().map(str::to_string),
                 input_schema: Value::Object((*tool.input_schema).clone()),
                 read_only_hint: tool.annotations.as_ref().and_then(|a| a.read_only_hint),
@@ -615,6 +624,15 @@ const NO_DESCRIPTION: &str = "(no description provided by the MCP server)";
 pub struct CachedToolSpec {
     /// The tool's name as the server declared it (unprefixed).
     pub name: String,
+    /// Optional host-chosen provider-safe registry name. The raw [`Self::name`]
+    /// is still sent to the MCP server on `tools/call`.
+    ///
+    /// This lets a host persist one stable public name even when the remote
+    /// name contains characters provider APIs reject (for example `.`), or
+    /// when it applies collision-safe truncation. `None` preserves
+    /// [`RegisterOptions::prefix`] composition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_name: Option<String>,
     pub description: Option<String>,
     /// The server's declared input schema, verbatim.
     pub input_schema: Value,
@@ -637,10 +655,12 @@ pub type McpDialer =
 /// dial is one failed tool result — nothing is poisoned, the next call
 /// retries.
 ///
-/// Name validation, prefixing, capability classification, and skip accounting
-/// are exactly [`McpConnection::register_tools`]'s: `server_name` is held to
-/// the same rules as [`McpConnection::connect`]'s name, contract-violating
-/// tool names are skipped and reported, and every tool defaults to
+/// Name validation, capability classification, and skip accounting match
+/// [`McpConnection::register_tools`]. By default names use the configured
+/// prefix; a cached spec may instead carry a stable host-chosen
+/// [`CachedToolSpec::registry_name`] while preserving its raw remote call
+/// name. `server_name` is held to [`McpConnection::connect`]'s rules, invalid
+/// public names are skipped and reported, and every tool defaults to
 /// [`Capability::Mutating`] unless the host opted into trusting annotations.
 // The pre-existing `McpError::Service` variant embeds rmcp's `ServiceError`
 // (large by clippy's threshold); this is just the crate's first non-async fn
@@ -671,7 +691,10 @@ pub fn register_cached(
             });
             continue;
         }
-        let registry_name = format!("{prefix}{}", cached.name);
+        let registry_name = cached
+            .registry_name
+            .clone()
+            .unwrap_or_else(|| format!("{prefix}{}", cached.name));
         if let Some(reason) = tool_name_violation(&registry_name) {
             result.skipped.push(SkippedTool {
                 remote_name: cached.name.clone(),
@@ -1021,5 +1044,37 @@ mod tests {
         // Trailing underscore: server "a" + tool "_x" and server "a_" +
         // tool "x" would both be "mcp__a___x".
         assert!(server_name_violation("a_").is_some());
+    }
+
+    #[test]
+    fn cached_tool_can_keep_a_raw_remote_name_behind_a_provider_safe_public_name() {
+        let mut registry = ToolRegistry::new();
+        let dialer: McpDialer = Arc::new(|| {
+            Box::pin(async {
+                Err(McpError::Connect {
+                    server: "server".to_string(),
+                    message: "not dialed by registration".to_string(),
+                })
+            })
+        });
+        let result = register_cached(
+            &mut registry,
+            "server",
+            &[CachedToolSpec {
+                name: "issues.list".to_string(),
+                registry_name: Some("mcp__server__issues_list".to_string()),
+                description: Some("List issues".to_string()),
+                input_schema: serde_json::json!({ "type": "object" }),
+                read_only_hint: None,
+            }],
+            dialer,
+            &RegisterOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.registered, ["mcp__server__issues_list"]);
+        assert!(result.skipped.is_empty());
+        assert!(registry.contains("mcp__server__issues_list"));
+        assert!(!registry.contains("mcp__server__issues.list"));
     }
 }

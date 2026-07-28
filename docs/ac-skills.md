@@ -1,6 +1,6 @@
 # RFC: Skills — instruction packs as injected text
 
-**Status:** implemented — specification of record (2026-07-21).
+**Status:** implemented — specification of record (2026-07-28).
 **Requires:** nothing (skills ride the host's ordinary tool surface, [ac-tools.md](ac-tools.md)).
 **Interacts with:** [ac-context.md](ac-context.md) (catalog budgeting is deferred there),
 [ac-security.md](ac-security.md) and [ac-sandbox.md](ac-sandbox.md) (read grants are fixed at
@@ -34,42 +34,53 @@ path, and the map of all frontmatter fields as written. Companion material — `
 `references/`, `assets/` — is convention for the model, opaque to discovery. A skill's **text**
 is the file as authored, frontmatter included, capped at 256 KiB with marked truncation.
 
-The **name contract**: `n ∈ [a-z0-9]([a-z0-9-]*[a-z0-9])?`, at most 64 characters — a
-sublanguage of what the mention syntax (§4.2) consumes, so every valid name is mentionable.
-The description: required, non-empty, at most 1024 characters.
+The recursive resolver's **name contract** is
+`n ∈ [a-z0-9]([a-z0-9-]*[a-z0-9])?`, at most 64 characters — a sublanguage of what
+the mention syntax (§4.2) consumes, so every valid name is mentionable. Its `name` may fall
+back to the directory name. AC's optional direct-child resolver uses this contract:
+`n ∈ [a-z][a-z0-9-]*`, and `name` is required in the manifest. The description is required,
+must be a non-empty string after trimming, and is capped at 1024 characters in recursive mode.
 
 A **layer** is a root directory where skills live; hosts hand discovery an ordered sequence
-`Λ = ⟨λ₁, …, λₖ⟩` in precedence order (e.g. user, project, bundled). Discovery is a total
+`Λ = ⟨λ₁, …, λₖ⟩` in precedence order (e.g. first, second, third). Discovery is a total
 function `list(Λ) = (S, X)`: the listed skills plus every skipped candidate with its reason.
 
-**Frontmatter** is a `---`-fenced block of **single-line `key: value` scalars**, bare or quoted,
-ahead of the markdown body — deliberately not YAML. Supporting exactly the scalar subset means
-anything richer (block scalars, flow collections, nested mappings, anchors, aliases, tags) is
-rejected with a reason rather than silently read as a different value than a YAML parser would
-produce; the one YAML behavior mirrored inside bare values is the inline ` #` comment ending
-the value. Quoted values mirror YAML narrowly — double quotes recognize only the `\"` and `\\`
-escapes, single quotes double (`''`) to embed one — and a malformed quote (bad escape, missing
-close, trailing content) rejects the skill, as a duplicated key does; BOM, CRLF, blank and
-comment lines are tolerated. `name` is optional, falling back to the directory name; either
-way the result MUST satisfy the name contract — a directory named `My Skills` is skipped, not
-mangled into an identity. Unknown keys are preserved verbatim in `φ` for host-level conventions.
+**Frontmatter** is a `---`-fenced YAML mapping ahead of the markdown body. It accepts the data
+shapes used by real agentskills manifests: bare and quoted scalars, literal and folded block
+scalars, block and flow sequences, and nested/flow mappings. Values are retained as JSON-shaped
+data in `φ`; unknown keys are preserved for host-level conventions. An optional BOM, CRLF, blank
+lines, and comments are tolerated. Mapping keys must be strings. YAML anchors, aliases, and tags
+are rejected with a reason so every manifest remains self-contained rather than becoming a YAML
+object graph.
+
+The standard fields are validated once in the kit. `name` and `description` follow the selected
+resolver's contract above; `license` and `compatibility`, when present, must be strings;
+`allowed-tools` must be a sequence of strings; and `metadata`
+must be a mapping whose nested JSON-shaped values are preserved. Parsing `allowed-tools` is
+interoperability, not enforcement: it never changes the registered tools or policy (§5).
 
 ## 3. Discovery
 
-Each layer root is walked recursively for files named `SKILL.md`, under two bounds: directories
-deeper than 6 below the root are not descended (a bound, not a report), and at most 2000
-directories per root — hitting that cap emits a skip entry saying the remainder was not scanned.
-Dot-prefixed directories are not descended; unreadable subdirectories, like a missing or
-unreadable root, contribute nothing (hosts MAY point layers at directories that do not exist yet).
+The resolver exposes two application-agnostic policies over the same manifest parser:
 
-- **Symlinks.** Directory symlinks are followed, but each *physical* directory is scanned
-  once — a cycle terminates, an aliased directory cannot list a skill twice. An instruction
-  file that is itself a file symlink is not a candidate: the walk reports real files only.
-- **Duplicates.** Duplicate *names* are legal — both list; ambiguity is resolved at mention
-  time (R4), not by shadowing at discovery. Duplicate *canonical paths* (two layers reaching
-  one file) dedupe to the earlier layer, with a skip entry for the later.
-- **Freshness.** Every listing is a fresh scan of disk — no cache to invalidate. A name is
-  never joined into a filesystem path, so a traversal-shaped name resolves to nothing.
+- **Recursive (default).** Each layer root is walked recursively for files named `SKILL.md`,
+  under two bounds: directories deeper than 6 below the root are not descended (a bound, not a
+  report), and at most 2000 directories per root — hitting that cap emits a skip entry saying
+  the remainder was not scanned. Dot-prefixed directories are not descended. Directory symlinks
+  are followed, but each physical directory is scanned once, so cycles terminate and aliases do
+  not duplicate a skill. A symlinked `SKILL.md` file is not a candidate. Duplicate manifest
+  names are legal and remain ambiguous until mention time (R4); duplicate canonical paths dedupe
+  to the earlier layer, with a skip for the later.
+- **Direct children.** Each layer contributes only real immediate child directories whose names
+  match `[a-z][a-z0-9-]*` and which contain `SKILL.md`; symlinked directories and nested skills
+  are not candidates. Layers are visited in caller order. Once a directory loads successfully,
+  the same directory name in lower-priority layers is shadowed and reported as skipped. A broken
+  higher-layer candidate does not shadow a valid lower one. Shadow identity is the directory
+  name, independent of the manifest's `name`; successful skills are returned sorted by manifest
+  name. The canonical instruction path must remain inside its canonical layer root.
+
+Every listing in either mode is a fresh scan of disk — no cache to invalidate. A manifest name
+is never joined into a filesystem path, so a traversal-shaped name resolves to nothing.
 
 ## 4. The three channels
 
@@ -126,8 +137,9 @@ warning on the host's diagnostic channel, never a hard failure; the turn proceed
 
 - **No skill tool.** No list/load round-trip: the catalog is the list, the filesystem is the
   loader, and the model's ordinary read tools are the access path.
-- **No per-skill permissions, no allowed-tools.** A skill declares no capability requirements
-  and its use enforces none (R2). A host that contains reads grants its skill directories
+- **No per-skill permissions or allowed-tools enforcement.** A parsed `allowed-tools` field is
+  descriptive interoperability data only; its use enforces no capability requirements (R2).
+  A host that contains reads grants its skill directories
   read access **up front, at assembly** — in-process policy and OS sandbox both — including
   canonical directories a symlink resolves outside the root. Writes never widen for a skill.
 - **No execution surface.** A skill's `scripts/` run through the host's ordinary,
@@ -144,8 +156,9 @@ directories they trust as much as their own prompts, never at roots from untrust
 
 - **I1 (totality).** Every candidate instruction file the walk encounters either appears in
   the listing or has a skip entry with a reason; a truncated walk itself produces one.
-- **I2 (physical uniqueness).** Listed skills have pairwise distinct canonical paths; when
-  two layers reach one file, the earlier layer's entry survives.
+- **I2 (mode-specific uniqueness).** Recursive listings have pairwise distinct canonical paths;
+  direct-child listings have pairwise distinct directory names, with the earliest successfully
+  loaded layer surviving.
 - **I3 (verbatim body).** Injected contents are byte-identical to the authored file up to the
   256 KiB cap; truncation is marked and cuts on a character boundary.
 - **I4 (no guessing).** A plain mention selects iff exactly one listed skill carries the

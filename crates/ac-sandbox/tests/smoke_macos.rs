@@ -13,6 +13,7 @@ use std::thread;
 use ac_sandbox::OsSandbox;
 use ac_tool::{
     CommandSpec, NetworkMode, ResourceLimits, SandboxLauncher, SandboxMode, SandboxPolicy,
+    WriteDenyRule,
 };
 
 struct Run {
@@ -100,6 +101,56 @@ async fn a_write_outside_the_workspace_is_denied() {
 }
 
 #[tokio::test]
+async fn replacing_a_captured_root_with_a_symlink_grants_no_new_authority() {
+    use std::os::unix::fs::symlink;
+
+    let holder = workspace();
+    let root = holder.path().join("captured");
+    std::fs::create_dir(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let policy = SandboxPolicy::workspace(&root);
+
+    let moved = holder.path().join("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    let outside = workspace();
+    let outside_root = outside.path().canonicalize().unwrap();
+    symlink(&outside_root, &root).unwrap();
+
+    let r = run(policy, &root, "printf PWNED > escaped.txt").await;
+    assert_ne!(
+        r.exit,
+        Some(0),
+        "the replaced root must not become authority for its symlink target"
+    );
+    assert!(
+        !outside_root.join("escaped.txt").exists(),
+        "no file may be created in the replacement target"
+    );
+}
+
+#[tokio::test]
+async fn a_read_outside_explicit_roots_is_denied() {
+    let ws = workspace();
+    let root = ws.path().canonicalize().unwrap();
+    let outside = workspace();
+    let secret = outside.path().canonicalize().unwrap().join("secret");
+    std::fs::write(&secret, "TOP-SECRET-VALUE").unwrap();
+
+    let r = run(
+        SandboxPolicy::workspace(&root),
+        &root,
+        &format!("cat {}", secret.display()),
+    )
+    .await;
+    assert_ne!(r.exit, Some(0), "reading outside the grant must fail");
+    assert!(
+        !r.stdout.contains("TOP-SECRET-VALUE"),
+        "the global read grant must be gone; got {:?}",
+        r.stdout
+    );
+}
+
+#[tokio::test]
 async fn reading_a_denied_secret_is_blocked() {
     let ws = workspace();
     let root = ws.path().canonicalize().unwrap();
@@ -152,6 +203,55 @@ async fn writing_to_a_denied_path_inside_a_write_root_is_blocked() {
         !hooks.join("pre-commit").exists(),
         "the hook must not be on disk — a deny_paths entry is unconditional, \
          not merely 'earlier in the profile than some allow'"
+    );
+}
+
+#[tokio::test]
+async fn recursive_component_write_denies_hold_at_any_depth() {
+    let ws = workspace();
+    let root = ws.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("nested/repo/.git/hooks")).unwrap();
+    std::fs::create_dir_all(root.join("nested/config")).unwrap();
+
+    let policy = SandboxPolicy::workspace(&root).with_write_deny_rules([
+        WriteDenyRule::basename(".zshrc"),
+        WriteDenyRule::subtree([".git", "hooks"]),
+        WriteDenyRule::subtree([".idea"]),
+    ]);
+    let r = run(
+        policy,
+        &root,
+        "printf PWNED > nested/repo/.git/hooks/pre-commit; a=$?; \
+         printf PWNED > nested/config/.ZSHRC; b=$?; \
+         mkdir -p nested/more/.IDEA; c=$?; \
+         printf ok > nested/ordinary.txt; d=$?; \
+         printf '%s,%s,%s,%s' \"$a\" \"$b\" \"$c\" \"$d\"",
+    )
+    .await;
+
+    assert_eq!(r.mode, SandboxMode::Strict);
+    assert!(
+        !root.join("nested/repo/.git/hooks/pre-commit").exists(),
+        "nested hook must remain absent"
+    );
+    assert!(
+        !root.join("nested/config/.ZSHRC").exists(),
+        "mixed-case nested shell config must remain absent"
+    );
+    assert!(
+        !root.join("nested/more/.IDEA").exists(),
+        "mixed-case nested protected directory must remain absent"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("nested/ordinary.txt")).unwrap(),
+        "ok",
+        "ordinary writes remain available"
+    );
+    assert!(
+        r.stdout.ends_with(",0"),
+        "ordinary write must succeed; stdout={:?} stderr={:?}",
+        r.stdout,
+        r.stderr
     );
 }
 

@@ -12,7 +12,19 @@ ambiguous failures keeping their existing class. Separately, an offline catalog 
 connect-time-snapshot gap: a live connection exports its discovered tools as serializable
 cached specs, and a cached-registration path registers them connection-free with a
 host-injected dialer — first call dials, the batch memoizes the live connection, and a failed
-dial is one failed tool result, retried on the next call (§5). OAuth flows remain deferred.
+dial is one failed tool result, retried on the next call (§5).
+**Amended 2026-07-28:** cached specs may carry a host-chosen provider-safe registry name while
+retaining the raw remote call name. A persisted catalog MUST be bound to the exact server
+definition that produced it; changing a command, URL, headers, or auth policy invalidates that
+server's snapshot before registration. Hosts SHOULD translate config to connections through one
+adapter shared by probes, enumeration/OAuth, and lazy dialers (§5, §8).
+The opt-in `http` feature also owns application-agnostic OAuth 2.1 mechanics:
+protected-resource/authorization-server discovery, dynamic client registration, PKCE,
+authorization URL construction, code exchange, the loopback callback state machine, and the
+interactive coordinator. The coordinator serializes same-server flows, leases the one callback
+endpoint, observes caller and host cancellation throughout the flow, and guarantees pending-state
+cleanup. Hosts supply client metadata, browser hand-off, an async semantic credential store, and
+an authenticated enumerator (§7).
 **Requires:** [ac-tools.md](ac-tools.md) (the tool registry, the raw (runtime-described) registration
 path, errors-as-data), [ac-provider.md](ac-provider.md) (tool specs ride every sampling request —
 the exposure that motivates the name floor defined in §2). **Required by:** nothing yet. **Interacts with:**
@@ -156,6 +168,14 @@ arguments. The model sees a failed tool; the session continues.
   connection observed dead is re-dialed rather than kept as a corpse. Name floor, prefixing,
   capability distrust, and skip accounting are identical to live registration (I4–I6); the
   cached spec carries the server's read-only claim so the trust opt-in composes unchanged.
+  A cached spec MAY additionally carry a host-chosen `registry_name`; dispatch still sends its
+  raw `name` to the server.
+- **Catalog identity is host-enforced.** `CachedToolSpec` describes tools, not the connection
+  configuration that produced them. A host that persists specs MUST persist an identity for the
+  exact server definition beside them and MUST refuse snapshots whose identity no longer matches
+  the current definition. Keying only by a display/server name is unsafe: a same-name URL or
+  command overwrite otherwise pairs old schemas with a new dialer. Successful zero-tool
+  enumeration also needs an identity record, or it is retried on every boot.
 
 ## 6. Invariants
 
@@ -186,8 +206,13 @@ arguments. The model sees a failed tool; the session continues.
 | Result flattening, size cap, cancellation notification | kit |
 | Permission decisions over capability ([ac-approvals.md](ac-approvals.md)) | host |
 | Refresh policy — when to re-discover, rebuild vs. mutate | host |
+| Persisted catalog identity and invalidation on definition changes | host |
 | Surfacing skips and transport death to the operator | host |
 | Server-definition config format; importers from other tools | host (§8) |
+| OAuth metadata discovery, DCR, PKCE, authorization URL, and code exchange | kit (`http`) |
+| OAuth loopback routing, CSRF state dispatch, timeout, and cancellation | kit (`http`) |
+| OAuth stored-token probe, per-server single-flight, callback lease, cleanup, and re-enumeration sequencing | kit (`http`) |
+| OAuth client branding, browser launch, credential-store location/schema, and catalog/result mapping | host |
 
 ## 8. Server configuration format
 
@@ -218,6 +243,11 @@ the standard to follow is the *de-facto* one the ecosystem converged on, not any
   `url` definition maps onto the streamable-HTTP connect path (opt-in `http` feature; `headers`
   carry bearer auth). A host built without that feature MUST still report a remote definition as
   skipped with a stated reason (R5) — never silently.
+- **One translation path.** A host SHOULD implement one config-to-connection adapter and reuse it
+  for connectivity tests, live catalog export, authentication re-enumeration, and cached lazy
+  dialers. Duplicating this translation commonly drifts on inherited environment, static headers,
+  bearer applicability, or server-name normalization; those differences make a successful probe
+  poor evidence that the eventual tool call uses the same connection.
 
 ## 9. Deferred
 
@@ -225,7 +255,7 @@ the standard to follow is the *de-facto* one the ecosystem converged on, not any
   loop needs; the rest is host surface until evidence says otherwise.
 - **List-changed notifications** — snapshot-plus-host-driven-refresh is the contract today;
   reactive re-registration needs a story for removal (§5) first.
-- **OAuth** — streamable HTTP landed (2026-07-24, opt-in feature) and an observably-unauthorized
-  refusal is now a distinct auth error class a host can route to (re)authentication, but the
-  authentication flow itself — token acquisition, refresh, storage — is host surface; the kit
-  carries the credentials it is handed, nothing more.
+- **OAuth refresh grants** — the `http` feature owns the authorization-code/PKCE protocol,
+  loopback callback, and end-to-end interactive coordinator. Token refresh remains deferred.
+  Credential persistence and browser integration stay injected host seams; AC imposes semantic
+  operations and cleanup guarantees, not a storage schema or product UI.

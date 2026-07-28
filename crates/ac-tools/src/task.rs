@@ -62,9 +62,15 @@ impl Tool for Task {
             let Some(spawner) = ctx.spawner.clone() else {
                 return ToolOutput::error("sub-agent delegation is not available here");
             };
+            let Some(tool_call_id) = ctx.tool_call_id().map(str::to_owned) else {
+                return ToolOutput::error(
+                    "sub-agent delegation requires an invocation-scoped tool context",
+                );
+            };
 
             let result = spawner
                 .spawn(SpawnRequest {
+                    tool_call_id,
                     agent: input.agent,
                     prompt: input.prompt,
                     description: input.description,
@@ -115,7 +121,7 @@ mod tests {
         if let Some(s) = spawner {
             ctx = ctx.with_spawner(s);
         }
-        Arc::new(ctx)
+        Arc::new(ctx.for_invocation("call_task"))
     }
 
     fn input(agent: &str) -> TaskInput {
@@ -139,9 +145,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_completed_child_returns_the_envelope() {
-        struct Ok;
+        struct Ok {
+            seen_call_id: Arc<std::sync::Mutex<Option<String>>>,
+        }
         impl AgentSpawner for Ok {
             fn spawn(&self, req: SpawnRequest) -> BoxFuture<'static, SpawnResult> {
+                *self.seen_call_id.lock().unwrap() = Some(req.tool_call_id.clone());
                 Box::pin(async move {
                     SpawnResult {
                         session_id: "s_child".into(),
@@ -151,8 +160,14 @@ mod tests {
                 })
             }
         }
+        let seen_call_id = Arc::new(std::sync::Mutex::new(None));
         let out = Arc::new(Task)
-            .run(input("explore"), ctx_with(Some(as_dyn(Ok))))
+            .run(
+                input("explore"),
+                ctx_with(Some(as_dyn(Ok {
+                    seen_call_id: seen_call_id.clone(),
+                }))),
+            )
             .await;
         assert!(
             !out.is_error,
@@ -162,6 +177,7 @@ mod tests {
         assert!(out.content.contains("\"session_id\":\"s_child\""));
         assert!(out.content.contains("\"status\":\"completed\""));
         assert!(out.content.contains("did: do it"));
+        assert_eq!(seen_call_id.lock().unwrap().as_deref(), Some("call_task"));
     }
 
     #[tokio::test]

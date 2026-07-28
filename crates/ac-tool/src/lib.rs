@@ -9,6 +9,7 @@ mod observer;
 mod policy;
 mod registry;
 mod sandbox;
+mod spec_override;
 mod tool;
 
 pub use ac_types::Effort;
@@ -16,15 +17,19 @@ pub use agent::{
     AgentDefinition, AgentSpawner, RefusingSpawner, SpawnRequest, SpawnResult, SpawnStatus,
     ToolScope, as_dyn,
 };
-pub use ctx::{Extensions, FileTimes, PathLocks, ToolCtx, WriteCheck};
+pub use ctx::{
+    Extensions, FileSnapshot, FileTimeError, FileTimes, PathLocks, ToolCtx, WriteCheck,
+    file_time_key, iso8601_ms, lexical_normalize,
+};
 pub use observer::WriteObserver;
 pub use policy::{
-    DenyPolicy, GrantedReadPolicy, PathPolicy, PolicyError, PrefixRemapPolicy, ReadGrants,
-    ReadOnlyPolicy, SplitPolicy, SubtreePolicy, SwapPolicy,
+    AuthorizedPath, DenyPolicy, GrantedReadPolicy, PathPolicy, PolicyError, PrefixRemapPolicy,
+    ReadGrants, ReadOnlyPolicy, SplitPolicy, SubtreePolicy, SwapPolicy,
 };
 pub use registry::ToolRegistry;
 pub use sandbox::{
     CommandSpec, NetworkMode, Prepared, ResourceLimits, SandboxError, SandboxLauncher, SandboxMode,
-    SandboxPolicy, default_deny_paths,
+    SandboxPolicy, WriteDenyRule, default_deny_paths,
 };
-pub use tool::{Capability, RawTool, Tool, ToolOutput};
+pub use spec_override::RawToolSpecOverride;
+pub use tool::{Capability, RawTool, Tool, ToolOutput, ToolOutputPart};

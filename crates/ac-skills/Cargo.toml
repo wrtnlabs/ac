@@ -6,6 +6,8 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

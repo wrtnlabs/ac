@@ -29,6 +29,11 @@ pub trait AgentSpawner: Send + Sync {
 /// parent handle: a host that opts into bounded recursion tracks depth in its
 /// own spawner state (§4), so the agnostic request stays minimal.
 pub struct SpawnRequest {
+    /// The provider-assigned id of the `task` invocation that requested this
+    /// child. It is copied from [`crate::ToolCtx::tool_call_id`], never
+    /// reconstructed from observation order, so concurrent delegations retain
+    /// an exact parent-call → child mapping.
+    pub tool_call_id: String,
     /// Which agent definition to run (resolved by the host spawner).
     pub agent: String,
     /// The child's initial input.
@@ -208,6 +213,7 @@ mod tests {
     async fn refusing_spawner_always_errors() {
         let out = RefusingSpawner
             .spawn(SpawnRequest {
+                tool_call_id: "call_1".into(),
                 agent: "x".into(),
                 prompt: "p".into(),
                 description: None,

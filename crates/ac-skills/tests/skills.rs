@@ -46,7 +46,7 @@ fn listing_validates_candidates_and_reports_skips() {
         "dir-named",
         "---\ndescription: Named by its directory.\n---\nBody.\n",
     );
-    // Invalid fallback name (uppercase) and a rejected-dialect frontmatter.
+    // Invalid fallback name (uppercase). Rich YAML block scalars are valid.
     write_skill_md(
         dir.path(),
         "Bad-Case",
@@ -63,7 +63,7 @@ fn listing_validates_candidates_and_reports_skips() {
 
     let listing = resolver_over(dir.path()).list();
     let names: Vec<&str> = listing.skills.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, vec!["dir-named", "good", "other-name"]);
+    assert_eq!(names, vec!["dir-named", "good", "multi", "other-name"]);
 
     let renamed = listing
         .skills
@@ -74,7 +74,7 @@ fn listing_validates_candidates_and_reports_skips() {
     assert!(renamed.skill_md.ends_with("some-dir/SKILL.md"));
     assert_eq!(renamed.layer, "project");
 
-    assert_eq!(listing.skipped.len(), 2);
+    assert_eq!(listing.skipped.len(), 1);
     let reason_for = |d: &str| {
         listing
             .skipped
@@ -85,7 +85,15 @@ fn listing_validates_candidates_and_reports_skips() {
             .clone()
     };
     assert!(reason_for("Bad-Case").contains("invalid skill name"));
-    assert!(reason_for("multi").contains("block scalar"));
+    assert_eq!(
+        listing
+            .skills
+            .iter()
+            .find(|skill| skill.name == "multi")
+            .unwrap()
+            .description,
+        "block"
+    );
 }
 
 #[test]
@@ -212,8 +220,98 @@ fn skill_fields_carry_unknown_frontmatter_keys() {
     );
     let skill = resolver_over(dir.path()).resolve("annotated").unwrap();
     assert_eq!(
-        skill.fields.get("license").map(String::as_str),
+        skill
+            .fields
+            .get("license")
+            .and_then(serde_json::Value::as_str),
         Some("Apache-2.0")
+    );
+}
+
+#[test]
+fn direct_child_layers_shadow_by_directory_and_report_skips() {
+    let high = tempfile::tempdir().unwrap();
+    let low = tempfile::tempdir().unwrap();
+    write_skill(high.path(), "shared", "high-name", "Higher layer.");
+    write_skill(low.path(), "shared", "low-name", "Shadowed lower layer.");
+    write_skill(low.path(), "unique", "unique", "Only lower layer.");
+    write_skill_md(
+        high.path(),
+        "broken",
+        "---\nname: broken\n---\nMissing description.\n",
+    );
+    write_skill(low.path(), "broken", "broken", "Valid lower fallback.");
+
+    let resolver = SkillsResolver::direct_children(vec![
+        SkillLayer {
+            name: "high".into(),
+            root: high.path().to_path_buf(),
+        },
+        SkillLayer {
+            name: "low".into(),
+            root: low.path().to_path_buf(),
+        },
+    ]);
+    let listing = resolver.list();
+    let names: Vec<&str> = listing
+        .skills
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["broken", "high-name", "unique"]);
+    assert_eq!(
+        listing
+            .skills
+            .iter()
+            .find(|skill| skill.dir_name == "shared")
+            .unwrap()
+            .layer,
+        "high"
+    );
+    assert!(
+        listing
+            .skipped
+            .iter()
+            .any(|skip| skip.dir.ends_with("shared")
+                && skip.reason.contains("shadowed by an earlier layer"))
+    );
+    assert!(
+        listing
+            .skipped
+            .iter()
+            .any(|skip| skip.dir.ends_with("broken") && skip.reason.contains("description"))
+    );
+}
+
+#[test]
+fn direct_child_mode_is_non_recursive_and_requires_manifest_name() {
+    let root = tempfile::tempdir().unwrap();
+    write_skill(root.path(), "top", "top", "Direct child.");
+    write_skill(root.path(), "group/nested", "nested", "Not direct.");
+    write_skill_md(
+        root.path(),
+        "unnamed",
+        "---\ndescription: Name is required here.\n---\n",
+    );
+
+    let listing = SkillsResolver::direct_children(vec![SkillLayer {
+        name: "layer".into(),
+        root: root.path().to_path_buf(),
+    }])
+    .list();
+    assert_eq!(
+        listing
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["top"]
+    );
+    assert!(
+        listing
+            .skipped
+            .iter()
+            .any(|skip| skip.dir.ends_with("unnamed") && skip.reason.contains("'name'"))
     );
 }
 

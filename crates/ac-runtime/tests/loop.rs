@@ -7,7 +7,7 @@ use ac_runtime::{
 use ac_tool::{Capability, SubtreePolicy, Tool, ToolCtx, ToolOutput, ToolRegistry};
 use ac_types::StopReason;
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct EchoInput {
@@ -80,6 +80,30 @@ async fn text_only_turn() {
             stop_reason: StopReason::EndTurn
         }
     )));
+}
+
+#[tokio::test]
+async fn contentless_assistant_step_is_not_recorded() {
+    let provider = MockProvider::new(vec![vec![text(" \n "), stop_end()]]);
+    let (ctx, _dir) = make_ctx();
+    let mut session = Session::new(
+        Arc::new(provider),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        AgentConfig::default(),
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    session.run_turn("hello".into(), tx).await.unwrap();
+
+    let messages = session.messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, ac_types::Role::User);
+    assert!(
+        messages
+            .iter()
+            .all(|message| !ac_runtime::is_contentless(message))
+    );
 }
 
 #[tokio::test]
@@ -164,6 +188,47 @@ async fn unknown_tool() {
             .iter()
             .any(|e| matches!(e, AgentEvent::ToolResult { is_error: true, .. }))
     );
+}
+
+struct HideEcho;
+impl StepPrepareHook for HideEcho {
+    fn prepare(&self, _iteration: usize, request: &mut ac_provider::CompletionRequest) {
+        request.tools.retain(|tool| tool.name != "echo");
+    }
+}
+
+#[tokio::test]
+async fn a_registered_but_unoffered_tool_cannot_bypass_the_step_gate() {
+    let provider = MockProvider::new(vec![
+        vec![
+            tool_use("c1", "echo", serde_json::json!({"text": "must not run"})),
+            stop_tool_use(),
+        ],
+        vec![text("recovered"), stop_end()],
+    ]);
+    let (ctx, _dir) = make_ctx();
+    let mut registry = ToolRegistry::new();
+    registry.register(Echo);
+    let mut session = Session::new(
+        Arc::new(provider),
+        Arc::new(registry),
+        ctx,
+        AgentConfig::default(),
+    );
+    session.add_step_hook(Arc::new(HideEcho));
+
+    let (tx, rx) = mpsc::unbounded_channel();
+    session.run_turn("go".into(), tx).await.unwrap();
+    let events = drain(rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult {
+            name,
+            output,
+            is_error: true,
+            ..
+        } if name == "echo" && output.contains("not available on this step")
+    )));
 }
 
 #[tokio::test]
@@ -324,6 +389,97 @@ async fn cancellation() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let err = session.run_turn("go".into(), tx).await.unwrap_err();
     assert!(matches!(err, RuntimeError::Cancelled));
+}
+
+struct Blocking {
+    started: Arc<Notify>,
+}
+
+impl Tool for Blocking {
+    type Input = EchoInput;
+
+    fn name(&self) -> &'static str {
+        "blocking"
+    }
+
+    fn description(&self) -> String {
+        "waits forever".into()
+    }
+
+    fn capability(&self) -> Capability {
+        Capability::ReadOnly
+    }
+
+    fn run(
+        self: Arc<Self>,
+        _input: Self::Input,
+        _ctx: Arc<ToolCtx>,
+    ) -> futures::future::BoxFuture<'static, ToolOutput> {
+        Box::pin(async move {
+            self.started.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancellation_while_a_tool_runs_closes_the_call_in_history() {
+    let provider = MockProvider::new(vec![vec![
+        tool_use("c1", "blocking", serde_json::json!({"text": "x"})),
+        stop_tool_use(),
+    ]]);
+    let (ctx, _dir) = make_ctx();
+    let cancel = ctx.cancel.clone();
+    let started = Arc::new(Notify::new());
+    let mut registry = ToolRegistry::new();
+    registry.register(Blocking {
+        started: started.clone(),
+    });
+    let mut session = Session::new(
+        Arc::new(provider),
+        Arc::new(registry),
+        ctx,
+        AgentConfig::default(),
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    let running = tokio::spawn(async move {
+        let result = session.run_turn("go".into(), tx).await;
+        (session, result)
+    });
+    started.notified().await;
+    cancel.cancel();
+    let (session, result) = tokio::time::timeout(std::time::Duration::from_secs(1), running)
+        .await
+        .expect("cancellation must not wait for the tool")
+        .unwrap();
+    assert!(matches!(result, Err(RuntimeError::Cancelled)));
+
+    let messages = session.messages();
+    let call_index = messages
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .iter()
+                .any(|part| matches!(part, ac_types::ContentPart::ToolUse(call) if call.id == "c1"))
+        })
+        .unwrap();
+    let result_index = messages
+        .iter()
+        .position(|message| {
+            message.content.iter().any(|part| {
+                matches!(
+                    part,
+                    ac_types::ContentPart::ToolResult(result)
+                        if result.tool_use_id == "c1"
+                            && result.is_error
+                            && result.content == ac_runtime::ABORTED_TOOL_RESULT
+                )
+            })
+        })
+        .unwrap();
+    assert_eq!(result_index, call_index + 1);
 }
 
 /// A tool that panics. Its `run` future unwinds; the runtime must catch that

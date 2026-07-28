@@ -128,7 +128,7 @@ fn child_registry(def: &AgentDefinition) -> ToolRegistry {
         r.register(Shell);
     }
     if def.tools.admits("fetch") {
-        r.register(Fetch);
+        r.register(Fetch::default());
     }
     r
 }

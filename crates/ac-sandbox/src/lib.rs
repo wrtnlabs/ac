@@ -79,9 +79,13 @@ impl SandboxLauncher for OsSandbox {
     }
 
     fn mode(&self) -> SandboxMode {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         {
-            SandboxMode::Strict
+            macos::mode(&self.policy)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux::mode(&self.policy)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
