@@ -126,7 +126,7 @@ fn child_registry(def: &AgentDefinition) -> ToolRegistry {
         r.register(Grep);
     }
     if def.tools.admits("shell") {
-        r.register(Shell);
+        r.register(Shell::default());
     }
     if def.tools.admits("fetch") {
         r.register(Fetch::default());

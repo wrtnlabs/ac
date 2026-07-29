@@ -50,8 +50,10 @@ pub use files::{
 };
 pub use search::{Glob, GlobInput, Grep, GrepInput};
 pub use shell::{
-    Shell, ShellCaptureOptions, ShellExecRequest, ShellExecResult, ShellInput, ShellKillReason,
-    ShellSpillDir, execute_shell, tail_output,
+    DEFAULT_SHELL_KILL_GRACE, DEFAULT_SHELL_TIMEOUT_MS, MAX_SHELL_TIMEOUT_MS, MIN_SHELL_TIMEOUT_MS,
+    Shell, ShellCaptureOptions, ShellConfig, ShellEnvironmentProvider, ShellExecRequest,
+    ShellExecResult, ShellInput, ShellInvocation, ShellKillReason, ShellSpillDir, execute_shell,
+    tail_output,
 };
 pub use task::{Task, TaskInput};
 pub use tool_search::{TOOL_SEARCH_NAME, ToolSearch, ToolSearchEntry, ToolSearchInput};
@@ -71,7 +73,7 @@ pub fn register_builtins(registry: &mut ToolRegistry) {
     registry.register(ListFiles);
     registry.register(Glob);
     registry.register(Grep);
-    registry.register(Shell);
+    registry.register(Shell::default());
     registry.register(Fetch::default());
 }
 

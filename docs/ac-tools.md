@@ -257,16 +257,21 @@ and one wall-clock deadline bound the complete redirect/request/body sequence; t
 seconds and a host may override it with `Fetch::with_timeout`. The deadline is total, not renewed at
 each redirect, and both cancellation and expiry return model-facing error data.
 
-### 4.4 Shell execution adapters
+### 4.4 Configurable stock shell
 
-`execute_shell` is the one command-execution mechanism. The compiled `shell` tool supplies its
-typed schema and default `sh -c` policy; a product host may supply a login shell, environment
-overlay, timeout, cwd presentation, transcript policy, and result envelope through
-`ShellExecRequest`. Both paths use the same sandbox preparation, approval classification,
-stdout/stderr bounding, transcript capture, cancel/timeout handling, process-group termination, and
+`Shell` is the one compiled tool declaration and `execute_shell` is its one command-execution
+mechanism. A host installs `ShellConfig` to select the command interpreter, timeout/cleanup policy,
+transcript capture, an optional cwd-root restriction, and sandbox-compatible cwd fallback;
+`ShellEnvironmentProvider` supplies run-sensitive environment values. The model-selected cwd is
+always re-authorized through the active `PathPolicy`. A host may replace the model-facing description with
+`Shell::with_description`, but does not rebuild the schema, dispatcher, result envelope, or
+execution path.
+
+The stock path owns sandbox preparation, approval classification, stdout/stderr bounding,
+transcript capture, cancel/timeout handling, process-group termination, result shaping, and
 reaping. The process group is swept even after a successful leader exit, so background children
-cannot survive a tool call. A host shell adapter MUST use this executor rather than spawning a
-second runtime above AC.
+cannot survive a tool call. `execute_shell` remains public for lower-level process consumers, not
+as an invitation to declare a second shell tool.
 
 ## 5. Invariants
 
@@ -289,9 +294,9 @@ second runtime above AC.
   including each redirect target, was admitted by the same host policy before that request opened.
 - **I9 (fetch cannot hold a cancelled turn).** The complete redirect/request/body operation races
   the run's cancellation signal and one total host-configurable deadline.
-- **I10 (one mutation and process plane).** Host-specific file/shell presentation may wrap AC's
-  execution primitives, but does not replace their ledgers, locks, observer ordering, sandbox,
-  approval, cancellation, or cleanup mechanics.
+- **I10 (one mutation and process plane).** Host-specific file presentation may wrap AC's
+  execution primitives; shell customization configures AC's stock declaration. Neither replaces
+  ledgers, locks, observer ordering, sandbox, approval, cancellation, or cleanup mechanics.
 
 ## 6. Division of responsibility
 

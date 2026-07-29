@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use ac_approvals::{ApprovalConfig, RoleContainment, Verdict};
 use ac_tool::{Capability, CommandSpec, PathPolicy, SandboxMode, Tool, ToolCtx, ToolOutput};
 use futures::future::BoxFuture;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Adapts the tool context's [`PathPolicy`] into the [`RoleContainment`] the
 /// approval engine delegates path-role checks to: a role token is *readable* iff
@@ -74,12 +74,111 @@ fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
     }
     opts.open(path)
 }
-/// Hard wall-clock timeout for a command.
-const TIMEOUT: Duration = Duration::from_secs(120);
-/// Grace period to reap the child and collect output after it exits or is
-/// killed; bounds the drain so a backgrounded grandchild holding a pipe open
-/// cannot hang the tool past its advertised cap.
-const GRACE: Duration = Duration::from_secs(5);
+/// Default hard wall-clock timeout for a command.
+pub const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;
+/// Smallest model-selected timeout accepted by the stock tool.
+pub const MIN_SHELL_TIMEOUT_MS: u64 = 1_000;
+/// Largest model-selected timeout accepted by the stock tool.
+pub const MAX_SHELL_TIMEOUT_MS: u64 = 600_000;
+/// Default grace period used to reap a child after exit or cancellation.
+pub const DEFAULT_SHELL_KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// Program and prefix arguments used to execute one model-authored command.
+///
+/// The final command string is appended after `args_before_command`. The stock
+/// value is `sh -c`; hosts that need the user's configured login shell can use
+/// [`from_user_shell`](Self::from_user_shell).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellInvocation {
+    pub program: String,
+    pub args_before_command: Vec<String>,
+}
+
+impl ShellInvocation {
+    pub fn new(
+        program: impl Into<String>,
+        args_before_command: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            args_before_command: args_before_command.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Read `$SHELL`, falling back to `fallback`. Bash and zsh run as login
+    /// shells so user-installed command paths are available; other shells use
+    /// their ordinary `-c` form.
+    pub fn from_user_shell(fallback: impl Into<String>) -> Self {
+        let program = std::env::var("SHELL")
+            .ok()
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| fallback.into());
+        let name = Path::new(&program)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let args = if name == "bash" || name == "zsh" {
+            vec!["-l", "-c"]
+        } else {
+            vec!["-c"]
+        };
+        Self::new(program, args)
+    }
+
+    fn args(&self, command: String) -> Vec<String> {
+        let mut args = self.args_before_command.clone();
+        args.push(command);
+        args
+    }
+}
+
+impl Default for ShellInvocation {
+    fn default() -> Self {
+        Self::new("sh", ["-c"])
+    }
+}
+
+/// Per-run behavior for the stock [`Shell`] tool.
+///
+/// Install this in [`ToolCtx::extensions`] to select a command interpreter,
+/// timeout/cleanup policy, transcript policy, or a sandbox-compatible cwd.
+/// All fields are host-neutral; application-specific paths and names stay in
+/// the host.
+#[derive(Clone)]
+pub struct ShellConfig {
+    pub invocation: ShellInvocation,
+    pub default_timeout: Duration,
+    pub kill_grace: Duration,
+    /// `None` keeps the stock overflow-only transcript behavior.
+    pub capture: Option<ShellCaptureOptions>,
+    /// Optional additional restriction over paths the active policy permits
+    /// reading. The resolved cwd must be contained by at least one root.
+    pub cwd_roots: Option<Vec<PathBuf>>,
+    /// Cwd used only while the sandbox launcher derives its policy when the
+    /// requested read-only cwd is not itself an admissible launcher cwd.
+    pub sandbox_cwd_fallback: Option<PathBuf>,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            invocation: ShellInvocation::default(),
+            default_timeout: Duration::from_millis(DEFAULT_SHELL_TIMEOUT_MS),
+            kill_grace: DEFAULT_SHELL_KILL_GRACE,
+            capture: None,
+            cwd_roots: None,
+            sandbox_cwd_fallback: None,
+        }
+    }
+}
+
+/// Host-provided environment values for one shell invocation.
+///
+/// Providers may read mutable run binding state. Returning an error refuses
+/// the command before sandbox preparation or process spawn.
+pub trait ShellEnvironmentProvider: Send + Sync {
+    fn environment(&self) -> Result<Vec<(OsString, OsString)>, String>;
+}
 
 /// SIGKILL the child's whole process group (it is a group leader — see
 /// `process_group(0)` in `run`), sweeping any processes it forked. A negative
@@ -492,24 +591,69 @@ pub async fn execute_shell(
     })
 }
 
-/// Run a shell command with `sh -c` inside the workspace.
+/// Run a shell command inside the active host-authorized root.
 ///
-/// The working directory defaults to the workspace root and must resolve inside
-/// it. Output is capped per stream and the command is killed after 120 seconds
-/// or on cancellation. Execution is prepared by the host-provided sandbox, and
-/// the resulting capability is classified by the host approval policy before
-/// the process is spawned.
+/// The host may configure invocation, environment, capture, and sandbox cwd
+/// through [`ShellConfig`] and [`ShellEnvironmentProvider`]. Execution itself
+/// always passes through [`execute_shell`].
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ShellInput {
-    /// The command line, executed as `sh -c "<command>"`.
+    /// The command line passed to the configured shell.
+    #[schemars(length(min = 1))]
     pub command: String,
-    /// Working directory, relative to the workspace root (or absolute inside
-    /// it). Defaults to the workspace root.
+    /// Working directory, relative to the active root or an absolute path the
+    /// host policy permits reading. Defaults to the active root.
     pub cwd: Option<String>,
+    /// Short human-readable description for host UI.
+    #[schemars(length(min = 1))]
+    pub description: Option<String>,
+    /// Timeout in milliseconds.
+    #[schemars(range(min = 1_000, max = 600_000))]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Executes shell commands through AC's shared sandboxed process executor.
-pub struct Shell;
+#[derive(Default)]
+pub struct Shell {
+    description_override: Option<String>,
+}
+
+impl Shell {
+    pub fn with_description(description: impl Into<String>) -> Self {
+        Self {
+            description_override: Some(description.into()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ShellResult {
+    exit_code: Option<i32>,
+    stdout_tail: String,
+    stderr_tail: String,
+    truncated: bool,
+    duration_ms: u64,
+    sandbox: ShellSandboxResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    killed: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ShellSandboxResult {
+    mode: &'static str,
+    platform: &'static str,
+}
+
+fn platform_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        _ => "linux",
+    }
+}
 
 impl Tool for Shell {
     type Input = ShellInput;
@@ -519,17 +663,16 @@ impl Tool for Shell {
     }
 
     fn description(&self) -> String {
-        "Run a command via 'sh -c' inside the workspace. cwd defaults to the \
-         workspace root and must resolve inside it. Output is capped (~32 KiB \
-         per stream); when output overflows the cap, the full transcript (both \
-         streams, in arrival order) is spilled to a log file and the result \
-         carries its path as 'output_path' — read it for the rest. The command \
-         and anything it forks are killed after 120s, on cancel, or when the \
-         call returns (no lingering background processes). When the host has \
-         installed an OS sandbox the command is kernel-contained and the \
-         result reports 'sandbox.mode'; otherwise it runs with the host's own \
-         privileges ('sandbox.mode':'off')."
-            .into()
+        self.description_override.clone().unwrap_or_else(|| {
+            "Run a command inside the active host-authorized root. Use cwd for \
+             another host-authorized directory, description for concise UI \
+             context, and timeout_ms for commands that need a custom deadline. \
+             Output is returned as bounded stdout/stderr tails; a transcript \
+             path is included when configured or when output overflows. The \
+             command and its process group are terminated on timeout, cancel, \
+             or return. The result reports the achieved sandbox mode."
+                .into()
+        })
     }
 
     fn capability(&self) -> Capability {
@@ -542,66 +685,121 @@ impl Tool for Shell {
         ctx: Arc<ToolCtx>,
     ) -> BoxFuture<'static, ToolOutput> {
         Box::pin(async move {
-            let cwd = input.cwd.unwrap_or_else(|| ".".to_string());
-            let resolved = match ctx.policy.resolve_write(Path::new(&cwd)) {
-                Ok(p) => p,
-                Err(e) => return ToolOutput::error(e.to_string()),
+            if input.command.is_empty() {
+                return ToolOutput::error("shell: `command` must be a non-empty string.");
+            }
+            if input.description.as_deref() == Some("") {
+                return ToolOutput::error("shell: `description` must be a non-empty string.");
+            }
+
+            let config = ctx
+                .extensions
+                .get::<ShellConfig>()
+                .map(|config| (*config).clone())
+                .unwrap_or_default();
+            let default_timeout_ms = match u64::try_from(config.default_timeout.as_millis()) {
+                Ok(timeout) if (MIN_SHELL_TIMEOUT_MS..=MAX_SHELL_TIMEOUT_MS).contains(&timeout) => {
+                    timeout
+                }
+                _ => {
+                    return ToolOutput::error(format!(
+                        "shell: invalid host configuration: default timeout must be between {MIN_SHELL_TIMEOUT_MS} and {MAX_SHELL_TIMEOUT_MS} milliseconds"
+                    ));
+                }
+            };
+            let timeout_ms = input.timeout_ms.unwrap_or(default_timeout_ms);
+            if !(MIN_SHELL_TIMEOUT_MS..=MAX_SHELL_TIMEOUT_MS).contains(&timeout_ms) {
+                return ToolOutput::error(format!(
+                    "shell: `timeout_ms` must be an integer between {MIN_SHELL_TIMEOUT_MS} and {MAX_SHELL_TIMEOUT_MS}."
+                ));
+            }
+
+            let env = match ctx.extensions.get::<Arc<dyn ShellEnvironmentProvider>>() {
+                Some(provider) => match provider.environment() {
+                    Ok(environment) => environment,
+                    Err(error) => return ToolOutput::error(error),
+                },
+                None => Vec::new(),
             };
 
-            let spill_dir = ctx
-                .extensions
-                .get::<ShellSpillDir>()
-                .map(|d| d.0.clone())
-                .unwrap_or_else(|| std::env::temp_dir().join("ac-shell-spill"));
+            let cwd = input.cwd.unwrap_or_else(|| ".".to_string());
+            let resolved = match ctx.policy.resolve_read(Path::new(&cwd)) {
+                Ok(path) => path,
+                Err(error) => return ToolOutput::error(error.to_string()),
+            };
+            if let Some(roots) = &config.cwd_roots
+                && !roots.iter().any(|root| resolved.starts_with(root))
+            {
+                return ToolOutput::error(format!(
+                    "shell: cwd resolves outside the configured roots ({})",
+                    resolved.display()
+                ));
+            }
+
+            let capture = config.capture.unwrap_or_else(|| {
+                let spill_dir = ctx
+                    .extensions
+                    .get::<ShellSpillDir>()
+                    .map(|dir| dir.0.clone())
+                    .unwrap_or_else(|| std::env::temp_dir().join("ac-shell-spill"));
+                ShellCaptureOptions::overflow_only(spill_dir)
+            });
+            let sandbox_cwd = ctx.sandbox.as_ref().and_then(|launcher| {
+                (!launcher.permits_cwd(&resolved))
+                    .then(|| config.sandbox_cwd_fallback.clone())
+                    .flatten()
+            });
+            let args = config.invocation.args(input.command.clone());
             let execution = match execute_shell(
                 ctx,
                 ShellExecRequest {
-                    program: "sh".to_string(),
-                    args: vec!["-c".to_string(), input.command.clone()],
+                    program: config.invocation.program,
+                    args,
                     command_for_approval: input.command,
                     cwd: resolved,
-                    sandbox_cwd: None,
-                    env: vec![],
-                    timeout: TIMEOUT,
-                    kill_grace: GRACE,
-                    capture: ShellCaptureOptions::overflow_only(spill_dir),
+                    sandbox_cwd,
+                    env,
+                    timeout: Duration::from_millis(timeout_ms),
+                    kill_grace: config.kill_grace,
+                    capture,
                 },
             )
             .await
             {
                 Ok(execution) => execution,
-                Err(error) => return ToolOutput::error(error),
+                Err(error) => {
+                    let error = error
+                        .strip_prefix("failed to spawn command:")
+                        .map(|detail| format!("shell: spawn failed:{detail}"))
+                        .or_else(|| {
+                            error
+                                .strip_prefix("failed to open output log:")
+                                .map(|detail| format!("shell: failed to open output log:{detail}"))
+                        })
+                        .unwrap_or(error);
+                    return ToolOutput::error(error);
+                }
             };
 
-            let mut result = serde_json::json!({
-                "exit_code": execution.exit_code,
-                "stdout_tail": execution.stdout_tail,
-                "stderr_tail": execution.stderr_tail,
-                "sandbox": { "mode": execution.sandbox_mode.as_str() },
-            });
-            if execution.truncated {
-                result["truncated"] = serde_json::Value::Bool(true);
-            }
-            if let Some(path) = execution.output_path {
-                result["output_path"] = serde_json::Value::String(path.display().to_string());
-            }
-            if let Some(reason) = execution.killed {
-                result["killed"] = serde_json::Value::String(
-                    match reason {
-                        ShellKillReason::Timeout => "timeout",
-                        ShellKillReason::Cancelled => "cancelled",
-                    }
-                    .to_string(),
-                );
-            }
-
-            let body = serde_json::to_string(&result)
-                .unwrap_or_else(|_| "{\"error\":\"failed to encode result\"}".to_string());
-
-            if execution.killed.is_some() {
-                ToolOutput::error(body)
-            } else {
-                ToolOutput::ok(body)
+            let result = ShellResult {
+                exit_code: execution.exit_code,
+                stdout_tail: execution.stdout_tail,
+                stderr_tail: execution.stderr_tail,
+                truncated: execution.truncated,
+                duration_ms: execution.duration.as_millis() as u64,
+                sandbox: ShellSandboxResult {
+                    mode: execution.sandbox_mode.as_str(),
+                    platform: platform_name(),
+                },
+                output_path: execution.output_path.map(|path| path.display().to_string()),
+                killed: execution.killed.map(|reason| match reason {
+                    ShellKillReason::Timeout => "timeout",
+                    ShellKillReason::Cancelled => "aborted",
+                }),
+            };
+            match serde_json::to_string(&result) {
+                Ok(body) => ToolOutput::ok(body),
+                Err(error) => ToolOutput::error(format!("shell: cannot serialize result: {error}")),
             }
         })
     }
@@ -614,10 +812,12 @@ mod tests {
     use ac_tool::SubtreePolicy;
 
     fn run(cmd: &str, ctx: Arc<ToolCtx>) -> impl std::future::Future<Output = ToolOutput> {
-        Arc::new(Shell).run(
+        Arc::new(Shell::default()).run(
             ShellInput {
                 command: cmd.to_string(),
                 cwd: None,
+                description: None,
+                timeout_ms: None,
             },
             ctx,
         )
@@ -691,8 +891,108 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         let v: serde_json::Value = serde_json::from_str(&out.content).unwrap();
         assert!(v.get("output_path").is_none());
-        assert!(v.get("truncated").is_none());
+        assert_eq!(v["truncated"], false);
         assert_eq!(std::fs::read_dir(spill_dir.path()).unwrap().count(), 0);
+    }
+
+    struct TestEnvironment;
+
+    impl ShellEnvironmentProvider for TestEnvironment {
+        fn environment(&self) -> Result<Vec<(OsString, OsString)>, String> {
+            Ok(vec![(
+                OsString::from("AC_SHELL_TEST_VALUE"),
+                OsString::from("configured"),
+            )])
+        }
+    }
+
+    #[tokio::test]
+    async fn host_configuration_drives_invocation_environment_capture_and_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript_dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions.insert(ShellConfig {
+            invocation: ShellInvocation::new("sh", ["-c"]),
+            default_timeout: Duration::from_secs(2),
+            kill_grace: Duration::from_millis(100),
+            capture: Some(ShellCaptureOptions {
+                tail_bytes: 1024,
+                tail_lines: 10,
+                transcript_dir: transcript_dir.path().to_path_buf(),
+                always_transcript: true,
+                transcript_cap: Some(4096),
+            }),
+            cwd_roots: None,
+            sandbox_cwd_fallback: None,
+        });
+        let environment: Arc<dyn ShellEnvironmentProvider> = Arc::new(TestEnvironment);
+        ctx.extensions.insert(environment);
+
+        let out = Arc::new(Shell::default())
+            .run(
+                ShellInput {
+                    command: "printf '%s' \"$AC_SHELL_TEST_VALUE\"".to_string(),
+                    cwd: None,
+                    description: Some("read configured environment".to_string()),
+                    timeout_ms: Some(1_000),
+                },
+                ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let value: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(value["stdout_tail"], "configured");
+        assert_eq!(value["truncated"], false);
+        assert!(value["duration_ms"].is_u64());
+        assert_eq!(value["sandbox"]["mode"], "off");
+        assert_eq!(value["sandbox"]["platform"], platform_name());
+        let output_path = value["output_path"].as_str().expect("eager transcript");
+        assert!(Path::new(output_path).starts_with(transcript_dir.path()));
+    }
+
+    #[tokio::test]
+    async fn model_timeout_returns_a_normal_killed_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        let out = Arc::new(Shell::default())
+            .run(
+                ShellInput {
+                    command: "sleep 5".to_string(),
+                    cwd: None,
+                    description: Some("wait past deadline".to_string()),
+                    timeout_ms: Some(MIN_SHELL_TIMEOUT_MS),
+                },
+                ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let value: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(value["killed"], "timeout");
+        assert_eq!(value["exit_code"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn cancellation_returns_a_normal_aborted_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        let cancel = ctx.cancel.clone();
+        let task = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { run("sleep 5", ctx).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let out = task.await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        let value: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(value["killed"], "aborted");
+        assert_eq!(value["exit_code"], serde_json::Value::Null);
     }
 
     #[tokio::test]
