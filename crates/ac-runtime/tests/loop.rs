@@ -5,7 +5,7 @@ use ac_runtime::{
     AgentConfig, AgentEvent, Observation, ObservationHook, RuntimeError, Session, StepPrepareHook,
 };
 use ac_tool::{Capability, SubtreePolicy, Tool, ToolCtx, ToolOutput, ToolRegistry};
-use ac_types::StopReason;
+use ac_types::{CompletionEvent, StopReason, TokenUsage};
 use serde::Deserialize;
 use tokio::sync::{Notify, mpsc};
 
@@ -83,18 +83,38 @@ async fn text_only_turn() {
 }
 
 #[tokio::test]
-async fn contentless_assistant_step_is_not_recorded() {
-    let provider = MockProvider::new(vec![vec![text(" \n "), stop_end()]]);
+async fn contentless_assistant_step_is_a_turn_error() {
+    let provider = MockProvider::new(vec![
+        vec![
+            text(" \n "),
+            CompletionEvent::Thinking {
+                text: "private reasoning is not an answer".to_string(),
+                signature: None,
+            },
+            CompletionEvent::UsageUpdate(TokenUsage::default()),
+            stop_end(),
+        ],
+        vec![stop_end()],
+    ]);
     let (ctx, _dir) = make_ctx();
     let mut session = Session::new(
-        Arc::new(provider),
+        Arc::new(provider.clone()),
         Arc::new(ToolRegistry::new()),
         ctx,
         AgentConfig::default(),
     );
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel();
 
-    session.run_turn("hello".into(), tx).await.unwrap();
+    let error = session.run_turn("hello".into(), tx).await.unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeError::EmptyCompletion(StopReason::EndTurn)
+    ));
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "the default budget retries one empty EndTurn"
+    );
 
     let messages = session.messages();
     assert_eq!(messages.len(), 1);
@@ -103,6 +123,123 @@ async fn contentless_assistant_step_is_not_recorded() {
         messages
             .iter()
             .all(|message| !ac_runtime::is_contentless(message))
+    );
+    assert!(
+        drain(rx)
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::TurnComplete { .. })),
+        "an empty provider response must not publish successful completion"
+    );
+}
+
+#[tokio::test]
+async fn one_contentless_end_turn_is_retried_successfully_by_default() {
+    let provider = MockProvider::new(vec![vec![stop_end()], vec![text("recovered"), stop_end()]]);
+    let (ctx, _dir) = make_ctx();
+    let mut session = Session::new(
+        Arc::new(provider.clone()),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        AgentConfig::default(),
+    );
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    assert_eq!(
+        session.run_turn("hello".into(), tx).await.unwrap(),
+        StopReason::EndTurn
+    );
+    assert_eq!(provider.call_count(), 2);
+    assert!(session.messages().iter().any(|message| {
+        message.role == ac_types::Role::Assistant
+            && message.content.iter().any(
+                |part| matches!(part, ac_types::ContentPart::Text { text } if text == "recovered"),
+            )
+    }));
+    assert_eq!(
+        drain(rx)
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnComplete { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn contentless_end_turn_retry_budget_is_configurable() {
+    let provider = MockProvider::new(vec![
+        vec![stop_end()],
+        vec![text("must not be sampled"), stop_end()],
+    ]);
+    let (ctx, _dir) = make_ctx();
+    let mut session = Session::new(
+        Arc::new(provider.clone()),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        AgentConfig {
+            empty_completion_retries: 0,
+            ..AgentConfig::default()
+        },
+    );
+    let (tx, _rx) = mpsc::unbounded_channel();
+
+    assert!(matches!(
+        session.run_turn("hello".into(), tx).await.unwrap_err(),
+        RuntimeError::EmptyCompletion(StopReason::EndTurn)
+    ));
+    assert_eq!(provider.call_count(), 1);
+}
+
+#[tokio::test]
+async fn contentless_follow_up_after_tool_results_is_a_turn_error() {
+    let provider = MockProvider::new(vec![
+        vec![
+            tool_use("c1", "echo", serde_json::json!({"text": "yo"})),
+            stop_tool_use(),
+        ],
+        vec![stop_end()],
+        vec![stop_end()],
+    ]);
+    let (ctx, _dir) = make_ctx();
+    let mut registry = ToolRegistry::new();
+    registry.register(Echo);
+    let mut session = Session::new(
+        Arc::new(provider),
+        Arc::new(registry),
+        ctx,
+        AgentConfig::default(),
+    );
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    let error = session.run_turn("go".into(), tx).await.unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeError::EmptyCompletion(StopReason::EndTurn)
+    ));
+    let messages = session.messages();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>(),
+        [
+            ac_types::Role::User,
+            ac_types::Role::Assistant,
+            ac_types::Role::User
+        ],
+        "the completed call/result pair remains valid history"
+    );
+    assert!(matches!(
+        messages[1].content.as_slice(),
+        [ac_types::ContentPart::ToolUse(_)]
+    ));
+    assert!(matches!(
+        messages[2].content.as_slice(),
+        [ac_types::ContentPart::ToolResult(_)]
+    ));
+    assert!(
+        drain(rx)
+            .iter()
+            .all(|event| !matches!(event, AgentEvent::TurnComplete { .. }))
     );
 }
 

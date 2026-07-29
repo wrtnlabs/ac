@@ -17,6 +17,8 @@
 //! files. Calls are cheap (WAL, indexed lookups); an async host that cares
 //! wraps calls in its runtime's blocking facility.
 
+use std::collections::{HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -60,6 +62,26 @@ pub enum StoreError {
         session: String,
         current: Option<String>,
     },
+    /// A transport retried an acknowledged submission id with different
+    /// bytes. Idempotency is identity + payload, never identity alone.
+    #[error(
+        "managed submission {submission_id} in session {session} was retried with different payload"
+    )]
+    ManagedSubmissionConflict {
+        session: String,
+        submission_id: String,
+    },
+    /// A state string in the database is outside the schema understood by
+    /// this build. This is loud rather than silently treating active work as
+    /// pending or terminal.
+    #[error("invalid managed submission state in store: {0}")]
+    InvalidManagedState(String),
+    #[error("invalid terminal managed submission state: {0}")]
+    InvalidManagedTerminal(String),
+    #[error("invalid managed pending order: {0}")]
+    InvalidManagedPendingOrder(String),
+    #[error("invalid managed steer settlement: {0}")]
+    InvalidManagedSteerSettlement(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -72,6 +94,158 @@ pub struct SessionRecord {
     pub meta: Option<serde_json::Value>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// Durable state of one backend-managed submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedSubmissionState {
+    Pending,
+    Claimed,
+    Running,
+    Steering,
+    Delivered,
+    Steered,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl ManagedSubmissionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Running => "running",
+            Self::Steering => "steering",
+            Self::Delivered => "delivered",
+            Self::Steered => "steered",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "claimed" => Ok(Self::Claimed),
+            "running" => Ok(Self::Running),
+            "steering" => Ok(Self::Steering),
+            "delivered" => Ok(Self::Delivered),
+            "steered" => Ok(Self::Steered),
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            other => Err(StoreError::InvalidManagedState(other.to_string())),
+        }
+    }
+}
+
+/// One opaque durable submission. `payload` is host-owned serialized text;
+/// AC stores it verbatim and never interprets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedSubmissionRecord {
+    pub session_id: String,
+    /// Immutable per-session acceptance order.
+    pub sequence: u64,
+    /// Mutable pending order, retained during `steering` and `delivered` so an
+    /// unacknowledged or recovered steer returns to the same place.
+    pub queue_position: u64,
+    pub submission_id: String,
+    pub payload: String,
+    pub state: ManagedSubmissionState,
+    pub run_id: Option<String>,
+    pub accepted_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub finished_at_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRunRecord {
+    pub session_id: String,
+    pub run_id: String,
+    pub submission_id: Option<String>,
+    pub started_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedEnqueue {
+    Inserted(ManagedSubmissionRecord),
+    Existing(ManagedSubmissionRecord),
+}
+
+/// Result of a compare-and-swap reorder of the complete pending queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedPendingReorder {
+    Reordered,
+    Unchanged,
+    Conflict { current_order: Vec<String> },
+}
+
+/// Result of atomically reserving a pending submission for later delivery
+/// into an active run's steer queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedSteerCommit {
+    Begun(ManagedSubmissionRecord),
+    AlreadySteering(ManagedSubmissionRecord),
+    AlreadySteered(ManagedSubmissionRecord),
+    NotPending(ManagedSubmissionRecord),
+    Missing,
+    RunMismatch { active_run_id: Option<String> },
+}
+
+/// Result of durably confirming that the runtime accepted a reserved steer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedSteerDelivery {
+    Delivered(ManagedSubmissionRecord),
+    AlreadyDelivered(ManagedSubmissionRecord),
+    AlreadySteered(ManagedSubmissionRecord),
+    NotSteering(ManagedSubmissionRecord),
+    Missing,
+    RunMismatch { active_run_id: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedRunAcquire {
+    Acquired(ManagedRunRecord),
+    Held(ManagedRunRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRunSettlement {
+    pub settled: bool,
+    /// Exact acknowledged steer children in proof order for any settled
+    /// outcome. Empty only when the run did not settle or acknowledged none.
+    pub steered: Vec<ManagedSubmissionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedClaim {
+    Claimed {
+        submission: ManagedSubmissionRecord,
+        run: ManagedRunRecord,
+    },
+    Held(ManagedRunRecord),
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedRecovery {
+    Requeued {
+        submission: ManagedSubmissionRecord,
+        run: ManagedRunRecord,
+    },
+    Interrupted {
+        submission: ManagedSubmissionRecord,
+        run: ManagedRunRecord,
+    },
+    Released {
+        run: ManagedRunRecord,
+    },
 }
 
 /// A committed change to the store, reported to the mutation listener.
@@ -108,6 +282,16 @@ pub enum StoreMutation {
         id: String,
         deleted: u64,
     },
+    ManagedSubmissionChanged {
+        id: String,
+        submission_id: String,
+        state: ManagedSubmissionState,
+    },
+    ManagedRunChanged {
+        id: String,
+        run_id: String,
+        active: bool,
+    },
 }
 
 pub type MutationListener = Arc<dyn Fn(&StoreMutation) + Send + Sync>;
@@ -139,6 +323,36 @@ CREATE TABLE IF NOT EXISTS messages (
   meta        TEXT,
   PRIMARY KEY (session_id, seq)
 );
+CREATE TABLE IF NOT EXISTS managed_submissions (
+  session_id    TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  sequence      INTEGER NOT NULL,
+  queue_position INTEGER NOT NULL,
+  submission_id TEXT    NOT NULL,
+  payload       TEXT    NOT NULL,
+  state         TEXT    NOT NULL CHECK (
+    state IN (
+      'pending', 'claimed', 'running', 'steering', 'delivered', 'steered',
+      'succeeded', 'failed', 'cancelled', 'interrupted'
+    )
+  ),
+  run_id        TEXT,
+  accepted_at   INTEGER NOT NULL,
+  started_at    INTEGER,
+  finished_at   INTEGER,
+  error         TEXT,
+  PRIMARY KEY (session_id, submission_id),
+  UNIQUE (session_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_managed_submissions_pending
+  ON managed_submissions(session_id, state, queue_position, sequence);
+CREATE TABLE IF NOT EXISTS managed_runs (
+  session_id    TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  run_id        TEXT NOT NULL UNIQUE,
+  submission_id TEXT,
+  started_at    INTEGER NOT NULL,
+  FOREIGN KEY (session_id, submission_id)
+    REFERENCES managed_submissions(session_id, submission_id) ON DELETE CASCADE
+);
 ";
 
 /// Bumped when the on-disk schema changes shape. Opening a store stamped
@@ -148,7 +362,13 @@ CREATE TABLE IF NOT EXISTS messages (
 /// it). Lets a host keep its own per-message record — an id, display
 /// metadata, an alternate rendering — in the same transaction as the
 /// message itself instead of a second store with its own crash window.
-const SCHEMA_VERSION: u32 = 2;
+/// v3: durable opaque managed submissions plus the single active-run lease
+/// used for atomic ordered claim and restart reconciliation.
+/// v4: immutable acceptance sequence is separated from mutable pending queue
+/// position, and pending submissions can enter durable steering.
+/// v5: accepted runtime delivery is a distinct durable state, so an uncertain
+/// reservation rollback can never be mistaken for delivered input.
+const SCHEMA_VERSION: u32 = 5;
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -200,6 +420,7 @@ impl SqliteStore {
                 supported: SCHEMA_VERSION,
             });
         }
+        Self::migrate_managed_submissions_to_current_if_needed(&conn)?;
         conn.execute_batch(SCHEMA)?;
         if found < 2 {
             // v1 → v2: additive column. CREATE IF NOT EXISTS above only
@@ -224,11 +445,89 @@ impl SqliteStore {
         })
     }
 
+    fn migrate_managed_submissions_to_current_if_needed(conn: &Connection) -> Result<()> {
+        let table_sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'managed_submissions'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(table_sql) = table_sql else {
+            return Ok(());
+        };
+        let has_queue_position = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('managed_submissions')
+                 WHERE name = 'queue_position'",
+            )?
+            .exists([])?;
+        let has_delivered_state = table_sql.contains("'delivered'");
+        if has_queue_position && has_delivered_state {
+            return Ok(());
+        }
+
+        // SQLite cannot widen a CHECK constraint in place. Rebuild the table
+        // before the current schema is installed, preserving immutable
+        // acceptance sequence as the initial pending queue position.
+        conn.pragma_update(None, "foreign_keys", "OFF")?;
+        let queue_position_source = if has_queue_position {
+            "queue_position"
+        } else {
+            "sequence"
+        };
+        let migration_sql = format!(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE managed_submissions_current (
+               session_id     TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+               sequence       INTEGER NOT NULL,
+               queue_position INTEGER NOT NULL,
+               submission_id  TEXT    NOT NULL,
+               payload        TEXT    NOT NULL,
+               state          TEXT    NOT NULL CHECK (
+                 state IN (
+                   'pending', 'claimed', 'running', 'steering', 'delivered', 'steered',
+                   'succeeded', 'failed', 'cancelled', 'interrupted'
+                 )
+               ),
+               run_id         TEXT,
+               accepted_at    INTEGER NOT NULL,
+               started_at     INTEGER,
+               finished_at    INTEGER,
+               error          TEXT,
+               PRIMARY KEY (session_id, submission_id),
+               UNIQUE (session_id, sequence)
+             );
+             INSERT INTO managed_submissions_current (
+               session_id, sequence, queue_position, submission_id, payload,
+               state, run_id, accepted_at, started_at, finished_at, error
+             )
+             SELECT
+               session_id, sequence, {queue_position_source}, submission_id, payload,
+               state, run_id, accepted_at, started_at, finished_at, error
+             FROM managed_submissions;
+             DROP TABLE managed_submissions;
+             ALTER TABLE managed_submissions_current RENAME TO managed_submissions;
+             COMMIT;"
+        );
+        let migration = conn.execute_batch(&migration_sql);
+        if let Err(error) = migration {
+            let _ = conn.execute_batch("ROLLBACK;");
+            let _ = conn.pragma_update(None, "foreign_keys", "ON");
+            return Err(error.into());
+        }
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(())
+    }
+
     /// Installs (or clears) the mutation listener. One listener at a time;
     /// a host that needs fan-out multiplexes behind its own closure. The
     /// listener runs after the write commits and outside the store's
     /// internal lock, so it may reentrantly call back into the store; under
-    /// concurrent writers, delivery order may differ from commit order.
+    /// concurrent writers, delivery order may differ from commit order. Its
+    /// projection is advisory: a listener panic is isolated and cannot turn a
+    /// committed mutation into a reported store failure.
     pub fn set_mutation_listener(&self, listener: Option<MutationListener>) {
         *self.listener.lock().expect("listener lock poisoned") = listener;
     }
@@ -244,7 +543,7 @@ impl SqliteStore {
             .expect("listener lock poisoned")
             .clone();
         if let Some(listener) = listener {
-            listener(&mutation);
+            let _ = catch_unwind(AssertUnwindSafe(|| listener(&mutation)));
         }
     }
 
@@ -557,6 +856,857 @@ impl SqliteStore {
         Ok(out)
     }
 
+    // ---- managed submissions + runs ----------------------------------
+
+    /// Durably accept one opaque submission. The pair
+    /// `(session_id, submission_id)` is the idempotency key: retrying the
+    /// same bytes returns [`ManagedEnqueue::Existing`], while different bytes
+    /// fail with [`StoreError::ManagedSubmissionConflict`].
+    pub fn enqueue_managed_submission(
+        &self,
+        session_id: &str,
+        submission_id: &str,
+        payload: &str,
+    ) -> Result<ManagedEnqueue> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        if let Some(existing) = load_managed_submission(&tx, session_id, submission_id)? {
+            if existing.payload != payload {
+                return Err(StoreError::ManagedSubmissionConflict {
+                    session: session_id.to_string(),
+                    submission_id: submission_id.to_string(),
+                });
+            }
+            tx.commit()?;
+            return Ok(ManagedEnqueue::Existing(existing));
+        }
+
+        let (sequence, queue_position): (u64, u64) = tx.query_row(
+            "SELECT COALESCE(MAX(sequence) + 1, 0)
+                    , COALESCE(MAX(queue_position) + 1, 0)
+             FROM managed_submissions WHERE session_id = ?1",
+            params![session_id],
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+        )?;
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO managed_submissions (
+               session_id, sequence, queue_position, submission_id, payload,
+               state, run_id, accepted_at, started_at, finished_at, error
+             ) VALUES (
+               ?1, ?2, ?3, ?4, ?5, 'pending', NULL, ?6, NULL, NULL, NULL
+             )",
+            params![
+                session_id,
+                sequence as i64,
+                queue_position as i64,
+                submission_id,
+                payload,
+                now
+            ],
+        )?;
+        touch_session(&tx, session_id, now)?;
+        let record = ManagedSubmissionRecord {
+            session_id: session_id.to_string(),
+            sequence,
+            queue_position,
+            submission_id: submission_id.to_string(),
+            payload: payload.to_string(),
+            state: ManagedSubmissionState::Pending,
+            run_id: None,
+            accepted_at_ms: now,
+            started_at_ms: None,
+            finished_at_ms: None,
+            error: None,
+        };
+        tx.commit()?;
+        drop(conn);
+        self.emit(StoreMutation::ManagedSubmissionChanged {
+            id: session_id.to_string(),
+            submission_id: submission_id.to_string(),
+            state: ManagedSubmissionState::Pending,
+        });
+        Ok(ManagedEnqueue::Inserted(record))
+    }
+
+    pub fn get_managed_submission(
+        &self,
+        session_id: &str,
+        submission_id: &str,
+    ) -> Result<Option<ManagedSubmissionRecord>> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        ensure_session(&conn, session_id)?;
+        load_managed_submission(&conn, session_id, submission_id)
+    }
+
+    /// Pending records in mutable durable queue order. Claimed/running/terminal
+    /// records are deliberately absent from the editable queue projection.
+    pub fn list_pending_managed_submissions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ManagedSubmissionRecord>> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        ensure_session(&conn, session_id)?;
+        load_managed_submissions_where(
+            &conn,
+            "session_id = ?1 AND state = 'pending'",
+            params![session_id],
+        )
+    }
+
+    /// Every session with at least one pending record, ordered by the oldest
+    /// pending accept time. Used by managed recovery to wake durable work.
+    pub fn pending_managed_session_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT session_id
+             FROM managed_submissions
+             WHERE state = 'pending'
+             GROUP BY session_id
+             ORDER BY MIN(accepted_at), MIN(sequence)",
+        )?;
+        Ok(stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Cancel only an editable pending item. Claimed/running/terminal ids are
+    /// a no-op so a stale client can never cancel a newer lifecycle phase.
+    pub fn cancel_pending_managed_submission(
+        &self,
+        session_id: &str,
+        submission_id: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        let now = now_ms();
+        let changed = tx.execute(
+            "UPDATE managed_submissions
+             SET state = 'cancelled', finished_at = ?3, error = NULL
+             WHERE session_id = ?1 AND submission_id = ?2 AND state = 'pending'",
+            params![session_id, submission_id, now],
+        )? > 0;
+        if changed {
+            touch_session(&tx, session_id, now)?;
+        }
+        tx.commit()?;
+        drop(conn);
+        if changed {
+            self.emit(StoreMutation::ManagedSubmissionChanged {
+                id: session_id.to_string(),
+                submission_id: submission_id.to_string(),
+                state: ManagedSubmissionState::Cancelled,
+            });
+        }
+        Ok(changed)
+    }
+
+    /// Compare-and-swap the complete pending order.
+    ///
+    /// `expected_order` protects against a stale client overwriting a
+    /// concurrent acceptance, claim, cancellation, or reorder. Retrying an
+    /// already-applied request is idempotent: if the durable order already
+    /// equals `desired_order`, [`ManagedPendingReorder::Unchanged`] is
+    /// returned even though it no longer equals `expected_order`.
+    pub fn reorder_pending_managed_submissions(
+        &self,
+        session_id: &str,
+        expected_order: &[String],
+        desired_order: &[String],
+    ) -> Result<ManagedPendingReorder> {
+        validate_pending_reorder(expected_order, desired_order)?;
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        let current = load_managed_submissions_where(
+            &tx,
+            "session_id = ?1 AND state = 'pending'",
+            params![session_id],
+        )?;
+        let current_order = current
+            .iter()
+            .map(|record| record.submission_id.clone())
+            .collect::<Vec<_>>();
+        if current_order == desired_order {
+            tx.commit()?;
+            return Ok(ManagedPendingReorder::Unchanged);
+        }
+        if current_order != expected_order {
+            tx.commit()?;
+            return Ok(ManagedPendingReorder::Conflict { current_order });
+        }
+
+        for (position, submission_id) in desired_order.iter().enumerate() {
+            let queue_position = current[position].queue_position;
+            let changed = tx.execute(
+                "UPDATE managed_submissions
+                 SET queue_position = ?3
+                 WHERE session_id = ?1 AND submission_id = ?2
+                   AND state = 'pending'",
+                params![session_id, submission_id, queue_position as i64],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidManagedState(
+                    "pending submission changed during serialized reorder".to_string(),
+                ));
+            }
+        }
+        let now = now_ms();
+        touch_session(&tx, session_id, now)?;
+        tx.commit()?;
+        drop(conn);
+        for submission_id in desired_order {
+            self.emit(StoreMutation::ManagedSubmissionChanged {
+                id: session_id.to_string(),
+                submission_id: submission_id.clone(),
+                state: ManagedSubmissionState::Pending,
+            });
+        }
+        Ok(ManagedPendingReorder::Reordered)
+    }
+
+    /// Durably reserve a pending submission for delivery into the named
+    /// active run. This transaction is the no-loss boundary: the record is
+    /// removed from ordinary claim eligibility only after its durable
+    /// `steering` intent and active-run binding commit together.
+    pub fn begin_pending_managed_steer(
+        &self,
+        session_id: &str,
+        submission_id: &str,
+        run_id: &str,
+    ) -> Result<ManagedSteerCommit> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        let Some(mut record) = load_managed_submission(&tx, session_id, submission_id)? else {
+            tx.commit()?;
+            return Ok(ManagedSteerCommit::Missing);
+        };
+        match record.state {
+            ManagedSubmissionState::Steering => {
+                tx.commit()?;
+                return Ok(ManagedSteerCommit::AlreadySteering(record));
+            }
+            ManagedSubmissionState::Delivered => {
+                tx.commit()?;
+                return Ok(ManagedSteerCommit::AlreadySteering(record));
+            }
+            ManagedSubmissionState::Steered => {
+                tx.commit()?;
+                return Ok(ManagedSteerCommit::AlreadySteered(record));
+            }
+            ManagedSubmissionState::Pending => {}
+            _ => {
+                tx.commit()?;
+                return Ok(ManagedSteerCommit::NotPending(record));
+            }
+        }
+        let active_run_id = load_active_managed_run(&tx, session_id)?.map(|run| run.run_id);
+        if active_run_id.as_deref() != Some(run_id) {
+            tx.commit()?;
+            return Ok(ManagedSteerCommit::RunMismatch { active_run_id });
+        }
+
+        let now = now_ms();
+        let changed = tx.execute(
+            "UPDATE managed_submissions
+             SET state = 'steering', run_id = ?3, started_at = ?4,
+                 finished_at = NULL, error = NULL
+             WHERE session_id = ?1 AND submission_id = ?2
+               AND state = 'pending'",
+            params![session_id, submission_id, run_id, now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidManagedState(
+                "pending submission changed during serialized steer reservation".to_string(),
+            ));
+        }
+        touch_session(&tx, session_id, now)?;
+        record.state = ManagedSubmissionState::Steering;
+        record.run_id = Some(run_id.to_string());
+        record.started_at_ms = Some(now);
+        record.finished_at_ms = None;
+        record.error = None;
+        tx.commit()?;
+        drop(conn);
+        self.emit(StoreMutation::ManagedSubmissionChanged {
+            id: session_id.to_string(),
+            submission_id: submission_id.to_string(),
+            state: ManagedSubmissionState::Steering,
+        });
+        Ok(ManagedSteerCommit::Begun(record))
+    }
+
+    /// Durably confirm runtime ownership of a reserved steer. `Err` is
+    /// failure-atomic: no `steering -> delivered` transition committed.
+    pub fn mark_pending_managed_steer_delivered(
+        &self,
+        session_id: &str,
+        submission_id: &str,
+        run_id: &str,
+    ) -> Result<ManagedSteerDelivery> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        let Some(mut record) = load_managed_submission(&tx, session_id, submission_id)? else {
+            tx.commit()?;
+            return Ok(ManagedSteerDelivery::Missing);
+        };
+        match record.state {
+            ManagedSubmissionState::Delivered => {
+                tx.commit()?;
+                return Ok(ManagedSteerDelivery::AlreadyDelivered(record));
+            }
+            ManagedSubmissionState::Steered => {
+                tx.commit()?;
+                return Ok(ManagedSteerDelivery::AlreadySteered(record));
+            }
+            ManagedSubmissionState::Steering => {}
+            _ => {
+                tx.commit()?;
+                return Ok(ManagedSteerDelivery::NotSteering(record));
+            }
+        }
+        let active_run_id = load_active_managed_run(&tx, session_id)?.map(|run| run.run_id);
+        if active_run_id.as_deref() != Some(run_id) || record.run_id.as_deref() != Some(run_id) {
+            tx.commit()?;
+            return Ok(ManagedSteerDelivery::RunMismatch { active_run_id });
+        }
+        let now = now_ms();
+        let changed = tx.execute(
+            "UPDATE managed_submissions
+             SET state = 'delivered', error = NULL
+             WHERE session_id = ?1 AND submission_id = ?2
+               AND run_id = ?3 AND state = 'steering'",
+            params![session_id, submission_id, run_id],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidManagedState(
+                "steering submission changed during delivery confirmation".to_string(),
+            ));
+        }
+        touch_session(&tx, session_id, now)?;
+        record.state = ManagedSubmissionState::Delivered;
+        record.error = None;
+        tx.commit()?;
+        drop(conn);
+        self.emit(StoreMutation::ManagedSubmissionChanged {
+            id: session_id.to_string(),
+            submission_id: submission_id.to_string(),
+            state: ManagedSubmissionState::Delivered,
+        });
+        Ok(ManagedSteerDelivery::Delivered(record))
+    }
+
+    /// Return a failed steer reservation to its original pending order.
+    /// Guarding by both state and run id makes stale delivery failures a no-op.
+    pub fn rollback_pending_managed_steer(
+        &self,
+        session_id: &str,
+        submission_id: &str,
+        run_id: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        let now = now_ms();
+        let changed = tx.execute(
+            "UPDATE managed_submissions
+             SET state = 'pending', run_id = NULL, started_at = NULL,
+                 finished_at = NULL, error = ?4
+             WHERE session_id = ?1 AND submission_id = ?2
+               AND run_id = ?3 AND state = 'steering'",
+            params![session_id, submission_id, run_id, error],
+        )? > 0;
+        if changed {
+            touch_session(&tx, session_id, now)?;
+        }
+        tx.commit()?;
+        drop(conn);
+        if changed {
+            self.emit(StoreMutation::ManagedSubmissionChanged {
+                id: session_id.to_string(),
+                submission_id: submission_id.to_string(),
+                state: ManagedSubmissionState::Pending,
+            });
+        }
+        Ok(changed)
+    }
+
+    /// Atomically claim exactly the first durably ordered pending submission
+    /// if the session has no active managed run. This is the single-flight
+    /// claim transaction; callers never compose a separate check + dequeue.
+    pub fn claim_next_managed_submission(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<ManagedClaim> {
+        self.claim_next_managed_submission_checked(session_id, run_id, |_| Ok(()))
+    }
+
+    /// [`Self::claim_next_managed_submission`] with validation of the exact
+    /// oldest record inside the same transaction and before either the run
+    /// lease or claimed state is written.
+    ///
+    /// Typed adapters use this to decode an opaque payload without a
+    /// list-then-claim race. A validation error rolls back the transaction and
+    /// leaves the submission pending.
+    pub fn claim_next_managed_submission_checked(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        validate: impl FnOnce(&ManagedSubmissionRecord) -> Result<()>,
+    ) -> Result<ManagedClaim> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        if let Some(active) = load_active_managed_run(&tx, session_id)? {
+            tx.commit()?;
+            return Ok(ManagedClaim::Held(active));
+        }
+        let Some(mut submission) = load_oldest_pending_submission(&tx, session_id)? else {
+            tx.commit()?;
+            return Ok(ManagedClaim::Empty);
+        };
+        validate(&submission)?;
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO managed_runs (session_id, run_id, submission_id, started_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, run_id, submission.submission_id, now],
+        )?;
+        let changed = tx.execute(
+            "UPDATE managed_submissions
+             SET state = 'claimed', run_id = ?3, started_at = ?4,
+                 finished_at = NULL, error = NULL
+             WHERE session_id = ?1 AND submission_id = ?2 AND state = 'pending'",
+            params![session_id, submission.submission_id, run_id, now],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidManagedState(
+                "oldest pending submission changed during serialized claim".to_string(),
+            ));
+        }
+        touch_session(&tx, session_id, now)?;
+        submission.state = ManagedSubmissionState::Claimed;
+        submission.run_id = Some(run_id.to_string());
+        submission.started_at_ms = Some(now);
+        submission.finished_at_ms = None;
+        submission.error = None;
+        let run = ManagedRunRecord {
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            submission_id: Some(submission.submission_id.clone()),
+            started_at_ms: now,
+        };
+        tx.commit()?;
+        drop(conn);
+        self.emit(StoreMutation::ManagedSubmissionChanged {
+            id: session_id.to_string(),
+            submission_id: submission.submission_id.clone(),
+            state: ManagedSubmissionState::Claimed,
+        });
+        self.emit(StoreMutation::ManagedRunChanged {
+            id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            active: true,
+        });
+        Ok(ManagedClaim::Claimed { submission, run })
+    }
+
+    /// Marks the input durability point. A driver MUST call this after its
+    /// idempotent input commit and before model sampling.
+    pub fn mark_managed_input_committed(&self, session_id: &str, run_id: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        let submission_id = active_submission_id(&tx, session_id, run_id)?;
+        let Some(submission_id) = submission_id else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let now = now_ms();
+        let changed = tx.execute(
+            "UPDATE managed_submissions
+             SET state = 'running'
+             WHERE session_id = ?1 AND submission_id = ?2
+               AND run_id = ?3 AND state = 'claimed'",
+            params![session_id, submission_id, run_id],
+        )? > 0;
+        if changed {
+            touch_session(&tx, session_id, now)?;
+        }
+        tx.commit()?;
+        drop(conn);
+        if changed {
+            self.emit(StoreMutation::ManagedSubmissionChanged {
+                id: session_id.to_string(),
+                submission_id,
+                state: ManagedSubmissionState::Running,
+            });
+        }
+        Ok(changed)
+    }
+
+    /// Input preparation failed before sampling. Return the claimed record to
+    /// queue eligibility and release its run in one transaction. The service
+    /// stops that drain pass so the failure cannot become a hot retry loop.
+    pub fn requeue_managed_claim(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        let Some(submission_id) = active_submission_id(&tx, session_id, run_id)? else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let now = now_ms();
+        let changed = tx.execute(
+            "UPDATE managed_submissions
+             SET state = 'pending', run_id = NULL, started_at = NULL,
+                 finished_at = NULL, error = ?4
+             WHERE session_id = ?1 AND submission_id = ?2
+               AND run_id = ?3 AND state = 'claimed'",
+            params![session_id, submission_id, run_id, error],
+        )? > 0;
+        let steering_mutations = if changed {
+            let (_, mutations) = resolve_steering_submissions(&tx, session_id, run_id, &[], now)?;
+            tx.execute(
+                "DELETE FROM managed_runs WHERE session_id = ?1 AND run_id = ?2",
+                params![session_id, run_id],
+            )?;
+            touch_session(&tx, session_id, now)?;
+            mutations
+        } else {
+            Vec::new()
+        };
+        tx.commit()?;
+        drop(conn);
+        if changed {
+            self.emit(StoreMutation::ManagedSubmissionChanged {
+                id: session_id.to_string(),
+                submission_id,
+                state: ManagedSubmissionState::Pending,
+            });
+            for mutation in steering_mutations {
+                self.emit(mutation);
+            }
+            self.emit(StoreMutation::ManagedRunChanged {
+                id: session_id.to_string(),
+                run_id: run_id.to_string(),
+                active: false,
+            });
+        }
+        Ok(changed)
+    }
+
+    /// Guarded terminal settlement. The matching active submission must have
+    /// passed the input commit (`running`). A stale run id changes nothing.
+    pub fn finish_managed_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        terminal: ManagedSubmissionState,
+        error: Option<&str>,
+        committed_steer_ids: &[String],
+    ) -> Result<ManagedRunSettlement> {
+        if !matches!(
+            terminal,
+            ManagedSubmissionState::Succeeded
+                | ManagedSubmissionState::Failed
+                | ManagedSubmissionState::Cancelled
+                | ManagedSubmissionState::Interrupted
+        ) {
+            return Err(StoreError::InvalidManagedTerminal(
+                terminal.as_str().to_string(),
+            ));
+        }
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        let Some(submission_id) = active_submission_id(&tx, session_id, run_id)? else {
+            tx.commit()?;
+            return Ok(ManagedRunSettlement {
+                settled: false,
+                steered: Vec::new(),
+            });
+        };
+        let now = now_ms();
+        let changed = tx.execute(
+            "UPDATE managed_submissions
+             SET state = ?4, finished_at = ?5, error = ?6
+             WHERE session_id = ?1 AND submission_id = ?2
+               AND run_id = ?3 AND state = 'running'",
+            params![
+                session_id,
+                submission_id,
+                run_id,
+                terminal.as_str(),
+                now,
+                error
+            ],
+        )? > 0;
+        let (steered, steering_mutations) = if changed {
+            let (records, mutations) =
+                resolve_steering_submissions(&tx, session_id, run_id, committed_steer_ids, now)?;
+            tx.execute(
+                "DELETE FROM managed_runs WHERE session_id = ?1 AND run_id = ?2",
+                params![session_id, run_id],
+            )?;
+            touch_session(&tx, session_id, now)?;
+            (records, mutations)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        tx.commit()?;
+        drop(conn);
+        if changed {
+            self.emit(StoreMutation::ManagedSubmissionChanged {
+                id: session_id.to_string(),
+                submission_id,
+                state: terminal,
+            });
+            for mutation in steering_mutations {
+                self.emit(mutation);
+            }
+            self.emit(StoreMutation::ManagedRunChanged {
+                id: session_id.to_string(),
+                run_id: run_id.to_string(),
+                active: false,
+            });
+        }
+        Ok(ManagedRunSettlement {
+            settled: changed,
+            steered,
+        })
+    }
+
+    /// Acquire the same per-session single-flight lease without a queued
+    /// submission. This supports host-initiated maintenance runs while still
+    /// excluding managed submissions.
+    pub fn try_acquire_managed_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<ManagedRunAcquire> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        ensure_session(&tx, session_id)?;
+        if let Some(active) = load_active_managed_run(&tx, session_id)? {
+            tx.commit()?;
+            return Ok(ManagedRunAcquire::Held(active));
+        }
+        let now = now_ms();
+        tx.execute(
+            "INSERT INTO managed_runs (session_id, run_id, submission_id, started_at)
+             VALUES (?1, ?2, NULL, ?3)",
+            params![session_id, run_id, now],
+        )?;
+        touch_session(&tx, session_id, now)?;
+        let run = ManagedRunRecord {
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            submission_id: None,
+            started_at_ms: now,
+        };
+        tx.commit()?;
+        drop(conn);
+        self.emit(StoreMutation::ManagedRunChanged {
+            id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            active: true,
+        });
+        Ok(ManagedRunAcquire::Acquired(run))
+    }
+
+    /// Release a direct (non-submission) run, guarded by run id. Submission
+    /// runs settle through [`Self::finish_managed_run`] instead.
+    pub fn release_managed_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        committed_steer_ids: &[String],
+    ) -> Result<ManagedRunSettlement> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        let active = load_active_managed_run(&tx, session_id)?;
+        let releasable = active
+            .as_ref()
+            .is_some_and(|run| run.run_id == run_id && run.submission_id.is_none());
+        let (steered, steering_mutations) = if releasable {
+            let now = now_ms();
+            let (records, mutations) =
+                resolve_steering_submissions(&tx, session_id, run_id, committed_steer_ids, now)?;
+            tx.execute(
+                "DELETE FROM managed_runs WHERE session_id = ?1 AND run_id = ?2",
+                params![session_id, run_id],
+            )?;
+            touch_session(&tx, session_id, now)?;
+            (records, mutations)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        tx.commit()?;
+        drop(conn);
+        if releasable {
+            for mutation in steering_mutations {
+                self.emit(mutation);
+            }
+            self.emit(StoreMutation::ManagedRunChanged {
+                id: session_id.to_string(),
+                run_id: run_id.to_string(),
+                active: false,
+            });
+        }
+        Ok(ManagedRunSettlement {
+            settled: releasable,
+            steered,
+        })
+    }
+
+    pub fn active_managed_run(&self, session_id: &str) -> Result<Option<ManagedRunRecord>> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        ensure_session(&conn, session_id)?;
+        load_active_managed_run(&conn, session_id)
+    }
+
+    /// Submission records referenced by current managed run leases.
+    ///
+    /// A typed adapter uses this as a recovery preflight while it has
+    /// exclusive store authority: every host-owned payload is decoded before
+    /// [`Self::reconcile_managed_runs`] is allowed to mutate durable state.
+    /// Direct leases have no submission and are omitted.
+    pub fn active_managed_submissions(&self) -> Result<Vec<ManagedSubmissionRecord>> {
+        let conn = self.conn.lock().expect("store lock poisoned");
+        let runs = load_all_active_managed_runs(&conn)?;
+        let mut submissions = Vec::with_capacity(runs.len());
+        for run in runs {
+            let Some(submission_id) = run.submission_id.as_deref() else {
+                continue;
+            };
+            let Some(submission) = load_managed_submission(&conn, &run.session_id, submission_id)?
+            else {
+                return Err(StoreError::InvalidManagedState(format!(
+                    "active run {} references missing submission {submission_id}",
+                    run.run_id
+                )));
+            };
+            submissions.push(submission);
+        }
+        Ok(submissions)
+    }
+
+    /// Reopen reconciliation. Pre-input claims return to pending; runs whose
+    /// input was committed become terminal interrupted; direct leases are
+    /// simply released. One transaction makes recovery a fixed point.
+    pub fn reconcile_managed_runs(&self) -> Result<Vec<ManagedRecovery>> {
+        let mut conn = self.conn.lock().expect("store lock poisoned");
+        let tx = conn.transaction()?;
+        let runs = load_all_active_managed_runs(&tx)?;
+        let now = now_ms();
+        let mut recovered = Vec::with_capacity(runs.len());
+        let mut mutations = Vec::new();
+        for run in runs {
+            let (_, steering_mutations) =
+                resolve_steering_submissions(&tx, &run.session_id, &run.run_id, &[], now)?;
+            mutations.extend(steering_mutations);
+            match run.submission_id.as_deref() {
+                None => {
+                    recovered.push(ManagedRecovery::Released { run: run.clone() });
+                }
+                Some(submission_id) => {
+                    let Some(mut submission) =
+                        load_managed_submission(&tx, &run.session_id, submission_id)?
+                    else {
+                        return Err(StoreError::InvalidManagedState(format!(
+                            "active run {} references missing submission {submission_id}",
+                            run.run_id
+                        )));
+                    };
+                    match submission.state {
+                        ManagedSubmissionState::Claimed => {
+                            tx.execute(
+                                "UPDATE managed_submissions
+                                 SET state = 'pending', run_id = NULL, started_at = NULL,
+                                     finished_at = NULL, error = NULL
+                                 WHERE session_id = ?1 AND submission_id = ?2",
+                                params![run.session_id, submission_id],
+                            )?;
+                            submission.state = ManagedSubmissionState::Pending;
+                            submission.run_id = None;
+                            submission.started_at_ms = None;
+                            submission.finished_at_ms = None;
+                            submission.error = None;
+                            mutations.push(StoreMutation::ManagedSubmissionChanged {
+                                id: run.session_id.clone(),
+                                submission_id: submission_id.to_string(),
+                                state: ManagedSubmissionState::Pending,
+                            });
+                        }
+                        ManagedSubmissionState::Running => {
+                            let message = "managed run interrupted by process restart";
+                            tx.execute(
+                                "UPDATE managed_submissions
+                                 SET state = 'interrupted', finished_at = ?3, error = ?4
+                                 WHERE session_id = ?1 AND submission_id = ?2",
+                                params![run.session_id, submission_id, now, message],
+                            )?;
+                            submission.state = ManagedSubmissionState::Interrupted;
+                            submission.finished_at_ms = Some(now);
+                            submission.error = Some(message.to_string());
+                            mutations.push(StoreMutation::ManagedSubmissionChanged {
+                                id: run.session_id.clone(),
+                                submission_id: submission_id.to_string(),
+                                state: ManagedSubmissionState::Interrupted,
+                            });
+                        }
+                        other => {
+                            return Err(StoreError::InvalidManagedState(format!(
+                                "active run {} references {} submission {submission_id}",
+                                run.run_id,
+                                other.as_str()
+                            )));
+                        }
+                    }
+                    touch_session(&tx, &run.session_id, now)?;
+                    recovered.push(match submission.state {
+                        ManagedSubmissionState::Pending => ManagedRecovery::Requeued {
+                            submission,
+                            run: run.clone(),
+                        },
+                        ManagedSubmissionState::Interrupted => ManagedRecovery::Interrupted {
+                            submission,
+                            run: run.clone(),
+                        },
+                        _ => unreachable!("recovery normalizes claimed or running only"),
+                    });
+                }
+            }
+            tx.execute(
+                "DELETE FROM managed_runs WHERE session_id = ?1 AND run_id = ?2",
+                params![run.session_id, run.run_id],
+            )?;
+            mutations.push(StoreMutation::ManagedRunChanged {
+                id: run.session_id.clone(),
+                run_id: run.run_id.clone(),
+                active: false,
+            });
+        }
+        tx.commit()?;
+        drop(conn);
+        for mutation in mutations {
+            self.emit(mutation);
+        }
+        Ok(recovered)
+    }
+
     /// The full message log in seq order — feed it to `Session::resume`.
     pub fn load_messages(&self, id: &str) -> Result<Vec<Message>> {
         Ok(self
@@ -737,6 +1887,308 @@ impl TxOps<'_> {
 
     pub fn load_messages_with_meta(&self, id: &str) -> Result<Vec<(Message, Option<String>)>> {
         load_rows(self.tx, id)
+    }
+}
+
+#[derive(Debug)]
+struct RawManagedSubmission {
+    session_id: String,
+    sequence: i64,
+    queue_position: i64,
+    submission_id: String,
+    payload: String,
+    state: String,
+    run_id: Option<String>,
+    accepted_at_ms: i64,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+    error: Option<String>,
+}
+
+fn raw_managed_submission(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawManagedSubmission> {
+    Ok(RawManagedSubmission {
+        session_id: row.get(0)?,
+        sequence: row.get(1)?,
+        queue_position: row.get(2)?,
+        submission_id: row.get(3)?,
+        payload: row.get(4)?,
+        state: row.get(5)?,
+        run_id: row.get(6)?,
+        accepted_at_ms: row.get(7)?,
+        started_at_ms: row.get(8)?,
+        finished_at_ms: row.get(9)?,
+        error: row.get(10)?,
+    })
+}
+
+fn managed_submission_record(raw: RawManagedSubmission) -> Result<ManagedSubmissionRecord> {
+    Ok(ManagedSubmissionRecord {
+        session_id: raw.session_id,
+        sequence: raw.sequence as u64,
+        queue_position: raw.queue_position as u64,
+        submission_id: raw.submission_id,
+        payload: raw.payload,
+        state: ManagedSubmissionState::parse(&raw.state)?,
+        run_id: raw.run_id,
+        accepted_at_ms: raw.accepted_at_ms,
+        started_at_ms: raw.started_at_ms,
+        finished_at_ms: raw.finished_at_ms,
+        error: raw.error,
+    })
+}
+
+fn validate_pending_reorder(expected: &[String], desired: &[String]) -> Result<()> {
+    if expected.len() != desired.len() {
+        return Err(StoreError::InvalidManagedPendingOrder(
+            "expected and desired orders have different lengths".to_string(),
+        ));
+    }
+    let expected_set = expected.iter().collect::<HashSet<_>>();
+    let desired_set = desired.iter().collect::<HashSet<_>>();
+    if expected_set.len() != expected.len() || desired_set.len() != desired.len() {
+        return Err(StoreError::InvalidManagedPendingOrder(
+            "orders must not contain duplicate submission ids".to_string(),
+        ));
+    }
+    if expected_set != desired_set {
+        return Err(StoreError::InvalidManagedPendingOrder(
+            "desired order must be a permutation of expected order".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+const MANAGED_SUBMISSION_COLUMNS: &str = "
+  session_id, sequence, queue_position, submission_id, payload, state, run_id,
+  accepted_at, started_at, finished_at, error
+";
+
+fn load_managed_submission(
+    conn: &Connection,
+    session_id: &str,
+    submission_id: &str,
+) -> Result<Option<ManagedSubmissionRecord>> {
+    let raw = conn
+        .query_row(
+            &format!(
+                "SELECT {MANAGED_SUBMISSION_COLUMNS}
+                 FROM managed_submissions
+                 WHERE session_id = ?1 AND submission_id = ?2"
+            ),
+            params![session_id, submission_id],
+            raw_managed_submission,
+        )
+        .optional()?;
+    raw.map(managed_submission_record).transpose()
+}
+
+fn load_oldest_pending_submission(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<ManagedSubmissionRecord>> {
+    let raw = conn
+        .query_row(
+            &format!(
+                "SELECT {MANAGED_SUBMISSION_COLUMNS}
+                 FROM managed_submissions
+                 WHERE session_id = ?1 AND state = 'pending'
+                 ORDER BY queue_position, sequence
+                 LIMIT 1"
+            ),
+            params![session_id],
+            raw_managed_submission,
+        )
+        .optional()?;
+    raw.map(managed_submission_record).transpose()
+}
+
+fn load_managed_submissions_where<P: rusqlite::Params>(
+    conn: &Connection,
+    predicate: &str,
+    params: P,
+) -> Result<Vec<ManagedSubmissionRecord>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MANAGED_SUBMISSION_COLUMNS}
+         FROM managed_submissions
+         WHERE {predicate}
+         ORDER BY queue_position, sequence"
+    ))?;
+    let raw: Vec<RawManagedSubmission> = stmt
+        .query_map(params, raw_managed_submission)?
+        .collect::<rusqlite::Result<_>>()?;
+    raw.into_iter().map(managed_submission_record).collect()
+}
+
+fn load_active_managed_run(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<ManagedRunRecord>> {
+    Ok(conn
+        .query_row(
+            "SELECT session_id, run_id, submission_id, started_at
+             FROM managed_runs WHERE session_id = ?1",
+            params![session_id],
+            |row| {
+                Ok(ManagedRunRecord {
+                    session_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    submission_id: row.get(2)?,
+                    started_at_ms: row.get(3)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn resolve_steering_submissions(
+    tx: &Connection,
+    session_id: &str,
+    run_id: &str,
+    committed_steer_ids: &[String],
+    now: i64,
+) -> Result<(Vec<ManagedSubmissionRecord>, Vec<StoreMutation>)> {
+    let mut records = load_managed_submissions_where(
+        tx,
+        "session_id = ?1 AND run_id = ?2 AND state IN ('steering', 'delivered')",
+        params![session_id, run_id],
+    )?;
+    let committed = committed_steer_ids.iter().collect::<HashSet<_>>();
+    if committed.len() != committed_steer_ids.len() {
+        return Err(StoreError::InvalidManagedSteerSettlement(
+            "committed steer ids must be unique".to_string(),
+        ));
+    }
+    for submission_id in &committed {
+        if !records.iter().any(|record| {
+            &record.submission_id == *submission_id
+                && record.state == ManagedSubmissionState::Delivered
+        }) {
+            return Err(StoreError::InvalidManagedSteerSettlement(format!(
+                "committed steer {submission_id} is not delivered and bound to run {run_id}"
+            )));
+        }
+    }
+
+    let mut steered_by_id = HashMap::with_capacity(committed.len());
+    let mut mutations = Vec::with_capacity(records.len());
+    for record in &mut records {
+        let commit = committed.contains(&record.submission_id);
+        let state = if commit {
+            let changed = tx.execute(
+                "UPDATE managed_submissions
+                 SET state = 'steered', finished_at = ?4, error = NULL
+                 WHERE session_id = ?1 AND submission_id = ?2
+                   AND run_id = ?3 AND state = 'delivered'",
+                params![session_id, record.submission_id, run_id, now],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidManagedState(
+                    "delivered steer changed during serialized settlement".to_string(),
+                ));
+            }
+            ManagedSubmissionState::Steered
+        } else {
+            let changed = tx.execute(
+                "UPDATE managed_submissions
+                 SET state = 'pending', run_id = NULL, started_at = NULL,
+                     finished_at = NULL, error = NULL
+                 WHERE session_id = ?1 AND submission_id = ?2
+                   AND run_id = ?3 AND state IN ('steering', 'delivered')",
+                params![session_id, record.submission_id, run_id],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidManagedState(
+                    "uncommitted steer changed during serialized settlement".to_string(),
+                ));
+            }
+            ManagedSubmissionState::Pending
+        };
+        record.state = state;
+        if commit {
+            record.finished_at_ms = Some(now);
+        } else {
+            record.run_id = None;
+            record.started_at_ms = None;
+            record.finished_at_ms = None;
+        }
+        record.error = None;
+        if commit {
+            steered_by_id.insert(record.submission_id.clone(), record.clone());
+        }
+        mutations.push(StoreMutation::ManagedSubmissionChanged {
+            id: session_id.to_string(),
+            submission_id: record.submission_id.clone(),
+            state,
+        });
+    }
+    let steered = committed_steer_ids
+        .iter()
+        .map(|submission_id| {
+            steered_by_id.remove(submission_id).ok_or_else(|| {
+                StoreError::InvalidManagedSteerSettlement(format!(
+                    "committed steer {submission_id} disappeared during settlement"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((steered, mutations))
+}
+
+fn load_all_active_managed_runs(conn: &Connection) -> Result<Vec<ManagedRunRecord>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, run_id, submission_id, started_at
+         FROM managed_runs ORDER BY started_at, session_id",
+    )?;
+    Ok(stmt
+        .query_map([], |row| {
+            Ok(ManagedRunRecord {
+                session_id: row.get(0)?,
+                run_id: row.get(1)?,
+                submission_id: row.get(2)?,
+                started_at_ms: row.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+fn active_submission_id(
+    conn: &Connection,
+    session_id: &str,
+    run_id: &str,
+) -> Result<Option<String>> {
+    let row: Option<Option<String>> = conn
+        .query_row(
+            "SELECT submission_id FROM managed_runs
+             WHERE session_id = ?1 AND run_id = ?2",
+            params![session_id, run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(row.flatten())
+}
+
+fn ensure_session(conn: &Connection, session_id: &str) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+        params![session_id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(StoreError::UnknownSession(session_id.to_string()))
+    }
+}
+
+fn touch_session(conn: &Connection, session_id: &str, now: i64) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+        params![session_id, now],
+    )?;
+    if changed == 0 {
+        Err(StoreError::UnknownSession(session_id.to_string()))
+    } else {
+        Ok(())
     }
 }
 

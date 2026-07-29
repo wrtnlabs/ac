@@ -1,6 +1,6 @@
 # RFC: The agent event stream
 
-**Status:** implemented — specification of record (2026-07-21).
+**Status:** implemented — specification of record (2026-07-29).
 **Requires:** [ac-loop.md](ac-loop.md) (the run loop is the sole producer),
 [ac-provider.md](ac-provider.md) (the completion stream this one is distilled from).
 **Required by:** [ac-serving.md](ac-serving.md) (every adapter consumes exactly this stream).
@@ -33,20 +33,23 @@ the kit's central serving contract. Five requirements shape it:
 ## 2. Model
 
 A turn's emission is a finite sequence `E = ⟨e₁, …, eₙ⟩` over the alphabet
-`Σ = { text, thinking, citation, usage, tool_call, tool_result, turn_complete, error }`.
+`Σ = { text, thinking, input_committed, citation, usage, tool_call, tool_result,
+turn_complete, error }`.
 Let `Δ = {text, thinking, citation, usage}` — the **delta events**, produced while a sampling
 response streams. A **step** is as defined in [ac-loop.md](ac-loop.md) §2: one
 sampling request, the model's response, and the complete execution of every tool call that
 response issued. The producer's grammar on the success path:
 
 ```
-turn      ::= tool_step* final
-tool_step ::= Δ*  tool_call⁺  tool_result⁺    (equal counts, same ids, same order)
-final     ::= Δ*  turn_complete               (itself a step — one that issued no calls)
+turn       ::= (step input_committed*)* turn_complete
+step       ::= Δ* (tool_call⁺ tool_result⁺)?  (equal call/result counts, same ids and order)
 ```
 
-A failed turn's emission is a proper prefix of this grammar with no terminal symbol: the
-stream closes and the failure is the turn's returned **outcome**, not an event the loop emits.
+A checkpoint between steps precedes every event from the next sampling request. A terminal
+flush may append `input_committed⁺` after the last step even when no next step will sample it.
+A failed turn's emission is a prefix of this grammar, optionally ending in such a terminal
+checkpoint sequence, with no terminal symbol: the stream closes and the failure is the turn's
+returned **outcome**, not an event the loop emits.
 `error` never appears in the producer's grammar — it exists for hosts that must frame that
 outcome in-band (§6).
 
@@ -60,6 +63,7 @@ cancellation — a turn nobody watches stops spending tokens and running tools.
 | --- | --- | --- |
 | `text` | string delta | Assistant-visible prose, incremental. |
 | `thinking` | string delta | Reasoning, for display. Provider thinking signatures are stripped here — they belong to the provider layer's replay path (itself deferred, per [ac-provider.md](ac-provider.md)), never to observation. |
+| `input_committed` | message | An accepted mid-turn input was appended to durable history as this exact plain user `Message`. Emitted after the append and before the next step, or before a non-cancel terminal outcome when terminal flush commits it. Initial input and runtime-authored user rows do not emit this checkpoint. |
 | `tool_call` | id, name, input | The model issued a tool call, input complete. No partial-input streaming: a call is announced once, whole. |
 | `tool_result` | id, name, output, is_error | The resolution of exactly one announced id. A tool failure — including a panic inside the tool — is a result with `is_error`, never a stream failure. |
 | `citation` | url, optional title | A source surfaced by a provider-executed server tool (e.g. web search). Citations are annotations — no local execution, nothing to feed back — so they ride their own variant, not the tool path. |
@@ -81,6 +85,10 @@ Within a step, ordering is layered, not interleaved:
 - **Exactly-one-result.** Each id appears exactly once as a call and once as a result, even
   when the tool crashed — the crash becomes an `is_error` result. This mirrors the loop's
   history invariant ([ac-loop.md](ac-loop.md)): the stream never shows a dangling call.
+- **Committed input separates steps.** `input_committed` follows the durable history append
+  it reports and precedes every event from the sampling step that can observe that row. If
+  terminal flush commits pending input instead, the checkpoint precedes the returned
+  non-cancel failure outcome and therefore any serving-layer `error` framing.
 - **The terminal is last.** No event follows `turn_complete`.
 
 ## 5. Wire form
@@ -131,8 +139,10 @@ message chunks) demonstrate:
   classification, occupancy denominators: all adapter- or host-supplied, none on the stream.
 - **The stream is a feed, not a record.** Resume and reload repaint from persisted history
   ([ac-loop.md](ac-loop.md)), which both adapters render into their wire's message shape; no
-  consumer may reconstruct durable state by replaying stored events. Corollary: `citation`
-  and `usage` are ephemeral observability, absent from history — record them if you want them.
+  consumer may reconstruct durable state by replaying stored events. `input_committed`
+  identifies a row that is already in history; it is a live ordering/checkpoint signal, not
+  an alternate persistence mechanism. Corollary: `citation` and `usage` are ephemeral
+  observability, absent from history — record them if you want them.
 
 ## 8. Invariants
 
@@ -154,6 +164,10 @@ message chunks) demonstrate:
 >
 > **I6 (no zombie turns).** A closed consumer is detected at the next step boundary and the
 > turn resolves as cancelled; emission never blocks on a slow or absent reader.
+>
+> **I7 (input checkpoint).** Every accepted mid-turn input appended to history emits exactly
+> one `input_committed` carrying that exact `Message`, after append and before the next-step
+> event or non-cancel terminal outcome. No other user-role row emits it.
 
 ## 9. Division of responsibility
 

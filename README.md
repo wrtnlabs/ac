@@ -19,7 +19,14 @@ rewind, and compaction project from; skills as injected text; MCP as a client.
 It also ships a small [`ac-host`](crates/ac-host) composition harness that
 assembles those injected pieces into fresh or resumed sessions and drives a
 borrowed turn as ordered events plus one terminal result. These are the parts a
-host should not re-derive.
+host should not re-derive. Hosts with thin or multiple clients can additionally
+use [`ac-managed`](crates/ac-managed) for durable submit-or-queue, per-session
+single-flight runs, acknowledgement receipts that separate durable acceptance
+from later scheduling faults, cross-mode direct-run leases, active submission
+cancellation, authoritative ordered queue snapshots, guarded pending reorder,
+sequential drain, explicit recovery, lossless pending-to-active steer
+promotion, exact ordered steer settlement proofs, and quiescent shutdown while
+injecting their own opaque payload, run driver, and event projection.
 
 **AC deliberately decides none of these for you**, and will not grow an opinion
 about them:
@@ -28,16 +35,20 @@ about them:
   socket, or an RPC surface, that is yours to define. [`ac-acp`](crates/ac-acp)
   and [`ac-ai-sdk`](crates/ac-ai-sdk) are thin adapters onto one event stream,
   not the boundary itself.
-- **No storage semantics.** [`ac-store`](crates/ac-store) owns the container —
-  identity, ordering, timestamps, transactions — and treats your `meta` as an
-  opaque blob it never parses. Domain fields are yours; so is indexing them.
+- **No consumer storage semantics.** [`ac-store`](crates/ac-store) owns generic
+  session/message and managed-submission records — identity, ordering,
+  timestamps, transactions — and treats your `meta` and managed payload as
+  opaque data it never parses. Domain fields are yours; so is indexing them.
+  A host that persists an opaque managed payload also owns its stable,
+  backward-decodable schema.
 - **No app vocabulary, and no plugin registry for app kinds.** No crate here
   knows what its host makes. Behaviour is layered through the seams in
   [CLAUDE.md](CLAUDE.md), never through an `if app == …`.
 - **No application framework or orchestration DSL.** AC is the agent backend
   framework; it does not own your process, product lifecycle, chains, graphs,
   or prompt language. `ac-host` wires the objects a host selected without
-  deciding their domain meaning.
+  deciding their domain meaning; `ac-managed` serializes ordinary runs without
+  learning what their payloads mean.
 
 ## Where the boundary falls: how you deliver a tool
 

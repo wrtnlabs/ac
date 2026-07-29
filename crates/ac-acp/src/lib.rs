@@ -459,6 +459,7 @@ async fn run_prompt(
             }
             Err(
                 e @ (RuntimeError::Timeout
+                | RuntimeError::EmptyCompletion(_)
                 | RuntimeError::Completion(_)
                 | RuntimeError::Compaction(_)),
             ) => Err(e.to_string()),
@@ -586,6 +587,11 @@ fn event_update(event: AgentEvent, context_window: u64) -> Option<SessionUpdate>
         // Mapping streamed argument fragments onto ACP's tool-call update shape
         // is a follow-up; the assembled ToolCall above carries the full input.
         AgentEvent::ToolInputDelta { .. } => None,
+        // ACP already exposes the user message through the session's durable
+        // history. Publishing the same row as a live AgentMessageChunk would
+        // misattribute it to the assistant, and ACP has no generic checkpoint
+        // update, so this boundary is deliberately absorbed.
+        AgentEvent::InputCommitted { .. } => None,
         // The stop reason rides the PromptResponse; errors ride the JSON-RPC
         // error response. Neither is a session update. Compaction is recorded in
         // the session log and surfaced live on other transports; an ACP-native

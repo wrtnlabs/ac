@@ -33,6 +33,12 @@ pub use message_state::MessageStateTracker;
 /// The SSE terminator `useChat` expects after the last chunk.
 pub const DONE: &str = "[DONE]";
 
+/// AI SDK data-part type carrying an [`AgentEvent::InputCommitted`] boundary.
+///
+/// The part is non-transient so [`MessageStateTracker`] retains and replays it
+/// to reconnecting consumers.
+pub const INPUT_COMMITTED_DATA_TYPE: &str = "data-input-committed";
+
 /// Turns the flat [`AgentEvent`] stream into a valid `UIMessageChunk`
 /// sequence. The AI SDK models an assistant message as *parts* with explicit
 /// start/end brackets, so this carries the small amount of state that requires:
@@ -180,6 +186,15 @@ impl ChunkEncoder {
                     }
                 };
                 out.push(json!({ "type": "reasoning-delta", "id": id, "delta": delta }));
+            }
+            AgentEvent::InputCommitted { message } => {
+                if let Some(end) = self.close_open() {
+                    out.push(end);
+                }
+                out.push(json!({
+                    "type": INPUT_COMMITTED_DATA_TYPE,
+                    "data": message,
+                }));
             }
             AgentEvent::ToolInputDelta { id, name, delta } => {
                 if let Some(end) = self.close_open() {
@@ -507,6 +522,37 @@ mod tests {
             .collect();
         assert_eq!(text_ids[0], text_ids[1]);
         assert_ne!(text_ids[0], text_ids[2]);
+    }
+
+    #[test]
+    fn input_checkpoint_closes_open_part_and_survives_reconnect_projection() {
+        let mut enc = ChunkEncoder::new("m1");
+        let mut tracker = MessageStateTracker::new("m1");
+        for chunk in enc.encode(AgentEvent::Text("before steer".into())) {
+            tracker.apply(&chunk);
+        }
+
+        let message = Message::text(Role::User, "change direction");
+        let chunks = enc.encode(AgentEvent::InputCommitted {
+            message: message.clone(),
+        });
+        assert_eq!(types(&chunks), vec!["text-end", "data-input-committed"]);
+        assert_eq!(chunks[1]["data"], serde_json::to_value(&message).unwrap());
+        assert!(
+            chunks[1].get("transient").is_none(),
+            "a durable input boundary must remain reconnectable"
+        );
+        for chunk in &chunks {
+            tracker.apply(chunk);
+        }
+        assert!(
+            tracker.synthesize_chunks().iter().any(|chunk| {
+                chunk["type"] == "data-input-committed"
+                    && chunk["data"] == serde_json::to_value(&message).unwrap()
+                    && chunk.get("transient").is_none()
+            }),
+            "late subscribers must receive the same committed input boundary"
+        );
     }
 
     #[test]

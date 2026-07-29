@@ -3,13 +3,16 @@
 //! the next model request; cancellation records the interruption marker and
 //! discards the queue.
 
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use ac_provider::{CompletionRequest, EventStream, Provider};
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
 use ac_runtime::{AgentConfig, AgentEvent, INTERRUPTION_MARKER, RuntimeError, Session, SteerInput};
 use ac_tool::{Capability, SubtreePolicy, Tool, ToolCtx, ToolOutput, ToolRegistry};
-use ac_types::{ContentPart, Role, StopReason};
+use ac_types::{CompletionError, CompletionEvent, ContentPart, Message, Role, StopReason};
+use futures::StreamExt;
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
@@ -103,7 +106,7 @@ async fn a_steer_during_a_tool_call_is_sampled_in_the_next_step() {
     );
     handle_cell.set(session.steer_handle()).ok().unwrap();
 
-    let (result, _events) = run(session, "begin").await;
+    let (result, events) = run(session, "begin").await;
     assert_eq!(result.expect("turn ok"), StopReason::EndTurn);
 
     let requests = handle_provider.requests();
@@ -134,6 +137,46 @@ async fn a_steer_during_a_tool_call_is_sampled_in_the_next_step() {
         "the steer must be drained into the next request verbatim: {:?}",
         requests[1].messages
     );
+
+    let result_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::ToolResult {
+                    id,
+                    is_error: false,
+                    ..
+                } if id == "call-steer"
+            )
+        })
+        .expect("tool result event");
+    let committed_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentEvent::InputCommitted { message }
+                    if message == &Message::text(Role::User, "STEERED-9137")
+            )
+        })
+        .expect("input checkpoint event");
+    let continuation_index = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::Text(text) if text == "done"))
+        .expect("continuation text event");
+    assert!(
+        result_index < committed_index && committed_index < continuation_index,
+        "the input checkpoint belongs exactly between completed steps: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::InputCommitted { .. }))
+            .count(),
+        1,
+        "initial input and runtime-authored tool-result rows must not emit checkpoints"
+    );
 }
 
 /// Steers a fixed message exactly once, on iteration 0 — a deterministic
@@ -144,6 +187,44 @@ struct SteerOnceHook {
     handle: Arc<OnceLock<ac_runtime::SteerHandle>>,
     fired: std::sync::atomic::AtomicBool,
     message: String,
+}
+
+#[derive(Clone, Default)]
+struct FailAfterFirstResponse {
+    calls: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<CompletionRequest>>>,
+}
+
+impl FailAfterFirstResponse {
+    fn requests(&self) -> Vec<CompletionRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+impl Provider for FailAfterFirstResponse {
+    fn name(&self) -> &str {
+        "fail-after-first-response"
+    }
+
+    fn stream_completion(
+        &self,
+        request: CompletionRequest,
+    ) -> BoxFuture<'static, Result<EventStream, CompletionError>> {
+        self.requests.lock().unwrap().push(request);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if call > 0 {
+                return Err(CompletionError::BadRequest(
+                    "scripted failure after completed response".to_string(),
+                ));
+            }
+            Ok(futures::stream::iter([
+                Ok(CompletionEvent::Text("before steer".to_string())),
+                Ok(CompletionEvent::Stop(StopReason::EndTurn)),
+            ])
+            .boxed())
+        })
+    }
 }
 
 impl ac_runtime::StepPrepareHook for SteerOnceHook {
@@ -196,6 +277,166 @@ async fn a_pending_steer_extends_an_otherwise_final_text_step() {
             .any(|p| matches!(p, ContentPart::Text { text } if text == "MORE-4423"))),
         "the steer must be sampled in the extending step",
     );
+}
+
+#[tokio::test]
+async fn completed_assistant_and_drained_steer_survive_later_provider_error() {
+    let provider = FailAfterFirstResponse::default();
+    let (ctx, _dir) = make_ctx();
+    let handle_cell = Arc::new(OnceLock::new());
+    let mut session = Session::new(
+        Arc::new(provider.clone()),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        AgentConfig::default(),
+    );
+    handle_cell.set(session.steer_handle()).ok().unwrap();
+    session.add_step_hook(Arc::new(SteerOnceHook {
+        handle: handle_cell,
+        fired: std::sync::atomic::AtomicBool::new(false),
+        message: "CHANGE-DIRECTION-4423".to_string(),
+    }));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let error = session.run_turn("go".into(), tx).await.unwrap_err();
+    assert!(matches!(error, RuntimeError::Completion(_)));
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message.role == Role::User
+                && message.content.iter().any(|part| {
+                    matches!(
+                        part,
+                        ContentPart::Text { text } if text == "CHANGE-DIRECTION-4423"
+                    )
+                })
+        }),
+        "the steer must be sampled by the failing follow-up request"
+    );
+
+    let messages = session.messages();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>(),
+        [Role::User, Role::Assistant, Role::User]
+    );
+    assert!(matches!(
+        messages[1].content.as_slice(),
+        [ContentPart::Text { text }] if text == "before steer"
+    ));
+    assert!(matches!(
+        messages[2].content.as_slice(),
+        [ContentPart::Text { text }] if text == "CHANGE-DIRECTION-4423"
+    ));
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event, AgentEvent::TurnComplete { .. }),
+            "a failed follow-up request must not publish successful completion"
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_flush_emits_input_checkpoint_before_failure_framing() {
+    // Queue a steer before the initial request. Initial deferral prevents it
+    // from being sampled; the request then fails, so the non-cancel terminal
+    // flush is the only path that can durably commit it.
+    let provider = FailAfterFirstResponse {
+        calls: Arc::new(AtomicUsize::new(1)),
+        ..Default::default()
+    };
+    let (ctx, _dir) = make_ctx();
+    let handle_cell = Arc::new(OnceLock::new());
+    let mut session = Session::new(
+        Arc::new(provider),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        AgentConfig::default(),
+    );
+    handle_cell.set(session.steer_handle()).ok().unwrap();
+    session.add_step_hook(Arc::new(SteerOnceHook {
+        handle: handle_cell,
+        fired: std::sync::atomic::AtomicBool::new(false),
+        message: "TERMINAL-FLUSH-4423".to_string(),
+    }));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let host_sink = tx.clone();
+    let error = session.run_turn("go".into(), tx).await.unwrap_err();
+    assert!(matches!(error, RuntimeError::Completion(_)));
+    host_sink
+        .send(AgentEvent::Error(error.to_string()))
+        .expect("host failure framing");
+    drop(host_sink);
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+    assert!(matches!(
+        events.as_slice(),
+        [
+            AgentEvent::InputCommitted { message },
+            AgentEvent::Error(_)
+        ] if message == &Message::text(Role::User, "TERMINAL-FLUSH-4423")
+    ));
+    assert_eq!(
+        session.messages(),
+        [
+            Message::text(Role::User, "go"),
+            Message::text(Role::User, "TERMINAL-FLUSH-4423"),
+        ],
+        "the checkpoint reports the exact row already appended by terminal flush"
+    );
+}
+
+#[tokio::test]
+async fn a_drained_steer_is_preserved_when_the_provider_completes_empty() {
+    let provider = MockProvider::new(vec![
+        vec![text("first"), stop_end()],
+        vec![stop_end()],
+        vec![stop_end()],
+    ]);
+    let (ctx, _dir) = make_ctx();
+    let handle_cell = Arc::new(OnceLock::new());
+    let mut session = Session::new(
+        Arc::new(provider),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        AgentConfig::default(),
+    );
+    handle_cell.set(session.steer_handle()).ok().unwrap();
+    session.add_step_hook(Arc::new(SteerOnceHook {
+        handle: handle_cell,
+        fired: std::sync::atomic::AtomicBool::new(false),
+        message: "MORE-EMPTY-4423".to_string(),
+    }));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let error = session.run_turn("go".into(), tx).await.unwrap_err();
+    assert!(matches!(
+        error,
+        RuntimeError::EmptyCompletion(StopReason::EndTurn)
+    ));
+    assert!(
+        session.messages().iter().any(|message| {
+            message.role == Role::User
+                && message.content.iter().any(
+                    |part| matches!(part, ContentPart::Text { text } if text == "MORE-EMPTY-4423"),
+                )
+        }),
+        "a steer drained before the empty sample remains in valid history"
+    );
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event, AgentEvent::TurnComplete { .. }),
+            "empty completion must not publish successful completion"
+        );
+    }
 }
 
 #[tokio::test]

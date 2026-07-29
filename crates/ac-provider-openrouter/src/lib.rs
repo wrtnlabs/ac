@@ -5,6 +5,8 @@
 
 pub mod images;
 
+use std::collections::BTreeMap;
+
 use ac_provider::{CompletionRequest, EventStream, Provider, ServerTool, ToolChoice};
 use ac_types::{
     CacheMark, Citation, CompletionError, CompletionEvent, ContentPart, Effort, Role, StopReason,
@@ -310,15 +312,25 @@ where
     E: std::fmt::Display + Send + 'static,
 {
     Box::pin(try_stream! {
-        let mut pending: Vec<PendingToolCall> = Vec::new();
-        let mut finish: Option<String> = None;
+        // Provider tool-call indexes are ordering keys, not a promise of a
+        // dense zero-based array. A built-in/server tool may occupy an index
+        // the chat-completions delta does not expose. Using `Vec::resize`
+        // here used to manufacture empty phantom calls for those gaps; the
+        // next request then failed remotely on an empty call id.
+        let mut pending: BTreeMap<usize, PendingToolCall> = BTreeMap::new();
+        let mut finish: Option<StopReason> = None;
+        let mut received_done = false;
         while let Some(frame) = sse.next().await {
             let frame = frame.map_err(|e| CompletionError::Parse(e.to_string()))?;
             if frame.data.trim() == "[DONE]" {
+                received_done = true;
                 break;
             }
             let chunk: ChatChunk = serde_json::from_str(&frame.data)
                 .map_err(|e| CompletionError::Parse(format!("{e} in: {}", frame.data)))?;
+            if let Some(error) = chunk.error {
+                Err(error.into_completion_error())?;
+            }
             if let Some(usage) = chunk.usage {
                 yield CompletionEvent::UsageUpdate(usage.into());
             }
@@ -347,10 +359,7 @@ where
                     }
                 }
                 for tool_call in choice.delta.tool_calls {
-                    if pending.len() <= tool_call.index {
-                        pending.resize_with(tool_call.index + 1, PendingToolCall::default);
-                    }
-                    let slot = &mut pending[tool_call.index];
+                    let slot = pending.entry(tool_call.index).or_default();
                     if let Some(id) = tool_call.id {
                         slot.id = id;
                     }
@@ -379,11 +388,44 @@ where
                     }
                 }
                 if let Some(reason) = choice.finish_reason {
-                    finish = Some(reason);
+                    finish = Some(match reason.as_str() {
+                        "stop" => StopReason::EndTurn,
+                        "tool_calls" => StopReason::ToolUse,
+                        "length" => StopReason::MaxTokens,
+                        "content_filter" => StopReason::Refusal,
+                        "error" => {
+                            Err(CompletionError::Other(
+                                "OpenRouter stream ended with finish_reason \"error\" but no error details"
+                                    .into(),
+                            ))?
+                        }
+                        other => {
+                            Err(CompletionError::Parse(format!(
+                                "unrecognized OpenRouter finish_reason: {other:?}"
+                            )))?
+                        }
+                    });
                 }
             }
         }
-        for call in pending.drain(..) {
+        let stop = finish.ok_or_else(|| {
+            let ending = if received_done { "[DONE]" } else { "EOF" };
+            CompletionError::Parse(format!(
+                "OpenRouter stream reached {ending} without a recognized finish_reason"
+            ))
+        })?;
+        for (index, call) in pending {
+            if call.id.trim().is_empty() || call.name.trim().is_empty() {
+                Err(CompletionError::Parse(format!(
+                    "incomplete tool call at index {index}: missing {}",
+                    match (call.id.trim().is_empty(), call.name.trim().is_empty()) {
+                        (true, true) => "id and function name",
+                        (true, false) => "id",
+                        (false, true) => "function name",
+                        (false, false) => unreachable!(),
+                    }
+                )))?;
+            }
             let input = if call.arguments.trim().is_empty() {
                 json!({})
             } else {
@@ -393,12 +435,6 @@ where
             };
             yield CompletionEvent::ToolUse(ToolUse { id: call.id, name: call.name, input });
         }
-        let stop = match finish.as_deref() {
-            Some("tool_calls") => StopReason::ToolUse,
-            Some("length") => StopReason::MaxTokens,
-            Some("content_filter") => StopReason::Refusal,
-            _ => StopReason::EndTurn,
-        };
         yield CompletionEvent::Stop(stop);
     })
 }
@@ -418,6 +454,70 @@ struct ChatChunk {
     #[serde(default)]
     choices: Vec<ChoiceChunk>,
     usage: Option<UsageChunk>,
+    error: Option<StreamErrorChunk>,
+}
+
+/// OpenRouter reports failures that happen after a streaming response has
+/// started inside an otherwise-successful HTTP 200 SSE chunk. The canonical
+/// semantic category lives at `error.metadata.error_type`; `code` remains the
+/// fallback for older or less-specific error envelopes.
+#[derive(Deserialize)]
+struct StreamErrorChunk {
+    #[serde(default)]
+    code: Value,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    metadata: Value,
+}
+
+impl StreamErrorChunk {
+    fn into_completion_error(self) -> CompletionError {
+        let error_type = self
+            .metadata
+            .get("error_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| self.code.as_str().map(str::to_owned));
+        let status = self.code.as_u64();
+        let detail = if self.message.trim().is_empty() {
+            match (error_type.as_deref(), status) {
+                (Some(error_type), _) => format!("OpenRouter stream error: {error_type}"),
+                (None, Some(status)) => format!("OpenRouter stream error (code {status})"),
+                (None, None) => "OpenRouter stream error".into(),
+            }
+        } else {
+            self.message
+        };
+
+        match error_type.as_deref() {
+            Some("authentication" | "permission_denied") => CompletionError::Auth(detail),
+            Some("payment_required") => CompletionError::InsufficientCredits(detail),
+            Some("rate_limit_exceeded") => CompletionError::RateLimited {
+                retry_after_ms: None,
+            },
+            Some(
+                "provider_overloaded"
+                | "provider_unavailable"
+                | "server"
+                | "server_error"
+                | "timeout"
+                | "unmapped",
+            ) => CompletionError::Overloaded(detail),
+            Some("context_length_exceeded") => CompletionError::PromptTooLarge(detail),
+            _ => match status {
+                Some(401 | 403) => CompletionError::Auth(detail),
+                Some(402) => CompletionError::InsufficientCredits(detail),
+                Some(429) => CompletionError::RateLimited {
+                    retry_after_ms: None,
+                },
+                Some(400 | 404 | 412 | 413 | 422) => CompletionError::BadRequest(detail),
+                Some(500..=599) => CompletionError::Overloaded(detail),
+                Some(status) => CompletionError::Other(format!("{status}: {detail}")),
+                None => CompletionError::Other(detail),
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1010,6 +1110,121 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn top_level_stream_error_uses_openrouter_semantic_type() {
+        // `context_length_exceeded` is more specific than its generic HTTP-ish
+        // code 400 and must reach AC as PromptTooLarge, not BadRequest.
+        let frames = vec![frame(
+            r#"{"error":{"code":400,"message":"context window exceeded","metadata":{"error_type":"context_length_exceeded"}},"choices":[{"delta":{"content":""},"finish_reason":"error"}]}"#,
+        )];
+        let mut stream = map_events(futures::stream::iter(frames));
+        let err = stream
+            .next()
+            .await
+            .expect("error item")
+            .expect_err("a top-level OpenRouter error must fail the stream");
+        assert!(
+            matches!(&err, CompletionError::PromptTooLarge(message) if message == "context window exceeded"),
+            "got: {err:?}"
+        );
+        assert!(stream.next().await.is_none());
+
+        let frames = vec![frame(
+            r#"{"error":{"code":429,"message":"rate limit exceeded","metadata":{"error_type":"rate_limit_exceeded"}},"choices":[{"delta":{"content":""},"finish_reason":"error"}]}"#,
+        )];
+        let mut stream = map_events(futures::stream::iter(frames));
+        assert!(matches!(
+            stream.next().await.expect("error item"),
+            Err(CompletionError::RateLimited {
+                retry_after_ms: None
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn finish_reason_error_without_error_details_still_fails() {
+        let frames = vec![frame(
+            r#"{"choices":[{"delta":{"content":""},"finish_reason":"error"}]}"#,
+        )];
+        let mut stream = map_events(futures::stream::iter(frames));
+        let err = stream
+            .next()
+            .await
+            .expect("error item")
+            .expect_err("finish_reason:error must never become EndTurn");
+        assert!(
+            matches!(&err, CompletionError::Other(message) if message.contains("finish_reason")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_finish_reason_is_rejected() {
+        let frames = vec![frame(
+            r#"{"choices":[{"delta":{},"finish_reason":"unexpected_new_reason"}]}"#,
+        )];
+        let mut stream = map_events(futures::stream::iter(frames));
+        let err = stream
+            .next()
+            .await
+            .expect("error item")
+            .expect_err("an unknown terminal reason must not imply success");
+        assert!(
+            matches!(&err, CompletionError::Parse(message) if message.contains("unexpected_new_reason")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn done_without_finish_reason_is_rejected() {
+        let mut stream = map_events(futures::stream::iter(vec![frame("[DONE]")]));
+        let err = stream
+            .next()
+            .await
+            .expect("error item")
+            .expect_err("[DONE] alone is not proof of a successful completion");
+        assert!(
+            matches!(&err, CompletionError::Parse(message) if message.contains("[DONE]") && message.contains("finish_reason")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_without_finish_reason_is_rejected_after_partial_content() {
+        let frames = vec![frame(r#"{"choices":[{"delta":{"content":"partial"}}]}"#)];
+        let mut stream = map_events(futures::stream::iter(frames));
+        assert!(matches!(
+            stream.next().await.expect("text item").expect("valid text"),
+            CompletionEvent::Text(text) if text == "partial"
+        ));
+        let err = stream
+            .next()
+            .await
+            .expect("terminal error item")
+            .expect_err("EOF without finish_reason must fail");
+        assert!(
+            matches!(&err, CompletionError::Parse(message) if message.contains("EOF") && message.contains("finish_reason")),
+            "got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_without_content_remains_a_valid_wire_completion() {
+        // OpenRouter documents that a provider can produce no content. The
+        // wire layer accepts a proven terminal `stop`; the runtime decides
+        // whether an otherwise-empty completion should be retried.
+        let frames = vec![
+            frame(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            frame("[DONE]"),
+        ];
+        let mut stream = map_events(futures::stream::iter(frames));
+        assert!(matches!(
+            stream.next().await.expect("stop item").expect("valid stop"),
+            CompletionEvent::Stop(StopReason::EndTurn)
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
     // The load-bearing invariant: concatenating every args_delta emitted for an
     // id equals the final assembled arguments string — no bytes dropped,
     // duplicated, or reordered across arbitrary fragment boundaries, including an
@@ -1091,6 +1306,55 @@ mod tests {
             "buffered prefix flushes as one delta at identification"
         );
         assert_eq!(deltas[0], r#"{"x":1}"#, "the buffered prefix is not lost");
+    }
+
+    #[tokio::test]
+    async fn sparse_tool_call_index_does_not_create_an_empty_phantom_call() {
+        let frames = vec![
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]}}]}"#,
+            ),
+            frame(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+        ];
+
+        let mut stream = map_events(futures::stream::iter(frames));
+        let mut calls = Vec::new();
+        while let Some(item) = stream.next().await {
+            if let CompletionEvent::ToolUse(call) = item.expect("valid sparse call") {
+                calls.push(call);
+            }
+        }
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].input, json!({ "path": "a.txt" }));
+    }
+
+    #[tokio::test]
+    async fn incomplete_tool_call_fails_before_it_can_poison_follow_up_history() {
+        let frames = vec![
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+            ),
+            frame(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+        ];
+
+        let mut stream = map_events(futures::stream::iter(frames));
+        let error = loop {
+            match stream.next().await {
+                Some(Err(error)) => break error,
+                Some(Ok(CompletionEvent::ToolUse(call))) => {
+                    panic!("incomplete call escaped into history: {call:?}")
+                }
+                Some(Ok(_)) => {}
+                None => panic!("incomplete call ended without an error"),
+            }
+        };
+        assert!(
+            matches!(error, CompletionError::Parse(ref message) if message.contains("missing id")),
+            "got: {error:?}"
+        );
     }
 
     // --- usage accounting: completion_tokens_details ---

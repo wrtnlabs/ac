@@ -268,6 +268,10 @@ pub struct AgentConfig {
     /// Max time to wait for the next stream event before giving up on a stalled
     /// provider. `None` disables the guard. Defaults to 5 minutes.
     pub idle_timeout: Option<Duration>,
+    /// Maximum number of contentless `EndTurn` responses retried during one
+    /// turn. Thinking, citations, usage, and whitespace do not count as
+    /// assistant output. Defaults to one retry.
+    pub empty_completion_retries: usize,
     /// Context-compaction budget and policy ([docs/ac-compaction.md]). `None`
     /// disables compaction: no trigger fires and manual `compact` is refused.
     pub compaction: Option<CompactionConfig>,
@@ -289,6 +293,7 @@ impl Default for AgentConfig {
             max_iterations: 16,
             server_tools: Vec::new(),
             idle_timeout: Some(Duration::from_secs(300)),
+            empty_completion_retries: 1,
             compaction: None,
             effort: None,
             transient_tool_output_bytes: DEFAULT_TRANSIENT_TOOL_OUTPUT_BYTES,
@@ -306,6 +311,15 @@ impl Default for AgentConfig {
 pub enum AgentEvent {
     Text(String),
     Thinking(String),
+    /// Accepted mid-turn input has crossed a durable history boundary.
+    ///
+    /// Emitted immediately after the plain user message is appended to the
+    /// rollout, whether at an ordinary step drain or the non-cancel terminal
+    /// flush. Initial turn input, runtime-authored user rows, and cancellation
+    /// markers do not emit this event.
+    InputCommitted {
+        message: Message,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -355,6 +369,8 @@ pub enum RuntimeError {
     MaxIterations(usize),
     #[error("provider stalled: no event within the idle timeout")]
     Timeout,
+    #[error("provider completed without assistant text or tool calls ({0:?})")]
+    EmptyCompletion(StopReason),
     #[error("cancelled")]
     Cancelled,
     #[error("compaction failed: {0}")]
@@ -550,15 +566,23 @@ impl Session {
         self.turn_counter
     }
 
-    /// Move the active turn's pending steers into history as plain user
-    /// messages, unsampled — the terminal-flush of [docs/ac-queue-steer.md] §4:
-    /// input the runtime accepted reaches history even when the turn ends
-    /// abnormally (R2), except under deliberate cancellation ([`on_user_cancel`]).
-    fn flush_pending(&mut self) {
+    /// Append one accepted mid-turn input as a plain user message and publish
+    /// its live checkpoint only after the durable rollout mutation.
+    fn commit_pending_input(&mut self, item: SteerInput, sink: &UnboundedSender<AgentEvent>) {
+        let message = match item {
+            SteerInput::Text(t) => Message::text(Role::User, t),
+        };
+        self.record(message.clone());
+        let _ = sink.send(AgentEvent::InputCommitted { message });
+    }
+
+    /// Move the active turn's pending steers into history, unsampled — the
+    /// terminal flush of [docs/ac-queue-steer.md] §4. Input the runtime
+    /// accepted reaches history even when the turn ends abnormally (R2),
+    /// except under deliberate cancellation ([`on_user_cancel`]).
+    fn flush_pending(&mut self, sink: &UnboundedSender<AgentEvent>) {
         for item in self.steer.take_pending() {
-            match item {
-                SteerInput::Text(t) => self.record(Message::text(Role::User, t)),
-            }
+            self.commit_pending_input(item, sink);
         }
     }
 
@@ -634,16 +658,17 @@ impl Session {
                     return Err(RuntimeError::Cancelled);
                 }
                 Err(e) => {
-                    self.flush_pending();
+                    self.flush_pending(&sink);
                     return Err(RuntimeError::Compaction(e));
                 }
             }
         }
 
         let mut iteration = 0usize;
+        let mut empty_completion_retries = 0usize;
         loop {
             if iteration >= self.config.max_iterations {
-                self.flush_pending();
+                self.flush_pending(&sink);
                 return Err(RuntimeError::MaxIterations(self.config.max_iterations));
             }
             if cancel.is_cancelled() {
@@ -665,9 +690,7 @@ impl Session {
             // initial deferral; `defer_drain_once` gates the post-compaction one.
             if drainable && !defer_drain_once {
                 for item in self.steer.take_pending() {
-                    match item {
-                        SteerInput::Text(t) => self.record(Message::text(Role::User, t)),
-                    }
+                    self.commit_pending_input(item, &sink);
                 }
             }
             defer_drain_once = false;
@@ -724,7 +747,7 @@ impl Session {
                 res = provider.stream_completion(req) => match res {
                     Ok(s) => s,
                     Err(e) => {
-                        self.flush_pending();
+                        self.flush_pending(&sink);
                         return Err(RuntimeError::Completion(e));
                     }
                 },
@@ -752,13 +775,13 @@ impl Session {
                 };
                 let event = match next {
                     Err(()) => {
-                        self.flush_pending();
+                        self.flush_pending(&sink);
                         return Err(RuntimeError::Timeout);
                     }
                     Ok(None) => break,
                     Ok(Some(Ok(ev))) => ev,
                     Ok(Some(Err(e))) => {
-                        self.flush_pending();
+                        self.flush_pending(&sink);
                         return Err(RuntimeError::Completion(e));
                     }
                 };
@@ -808,13 +831,35 @@ impl Session {
             for tu in &tool_uses {
                 assistant_content.push(ContentPart::ToolUse(tu.clone()));
             }
-            if !assistant_content.is_empty() {
-                self.record(Message {
-                    role: Role::Assistant,
-                    content: assistant_content,
-                    cache: CacheMark::Off,
-                });
+            if assistant_content.is_empty() {
+                // Thinking, citations, and usage are observational stream data;
+                // none is a durable assistant response the next request can
+                // replay. Retry a nominal EndTurn within the configured
+                // per-turn budget; the unchanged history makes this a clean
+                // provider retry, while the ordinary iteration bound remains
+                // the outer safety net. A completed empty step still opens the
+                // steer drain for the retry.
+                if stop_reason == StopReason::EndTurn
+                    && empty_completion_retries < self.config.empty_completion_retries
+                {
+                    empty_completion_retries += 1;
+                    drainable = true;
+                    iteration += 1;
+                    continue;
+                }
+                // Once the retry budget is exhausted (or the provider reports a
+                // different stop reason), surface a machinery failure instead
+                // of successful completion. Preserve any steer that raced this
+                // sampling request using the same terminal-flush discipline as
+                // other provider failures.
+                self.flush_pending(&sink);
+                return Err(RuntimeError::EmptyCompletion(stop_reason));
             }
+            self.record(Message {
+                role: Role::Assistant,
+                content: assistant_content,
+                cache: CacheMark::Off,
+            });
 
             // A completed step makes the queue drainable from here on.
             drainable = true;
@@ -979,7 +1024,7 @@ impl Session {
                         return Err(RuntimeError::Cancelled);
                     }
                     Err(e) => {
-                        self.flush_pending();
+                        self.flush_pending(&sink);
                         return Err(RuntimeError::Compaction(e));
                     }
                 }
@@ -1190,6 +1235,9 @@ mod tests {
         let events = vec![
             AgentEvent::Text("hi".into()),
             AgentEvent::Thinking("hm".into()),
+            AgentEvent::InputCommitted {
+                message: Message::text(Role::User, "changed direction"),
+            },
             AgentEvent::ToolCall {
                 id: "c1".into(),
                 name: "read_file".into(),

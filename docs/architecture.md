@@ -67,9 +67,17 @@ never link the runtime. The application-agnostic **host harness**
 ([`ac-host`](../crates/ac-host)) removes repeated session/event-pump wiring
 without owning any of those choices. Sessions are backed in the runtime by an
 append-only **log** ([ac-fork.md](ac-fork.md)) that makes branching, rewind, and
-**compaction** ([ac-compaction.md](ac-compaction.md)) pure projections of it, and persist
-through a store (the flat view) or the log itself; mid-turn input
-**steers** the running turn ([ac-queue-steer.md](ac-queue-steer.md)).
+**compaction** ([ac-compaction.md](ac-compaction.md)) pure projections of it,
+and persist through a store (the flat view) or the log itself; mid-turn input
+**steers** the running turn ([ac-queue-steer.md](ac-queue-steer.md)), while the
+optional **managed service**
+([ac-managed-submissions.md](ac-managed-submissions.md)) durably accepts,
+serializes, reorders, cancels, recovers, quiesces, and drains distinct runs for
+thin clients. It can promote a pending record into the active runtime through
+a durable reserved/delivered handoff and an exact ordered settlement proof.
+Its direct-run lease shares the same per-session publication fence, while
+stable sequence receipts preserve acknowledgement across later scheduling
+faults and queue snapshots remain durably ordered.
 
 ## 5. Reading order
 
@@ -105,6 +113,7 @@ through a store (the flat view) or the log itself; mid-turn input
 | [ac-ultra.md](ac-ultra.md) | effort as a request parameter + a delegation-mode injection; "ultra" as a host composition over the seam *(implemented + live-proven; host composition)* |
 | [ac-goals.md](ac-goals.md) | bounded autonomous objectives; a goal as a composition over a lifecycle trigger + idle continuation, packaged as an opt-in extension *(design of record — proposed)* |
 | [ac-durability.md](ac-durability.md) | the reopen contract: acknowledge points, crash windows, recovery invariants, and the proof harness *(specification + harness)* |
+| [ac-managed-submissions.md](ac-managed-submissions.md) | durable backend-authoritative submit-or-queue, direct-run leases, and sequential runs *(implemented: `ac-managed`)* |
 
 **Doctrine — in force:**
 

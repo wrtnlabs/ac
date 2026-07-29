@@ -58,19 +58,44 @@ A host that persists sessions MUST:
 
 1. **Persist input first.** Append the user's message (A1) before the turn's first sample. The
    reference AI-SDK host is corrected to do this; batching output is permitted, batching the
-   *input* into the post-turn append is not.
+   *input* into the post-turn append is not. In managed mode, durable submission
+   acceptance is likewise the acknowledgement boundary: a later scheduling
+   fault is returned inside the receipt while the accepted record remains
+   pending. A host MUST NOT infer that the input needs transport retry.
 2. **Reopen from the store, not from memory.** On restart, session state derives from
    `load → resume`; no in-memory artifact (run registry, ring buffer, handle) is assumed to
    have survived. Resume equivalence is the kit's obligation ([ac-hooks.md](ac-hooks.md) I3).
-3. **Reconcile stuck liveness marks.** Any host-maintained "running" mark (a run-status column,
-   a lock file) MUST be reconciled at open: a mark with no living process behind it flips to a
-   terminal failed state, once, idempotently (R4).
-4. **Treat persist failure as loud.** An append that fails (disk full, conflict) is surfaced —
-   to the log at minimum, to the user where a surface exists. It MUST NOT abort an otherwise
-   completed turn retroactively, and MUST NOT be silently swallowed.
+3. **Reconcile stuck liveness marks.** A low-level host-maintained "running"
+   mark (a run-status column, a lock file) MUST be reconciled at open: a mark
+   with no living process behind it flips to a terminal failed state, once,
+   idempotently (R4). In managed mode this is an `ac-managed` obligation:
+   orphaned pre-input-commit claims return to `pending`, orphaned `running`
+   submissions become `interrupted`, orphaned direct leases are released, and
+   already-pending submissions remain eligible to drain. `recover()` schedules
+   those pending sessions immediately; `recover_deferred()` reconciles without
+   claiming so the host can first restore transient execution prerequisites
+   ([ac-managed-submissions.md](ac-managed-submissions.md)).
+4. **Treat persist failure as loud.** An append that fails (disk full,
+   conflict) is surfaced — to the log at minimum, to the user where a surface
+   exists — and MUST NOT be silently swallowed. A provider may already have
+   completed and side effects may already exist, so the host cannot pretend
+   the execution never happened. But a required output append is part of
+   durable settlement: a managed submission MUST NOT report `succeeded` until
+   that append commits. It reports `failed` (or retains an uncertain active
+   fence when commit state cannot be proven) while preserving any streamed
+   output for diagnostics.
 5. **Never hold the only copy in a doomed process.** Client disconnect MAY cancel the turn
    (a stateless host) or MAY let it finish detached (a daemon host) — but in both designs
-   whatever completed still reaches the store (R1).
+   whatever completed still reaches the store (R1). Once an `ac-managed`
+   submission call begins, its accept-to-launch handshake is backend-owned:
+   request cancellation cannot interrupt a durable accept or strand a claimed
+   lease before active-run registration.
+6. **Quiesce before process teardown.** A managed host closes the scheduler's
+   claim and direct-acquire gate, requests cancellation of owned
+   submission-backed work, and waits for both submission and direct fences
+   under a host deadline. An uncertain guarded store transition remains fenced
+   as active and requires process restart plus recovery; the host MUST NOT
+   report it as cleanly released merely to complete shutdown.
 
 ## 4. Store obligations (the kit's half)
 
@@ -160,8 +185,10 @@ acknowledge points MUST keep it green.
 | Store atomicity, journal discipline, self-check, versioning | kit |
 | Log healing (torn tails, interruption closure), atomic file writes | kit |
 | Resume equivalence from the record | kit |
-| Acknowledge points (input-first, output at settle/step) | host, per §3 |
-| Liveness-mark reconciliation at open | host |
+| Acknowledge points (managed accept, input-first, output at settle/step) | managed service + host driver, per §3 |
+| Managed acceptance, direct-run lease fencing, submission cancellation, liveness reconciliation, quiescence | `ac-managed` |
+| Deferred-recovery prerequisite ordering and shutdown deadline | host |
+| Custom low-level liveness reconciliation | host |
 | Surfacing persist failures and healing reports to the user | host |
 | The proof harness | kit (store/log sweeps) + reference hosts (restart continuity) |
 

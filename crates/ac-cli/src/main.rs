@@ -182,6 +182,10 @@ fn render(event: AgentEvent, usage: &mut Option<TokenUsage>) {
             let _ = std::io::stdout().flush();
         }
         AgentEvent::Thinking(_) => {}
+        // The terminal already echoes input at submission time. This durable
+        // mid-turn checkpoint is for stateful clients and needs no second
+        // terminal rendering.
+        AgentEvent::InputCommitted { .. } => {}
         // The assembled ToolCall line below renders the full input; streaming
         // fragments adds nothing to a terminal.
         AgentEvent::ToolInputDelta { .. } => {}

@@ -81,7 +81,10 @@ The wire crate maps its native stream into the closed vocabulary, with these nor
 - **Tool calls are emitted whole.** Native streams fragment a call across frames; reassembly
   is the wire crate's job. A tool-call event MUST carry a complete id, name, and *parsed*
   input — absent arguments normalize to the empty object, unparseable arguments are a stream
-  failure, not a truncated event. Calls MAY be emitted late but MUST precede the terminal.
+  failure, not a truncated event. Native call indexes are ordering keys and MAY be sparse; a
+  wire MUST preserve their relative order without manufacturing empty calls for missing
+  indexes. An unfinished call with no non-empty id or name is a stream failure. Calls MAY be
+  emitted late but MUST precede the terminal.
 - **Stop reasons are normalized**: tool-call finishes map to *tool_use*, length cutoffs to
   *max_tokens*, content filtering to *refusal*, everything else to *end_turn*. The wire MUST
   emit a terminal even when the native stream ends without a finish signal (defaulting

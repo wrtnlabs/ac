@@ -81,9 +81,12 @@ Design notes on the error contract:
 
 **cancel** — abort the active turn. See §5.
 
-There is deliberately **no queue operation**. "Hold this for the next turn" requires no runtime
-support: a host that wants a queue holds the input itself and submits at the boundary it
-observes. The runtime's obligation ends at steer-or-start (§7).
+There is deliberately **no next-turn queue operation in `ac-runtime`**. "Hold
+this for the next turn" is not a step-loop concern. A low-level host MAY hold
+that input itself; a managed host uses the durable backend-authoritative
+submission service specified by
+[ac-managed-submissions.md](ac-managed-submissions.md). The runtime's
+obligation ends at steer-or-start (§7).
 
 ## 4. The drain discipline
 
@@ -114,8 +117,10 @@ The three rules encode three theorems of ordering:
 
 **Terminal flush (R2).** If the turn ends with `Q ≠ ∅` — a steer raced the final boundary —
 the residue is appended to `H` *unsampled*. It was not part of this turn's computation, but the
-next turn's model sees it in exactly the position it arrived. On the non-cancel path, accepted
-input therefore always reaches history:
+next turn's model sees it in exactly the position it arrived. Each append emits
+`AgentEvent::InputCommitted` before the turn returns its non-cancel terminal outcome, so a
+serving layer can project the same durable boundary before framing failure. On the non-cancel
+path, accepted input therefore always reaches history:
 
 > **I1.** For every accepted steer `x`, either `x` is sampled within its turn, or `x ∈ H` when
 > the turn resolves. A steer accepted at step boundary `i` is sampled no later than step
@@ -136,13 +141,39 @@ user said *stop, including what I just typed*.
   truncated turn as an anomaly and re-attempts completed work; with it, interruption becomes
   usable steering ("stop" is itself information).
 
+When a turn is hosted by `ac-managed`, scheduler-level `cancel_active` is the
+outer mechanism: its token is registered before `RunStarted` publication and
+before durable input commit can begin. The host runner MUST propagate that
+token into the runtime cancellation path before sampling. This closes the
+pre-run cancellation gap without moving the in-turn steer queue or its
+discard/flush semantics out of `ac-runtime`.
+
 ## 6. Observability
 
-Turn boundaries are explicit events; steered input is a plain user message within them (R3).
-Consequently a consumer needs no dedicated "steer" signal:
+Steered input remains a plain user message within the turn (R3), and history is the durable
+truth. A live consumer nevertheless cannot discover the exact history crossing from assistant
+deltas alone without polling. The runtime therefore emits
+`AgentEvent::InputCommitted { message }` immediately after each accepted mid-turn input is
+appended at an ordinary drain or terminal flush. It does not fire for initial turn input,
+tool-result user rows, reactive context, or the cancellation marker:
 
 > **I2.** A turn whose interval contains more than one user message was steered; the positions
-> of those messages in `H` are exactly the step boundaries at which they were drained.
+> of those messages in `H` are exactly the boundaries reported by `InputCommitted`, in event
+> order. The event is a live checkpoint for a row already in `H`, never a second source of
+> persistence truth.
+
+The managed submission layer has an earlier, deliberately weaker lifecycle
+event. After `ManagedRunner::steer` accepts a pending submission and AC
+durably confirms its state as `delivered`, `ac-managed` synchronously emits
+`ManagedEvent::SteerDelivered` before `steer_pending` returns. The event
+carries the exact active-run reference and durable submission record. It means
+only that the runtime owns the input provisionally: it does **not** prove that
+the runtime drained the input into `H`. `InputCommitted` is the later runtime
+proof that the row crossed into history; host persistence and settlement
+acknowledgement remain later host responsibilities. Rejected or failed delivery and a
+repeated request for an already-`steered` record do not emit this event.
+Consumers may use it for an immediate provisional projection, but must
+reconcile against the later `RunSettled` or `DirectRunSettled` proof.
 
 Long-blocking tools (waits, sleeps) MAY subscribe to the steer-activity signal and return
 early — new user intent is a better wake condition than a timer.
@@ -153,7 +184,8 @@ early — new user intent is a better wake condition than a timer.
 | --- | --- |
 | Steer queue, drain discipline, flush, cancel semantics | runtime |
 | Turn-identity precondition | runtime (verify) / client (supply) |
-| Next-turn queueing, queue editing UX, merge-on-submit | host |
+| Durable next-turn record, sequential claim/drain, pre-run active cancellation | `ac-managed` |
+| Queue editing UX, merge-on-submit policy | host |
 | Restoring cancelled drafts | host |
 | Non-steerable turn classes | runtime (declare per turn kind) |
 

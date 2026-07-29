@@ -73,6 +73,12 @@ forced opening chains ([ac-hooks.md](ac-hooks.md)) ride this seam, opaque to the
 
 **Sample.** Deltas forward to the sink as they arrive; tool-call requests accumulate. When the
 stream ends, the assistant message — final text plus every tool call — enters `H` as one record.
+At least one of those durable parts MUST exist. A provider that stops after emitting only
+thinking, citations, usage, whitespace, or no events has not completed an assistant response;
+stream-only observations cannot make an otherwise empty step successful. A contentless
+`EndTurn` is retried within a configurable per-turn budget (one retry by default), still
+counting against the ordinary iteration bound. Exhausting that budget, or receiving another
+contentless stop reason, terminates with a typed host error and emits no turn-complete event.
 
 **Execute.** If the response carried no tool calls the turn is over: a completion event with
 the model's stop reason is emitted and the turn returns it. Otherwise every tool call is

@@ -107,6 +107,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ac-managed"
+version = "0.1.0"
+dependencies = [
+ "ac-store",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "ac-mcp"
 version = "0.1.0"
 dependencies = [

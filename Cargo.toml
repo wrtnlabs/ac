@@ -18,6 +18,7 @@ ac-tool = { path = "crates/ac-tool" }
 ac-tools = { path = "crates/ac-tools" }
 ac-runtime = { path = "crates/ac-runtime" }
 ac-host = { path = "crates/ac-host" }
+ac-managed = { path = "crates/ac-managed" }
 ac-skills = { path = "crates/ac-skills" }
 ac-mcp = { path = "crates/ac-mcp" }
 ac-sandbox = { path = "crates/ac-sandbox" }
