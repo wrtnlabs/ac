@@ -26,6 +26,7 @@ use ac_runtime::AgentEvent;
 use ac_types::{ContentPart, Message, Role};
 use serde_json::{Value, json};
 
+pub mod media;
 mod message_state;
 
 pub use message_state::MessageStateTracker;
