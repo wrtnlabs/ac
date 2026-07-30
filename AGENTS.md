@@ -20,7 +20,9 @@ ac-ai-sdk                  LIVE: the Vercel AI SDK adapter — lib maps AgentEve
                            Stream Protocol (UIMessageChunk out, UIMessage hydration in); bin is an axum
                            host serving it over SSE to a stock useChat React app (examples/web-react).
                            The WEB-ecosystem proof. Sibling of ac-acp, not stacked on it.
-ac-cli                     smoke binary / generic host (phase 1: raw completion; later: full generic agent)
+ac-cli                     LIVE: generic host and smoke binary over the full agent stack — provider/loop,
+                           stock tools, skills, sandbox, and optional subagents. The CLI is the permanent
+                           second-host proof that AC is usable without any product daemon or UI.
 ac-acp                     LIVE: Agent-side ACP over the official agent-client-protocol crate (~1.2,
                            minor-pinned). initialize/new/prompt/cancel/load; AgentEvent → session/update;
                            prompt work spawned off the dispatch loop; cancelled turns respond
@@ -53,9 +55,12 @@ ac-skills                  LIVE: SKILL.md skills mirroring the codex-rs architec
                            retained) and ordered direct-child layers (required manifest name,
                            directory-name shadowing, detailed skips). No load_skill tool, no
                            allowed-tools enforcement, no per-skill permission widening — codex parity
-ac-mcp                     LIVE: rmcp 2.x adapter — McpConnection discovers server tools and registers
-                           them as RawTool entries in the same registry as built-ins; errors-as-data,
-                           cancel-raced calls, annotations untrusted by default — phase 3
+ac-mcp                     LIVE: rmcp 2.x transport/registry adapter plus the opt-in managed control
+                           plane — stdio and Streamable HTTP, OAuth 2.1, portable ordered config,
+                           fingerprints, offline catalog, lazy dialers, status/probe/mutation/backfill,
+                           stock or injected stores, and host-resolved symbolic environment references.
+                           Discovered tools enter the same RawTool registry as built-ins; errors are data,
+                           calls are cancel-raced, and annotations are untrusted by default.
 ac-sandbox                 LIVE (v1): kernel-enforced OS sandbox for the shell tool via the
                            SandboxLauncher seam — macOS Seatbelt (sandbox-exec) / Linux landlock +
                            seccompiler + setrlimit, self-applied in pre_exec (no bwrap/userns).
@@ -120,7 +125,7 @@ The AI SDK is two halves and only one overlaps AC: its *server/provider* half (`
 - **Same-session concurrency across connections is detected, not prevented:** two ACP connections (e.g. two browser tabs) can `session/load` the same stored session; a concurrent writer surfaces as a seq-CAS conflict (`StoreError::SeqConflict` → prompt error telling the client to reload) rather than a silent history fork. Prevention needs process-wide shared session state (an `AcpOptions` seam) — do it when a real host needs it.
 - **`StopReason::Refusal` keeps the refused turn in history:** the ACP spec says a refused prompt "won't be included in the next prompt", but the kit currently persists and replays it. Honoring it needs a `Session::truncate` + store truncation; deferred until a provider actually emits Refusal in practice.
 - **Skills mirror codex-rs, deliberately partially.** The architecture (text injection, mention selection, read-the-file-yourself progressive disclosure) is codex's; these codex subsystems were studied and *deliberately skipped* for now: the `agents/openai.yaml` sidecar (interface/dependencies/policy metadata), `[[skills.config]]` enable/disable rules, the catalog token-budget degradation ladder, implicit-invocation telemetry, plugin namespacing, and remote/orchestrator/environment skill sources. A host that contains reads (like `ac-cli`) grants its skills roots read access statically at build (`ReadGrants` + `SandboxPolicy::read_also`) — skill use never changes policy at runtime, matching codex's removal of skill-scoped permission widening (their #15812). `allowed-tools` is intentionally NOT a kit concept (codex has no such field).
-- **MCP surface is tools-only, snapshot-at-register:** resources/prompts/sampling/elicitation are not surfaced; `toolListChanged` notifications are ignored (a host refreshes by re-running `register_tools`); remote servers (streamable-HTTP transport + OAuth) are not wired — child-process stdio and in-process transports are. Copy codex `rmcp-client`'s OAuth/keyring patterns when remote lands.
+- **MCP surface is tools-only, snapshot-at-register:** resources/prompts/sampling/elicitation are not surfaced; `toolListChanged` notifications are ignored (a host refreshes explicitly and rebuilds registration). Child-process stdio, Streamable HTTP, and OAuth 2.1 are wired; token refresh grants and the non-tool MCP primitives remain deferred.
 
 ## Reference reading
 

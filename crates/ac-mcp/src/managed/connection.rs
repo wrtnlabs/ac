@@ -10,6 +10,8 @@ use crate::{CachedToolSpec, HttpOptions, McpConnection, McpDialer, McpError};
 
 use super::config::{ServerConfig, StdioConfig};
 
+type EnvironmentValueResolver = dyn Fn(&str) -> Option<String> + Send + Sync;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StderrMode {
     Inherit,
@@ -25,6 +27,7 @@ pub enum StderrMode {
 #[derive(Clone)]
 pub struct ConnectionPolicy {
     pub stdio_env: BTreeMap<OsString, OsString>,
+    environment_value: Option<Arc<EnvironmentValueResolver>>,
     pub connect_timeout: Duration,
     pub discovery_timeout: Duration,
     pub stdio_stderr: StderrMode,
@@ -35,6 +38,10 @@ impl std::fmt::Debug for ConnectionPolicy {
         formatter
             .debug_struct("ConnectionPolicy")
             .field("stdio_env_keys", &self.stdio_env.keys().collect::<Vec<_>>())
+            .field(
+                "has_environment_value_resolver",
+                &self.environment_value.is_some(),
+            )
             .field("connect_timeout", &self.connect_timeout)
             .field("discovery_timeout", &self.discovery_timeout)
             .field("stdio_stderr", &self.stdio_stderr)
@@ -46,6 +53,7 @@ impl Default for ConnectionPolicy {
     fn default() -> Self {
         Self {
             stdio_env: BTreeMap::new(),
+            environment_value: None,
             connect_timeout: Duration::from_secs(15),
             discovery_timeout: Duration::from_secs(15),
             stdio_stderr: StderrMode::Null,
@@ -68,6 +76,22 @@ impl ConnectionPolicy {
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
+    }
+
+    /// Supply symbolic environment values for remote header and bearer
+    /// references. AC never reads ambient process state on its own.
+    pub fn with_environment_value_resolver(
+        mut self,
+        resolver: impl Fn(&str) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.environment_value = Some(Arc::new(resolver));
+        self
+    }
+
+    fn environment_value(&self, name: &str) -> Option<String> {
+        self.environment_value
+            .as_ref()
+            .and_then(|resolver| resolver(name))
     }
 
     pub fn with_discovery_timeout(mut self, timeout: Duration) -> Self {
@@ -132,30 +156,46 @@ impl ConnectError {
         matches!(self, Self::Mcp(McpError::Auth { .. }))
     }
 
-    fn into_mcp(self, server: &str) -> McpError {
-        match self {
-            Self::Mcp(error) => error,
-            Self::ConnectTimeout(timeout) => McpError::Connect {
-                server: connection_name(server),
-                message: format!("connect timed out after {timeout:?}"),
-            },
-            Self::DiscoveryTimeout(timeout) => McpError::Connect {
-                server: connection_name(server),
-                message: format!("tool discovery timed out after {timeout:?}"),
-            },
+    fn into_redacted_mcp(self, server: &str) -> McpError {
+        let needs_auth = self.needs_auth();
+        // Connection construction captures the exact environment/header values
+        // it sends and McpConnection redacts with that one-shot snapshot.
+        // Never invoke a host resolver again while surfacing the error: it may
+        // rotate or intentionally be one-shot.
+        let message = self.to_string();
+        let server = connection_name(server);
+        if needs_auth {
+            McpError::Auth { server, message }
+        } else {
+            McpError::Connect { server, message }
         }
     }
 }
 
-fn command_from(config: &StdioConfig, policy: &ConnectionPolicy) -> tokio::process::Command {
+fn command_from(
+    config: &StdioConfig,
+    policy: &ConnectionPolicy,
+) -> (tokio::process::Command, Vec<String>) {
     let mut command = tokio::process::Command::new(&config.command);
+    let mut secrets = Vec::new();
     if let Some(args) = &config.args {
         command.args(args);
     }
     command.env_clear();
     command.envs(policy.stdio_env.iter());
+    let mut configured_environment = BTreeMap::new();
+    for name in config.env_vars.iter().flatten() {
+        if let Some(value) = policy.environment_value(name) {
+            configured_environment.insert(name.clone(), value);
+        }
+    }
     if let Some(environment) = &config.env {
-        command.envs(environment);
+        configured_environment.extend(environment.clone());
+    }
+    secrets.extend(configured_environment.values().cloned());
+    command.envs(configured_environment);
+    if let Some(cwd) = &config.cwd {
+        command.current_dir(cwd);
     }
     match policy.stdio_stderr {
         StderrMode::Inherit => {
@@ -165,7 +205,86 @@ fn command_from(config: &StdioConfig, policy: &ConnectionPolicy) -> tokio::proce
             command.stderr(Stdio::null());
         }
     }
-    command
+    (command, secrets)
+}
+
+fn http_options(
+    config: &super::config::RemoteConfig,
+    oauth_bearer: Option<String>,
+    policy: &ConnectionPolicy,
+) -> HttpOptions {
+    let mut headers = config.headers.clone().unwrap_or_default();
+    for (header, environment_key) in config.env_headers.iter().flatten() {
+        if let Some(value) = policy.environment_value(environment_key) {
+            headers.insert(header.clone(), value);
+        }
+    }
+    let environment_bearer = config
+        .bearer_token_env_var
+        .as_deref()
+        .and_then(|name| policy.environment_value(name));
+    let has_authorization_header = headers
+        .keys()
+        .any(|header| header.eq_ignore_ascii_case("authorization"));
+    HttpOptions {
+        bearer_token: if has_authorization_header {
+            None
+        } else {
+            environment_bearer.or_else(|| oauth_bearer.filter(|_| config.oauth_enabled()))
+        },
+        headers: headers.into_iter().collect(),
+    }
+}
+
+pub(crate) fn redact_error_message(
+    config: &ServerConfig,
+    extra_secrets: &[String],
+    message: &str,
+) -> String {
+    let mut secrets = Vec::new();
+    match config {
+        ServerConfig::Stdio(config) => {
+            secrets.extend(config.env.iter().flatten().map(|(_, value)| value.clone()));
+        }
+        ServerConfig::Remote(config) => {
+            if !config.url.is_empty() {
+                secrets.push(config.url.clone());
+            }
+            if let Ok(url) = reqwest::Url::parse(&config.url) {
+                secrets.push(url.as_str().to_string());
+                if !url.username().is_empty() {
+                    secrets.push(url.username().to_string());
+                }
+                if let Some(password) = url.password() {
+                    secrets.push(password.to_string());
+                }
+                secrets.extend(url.query_pairs().map(|(_, value)| value.into_owned()));
+                if let Some(fragment) = url.fragment() {
+                    secrets.push(fragment.to_string());
+                }
+            }
+            secrets.extend(
+                config
+                    .headers
+                    .iter()
+                    .flatten()
+                    .map(|(_, value)| value.clone()),
+            );
+            if let Some(secret) = config
+                .oauth_settings()
+                .and_then(|settings| settings.client_secret.clone())
+            {
+                secrets.push(secret);
+            }
+        }
+    }
+    secrets.extend(extra_secrets.iter().cloned());
+    let (mut redacted, truncated) =
+        crate::redact_and_limit(message.to_string(), &secrets, crate::MAX_ERROR_BYTES);
+    if truncated {
+        redacted.push_str("\n[truncated: MCP error exceeded 32 KiB]");
+    }
+    redacted
 }
 
 async fn connect_unbounded(
@@ -177,22 +296,11 @@ async fn connect_unbounded(
     let connection_name = connection_name(name);
     match config {
         ServerConfig::Stdio(config) => {
-            McpConnection::connect_command(connection_name, command_from(config, policy)).await
+            let (command, secrets) = command_from(config, policy);
+            McpConnection::connect_command_with_redaction(connection_name, command, secrets).await
         }
         ServerConfig::Remote(config) => {
-            let options = HttpOptions {
-                bearer_token: bearer_token.filter(|_| config.oauth_enabled()),
-                headers: config
-                    .headers
-                    .as_ref()
-                    .map(|headers| {
-                        headers
-                            .iter()
-                            .map(|(name, value)| (name.clone(), value.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            };
+            let options = http_options(config, bearer_token, policy);
             McpConnection::connect_http_with(connection_name, &config.url, options).await
         }
     }
@@ -262,9 +370,9 @@ pub fn dialer(
         let bearer_token = bearer_token.clone();
         let policy = policy.clone();
         Box::pin(async move {
-            connect(&name, &config, bearer_token, &policy)
+            connect(&name, &config, bearer_token.clone(), &policy)
                 .await
-                .map_err(|error| error.into_mcp(&name))
+                .map_err(|error| error.into_redacted_mcp(&name))
         })
     })
 }
@@ -288,6 +396,7 @@ mod tests {
     use rmcp::{RoleServer, ServerHandler, ServiceExt};
 
     use super::*;
+    use crate::managed::RemoteConfig;
 
     #[derive(Clone)]
     struct HangingServer;
@@ -321,6 +430,7 @@ mod tests {
         let observer = McpConnection {
             service: connection.service.clone(),
             name: connection.name.clone(),
+            redaction_secrets: connection.redaction_secrets.clone(),
         };
         (connection, observer, server)
     }
@@ -349,12 +459,189 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remote_environment_values_resolve_lazily_without_entering_config() {
+        let config = RemoteConfig {
+            url: "https://example.test/mcp".into(),
+            headers: Some(BTreeMap::from([("X-Static".into(), "yes".into())])),
+            env_headers: Some(BTreeMap::from([(
+                "X-Dynamic".into(),
+                "DYNAMIC_HEADER".into(),
+            )])),
+            bearer_token_env_var: Some("REMOTE_TOKEN".into()),
+            oauth: None,
+        };
+        let policy =
+            ConnectionPolicy::default().with_environment_value_resolver(|name| match name {
+                "DYNAMIC_HEADER" => Some("runtime".into()),
+                "REMOTE_TOKEN" => Some("secret".into()),
+                _ => None,
+            });
+        let options = http_options(&config, Some("oauth".into()), &policy);
+
+        assert!(options.headers.contains(&("X-Static".into(), "yes".into())));
+        assert!(
+            options
+                .headers
+                .contains(&("X-Dynamic".into(), "runtime".into()))
+        );
+        assert_eq!(options.bearer_token.as_deref(), Some("secret"));
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains("DYNAMIC_HEADER"));
+        assert!(!serialized.contains("runtime"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn configured_authorization_header_suppresses_environment_and_oauth_bearers() {
+        let config = RemoteConfig {
+            url: "https://example.test/mcp".into(),
+            headers: Some(BTreeMap::from([(
+                "authorization".into(),
+                "Basic configured".into(),
+            )])),
+            env_headers: None,
+            bearer_token_env_var: Some("REMOTE_TOKEN".into()),
+            oauth: None,
+        };
+        let policy =
+            ConnectionPolicy::default().with_environment_value_resolver(|name| match name {
+                "REMOTE_TOKEN" => Some("environment-bearer".into()),
+                _ => None,
+            });
+
+        let options = http_options(&config, Some("oauth-bearer".into()), &policy);
+
+        assert_eq!(options.bearer_token, None);
+        assert!(
+            options
+                .headers
+                .contains(&("authorization".into(), "Basic configured".into()))
+        );
+    }
+
+    #[test]
+    fn environment_authorization_header_is_resolved_before_bearer_precedence() {
+        let config = RemoteConfig {
+            url: "https://example.test/mcp".into(),
+            headers: None,
+            env_headers: Some(BTreeMap::from([(
+                "AUTHORIZATION".into(),
+                "AUTH_HEADER".into(),
+            )])),
+            bearer_token_env_var: Some("REMOTE_TOKEN".into()),
+            oauth: None,
+        };
+        let policy =
+            ConnectionPolicy::default().with_environment_value_resolver(|name| match name {
+                "AUTH_HEADER" => Some("Token configured".into()),
+                "REMOTE_TOKEN" => Some("environment-bearer".into()),
+                _ => None,
+            });
+
+        let options = http_options(&config, Some("oauth-bearer".into()), &policy);
+
+        assert_eq!(options.bearer_token, None);
+        assert!(
+            options
+                .headers
+                .contains(&("AUTHORIZATION".into(), "Token configured".into()))
+        );
+    }
+
+    #[test]
+    fn surfaced_error_redaction_covers_urls_and_every_configured_secret_source() {
+        let config = ServerConfig::Remote(RemoteConfig {
+            url: "https://user:url-secret@example.test/mcp?token=query-secret".into(),
+            headers: Some(BTreeMap::from([(
+                "X-Api-Key".into(),
+                "static-secret".into(),
+            )])),
+            env_headers: Some(BTreeMap::from([(
+                "X-Dynamic".into(),
+                "HEADER_SECRET".into(),
+            )])),
+            bearer_token_env_var: Some("ENV_BEARER".into()),
+            oauth: Some(super::super::OAuthMode::Settings(
+                super::super::OAuthSettings {
+                    client_secret: Some("client-secret".into()),
+                    ..Default::default()
+                },
+            )),
+        });
+        let message = "request to https://user:url-secret@example.test/mcp?token=query-secret \
+                       exposed static-secret client-secret oauth-access-token";
+
+        let redacted = redact_error_message(&config, &["oauth-access-token".to_string()], message);
+
+        assert!(redacted.contains("[REDACTED]"));
+        for secret in [
+            "url-secret",
+            "query-secret",
+            "static-secret",
+            "client-secret",
+            "oauth-access-token",
+        ] {
+            assert!(!redacted.contains(secret), "{secret} leaked: {redacted}");
+        }
+    }
+
+    #[test]
+    fn stdio_environment_values_and_cwd_are_applied_lazily() {
+        let config = StdioConfig {
+            command: "server".into(),
+            args: Some(vec!["--stdio".into()]),
+            env: Some(BTreeMap::from([("OVERRIDE".into(), "literal".into())])),
+            env_vars: Some(vec!["DYNAMIC_TOKEN".into(), "OVERRIDE".into()]),
+            cwd: Some("/tmp/agent-core-mcp".into()),
+        };
+        let policy =
+            ConnectionPolicy::default().with_environment_value_resolver(|name| match name {
+                "DYNAMIC_TOKEN" => Some("runtime-secret".into()),
+                "OVERRIDE" => Some("ambient-value".into()),
+                _ => None,
+            });
+        let (command, secrets) = command_from(&config, &policy);
+        let environment = command
+            .as_std()
+            .get_envs()
+            .filter_map(|(name, value)| {
+                Some((
+                    name.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            environment.get("DYNAMIC_TOKEN").map(String::as_str),
+            Some("runtime-secret")
+        );
+        assert_eq!(
+            environment.get("OVERRIDE").map(String::as_str),
+            Some("literal")
+        );
+        assert_eq!(
+            command.as_std().get_current_dir(),
+            Some(std::path::Path::new("/tmp/agent-core-mcp"))
+        );
+        assert!(secrets.contains(&"runtime-secret".to_string()));
+        assert!(secrets.contains(&"literal".to_string()));
+        assert!(!secrets.contains(&"ambient-value".to_string()));
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains("DYNAMIC_TOKEN"));
+        assert!(!serialized.contains("runtime-secret"));
+        assert!(!serialized.contains("ambient-value"));
+    }
+
     #[tokio::test]
     async fn spawn_failure_is_typed() {
         let config = ServerConfig::Stdio(StdioConfig {
             command: "/definitely/not/an/mcp/server".into(),
             args: None,
             env: None,
+            env_vars: None,
+            cwd: None,
         });
         let error = enumerate("missing", &config, None, &ConnectionPolicy::default())
             .await

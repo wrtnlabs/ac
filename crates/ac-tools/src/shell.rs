@@ -125,11 +125,60 @@ impl ShellInvocation {
         Self::new(program, args)
     }
 
+    /// Use the user's configured shell without loading user startup files.
+    ///
+    /// This is the companion to [`from_user_shell`](Self::from_user_shell) for
+    /// hosts that run with a cleared environment. Merely dropping `HOME` is
+    /// insufficient: shells such as zsh reconstruct it from the account
+    /// database before reading startup files. Common shells with an explicit
+    /// no-startup switch get it here; other shells use their ordinary
+    /// non-interactive command form. Unix reads `$SHELL`; native Windows reads
+    /// `%COMSPEC%`.
+    pub fn from_user_shell_without_startup(fallback: impl Into<String>) -> Self {
+        let program = select_user_shell_for_platform(
+            std::env::var("SHELL").ok(),
+            std::env::var("COMSPEC").ok(),
+            fallback.into(),
+            cfg!(windows),
+        );
+        Self::without_startup(program)
+    }
+
+    fn without_startup(program: String) -> Self {
+        let name = Path::new(&program)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let args = match name.as_str() {
+            "bash" => vec!["--noprofile", "--norc", "-c"],
+            "zsh" | "csh" | "tcsh" => vec!["-f", "-c"],
+            "fish" => vec!["--no-config", "-c"],
+            "cmd" | "cmd.exe" => vec!["/D", "/S", "/C"],
+            "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => {
+                vec!["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]
+            }
+            _ => vec!["-c"],
+        };
+        Self::new(program, args)
+    }
+
     fn args(&self, command: String) -> Vec<String> {
         let mut args = self.args_before_command.clone();
         args.push(command);
         args
     }
+}
+
+fn select_user_shell_for_platform(
+    shell: Option<String>,
+    comspec: Option<String>,
+    fallback: String,
+    windows: bool,
+) -> String {
+    let configured = if windows { comspec } else { shell };
+    configured
+        .filter(|program| !program.is_empty())
+        .unwrap_or(fallback)
 }
 
 impl Default for ShellInvocation {
@@ -149,10 +198,19 @@ pub struct ShellConfig {
     pub invocation: ShellInvocation,
     pub default_timeout: Duration,
     pub kill_grace: Duration,
+    /// Whether child processes inherit the host process environment.
+    ///
+    /// [`ShellEnvironmentPolicy::Inherit`] is the compatibility default.
+    /// Security-sensitive hosts should select `Clear` with an explicit,
+    /// minimal baseline; values returned by [`ShellEnvironmentProvider`] are
+    /// then overlaid on that baseline per invocation.
+    pub environment_policy: ShellEnvironmentPolicy,
     /// `None` keeps the stock overflow-only transcript behavior.
     pub capture: Option<ShellCaptureOptions>,
     /// Optional additional restriction over paths the active policy permits
-    /// reading. The resolved cwd must be contained by at least one root.
+    /// reading. The resolved cwd must be contained by at least one root. Roots
+    /// are canonicalized at invocation time so filesystem aliases and symlink
+    /// spellings compare against the policy-resolved cwd by identity.
     pub cwd_roots: Option<Vec<PathBuf>>,
     /// Cwd used only while the sandbox launcher derives its policy when the
     /// requested read-only cwd is not itself an admissible launcher cwd.
@@ -165,11 +223,27 @@ impl Default for ShellConfig {
             invocation: ShellInvocation::default(),
             default_timeout: Duration::from_millis(DEFAULT_SHELL_TIMEOUT_MS),
             kill_grace: DEFAULT_SHELL_KILL_GRACE,
+            environment_policy: ShellEnvironmentPolicy::default(),
             capture: None,
             cwd_roots: None,
             sandbox_cwd_fallback: None,
         }
     }
+}
+
+/// Host policy for the ambient environment of a shell child.
+///
+/// Dynamic values from [`ShellEnvironmentProvider`] are always applied after
+/// this policy. `Clear` is therefore an allowlist boundary: the child sees
+/// only the explicit baseline plus those per-invocation values.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ShellEnvironmentPolicy {
+    /// Preserve the spawning process environment, then overlay host values.
+    #[default]
+    Inherit,
+    /// Clear the spawning process environment, install this baseline, then
+    /// overlay host values.
+    Clear { baseline: Vec<(OsString, OsString)> },
 }
 
 /// Host-provided environment values for one shell invocation.
@@ -482,6 +556,14 @@ pub async fn execute_shell(
         }
     }
 
+    let environment_policy = ctx
+        .extensions
+        .get::<ShellConfig>()
+        .map(|config| config.environment_policy.clone())
+        .unwrap_or_default();
+    if let ShellEnvironmentPolicy::Clear { baseline } = environment_policy {
+        command.env_clear().envs(baseline);
+    }
     command
         .current_dir(&request.cwd)
         .envs(request.env)
@@ -728,7 +810,10 @@ impl Tool for Shell {
                 Err(error) => return ToolOutput::error(error.to_string()),
             };
             if let Some(roots) = &config.cwd_roots
-                && !roots.iter().any(|root| resolved.starts_with(root))
+                && !roots.iter().any(|root| {
+                    std::fs::canonicalize(root)
+                        .is_ok_and(|canonical_root| resolved.starts_with(canonical_root))
+                })
             {
                 return ToolOutput::error(format!(
                     "shell: cwd resolves outside the configured roots ({})",
@@ -821,6 +906,100 @@ mod tests {
             },
             ctx,
         )
+    }
+
+    #[test]
+    fn no_startup_invocation_uses_each_common_shells_closed_form() {
+        for (program, expected) in [
+            ("/bin/bash", &["--noprofile", "--norc", "-c"][..]),
+            ("/bin/zsh", &["-f", "-c"][..]),
+            ("/bin/fish", &["--no-config", "-c"][..]),
+            ("/bin/sh", &["-c"][..]),
+            ("cmd.exe", &["/D", "/S", "/C"][..]),
+            (
+                "powershell.exe",
+                &["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"][..],
+            ),
+        ] {
+            let invocation = ShellInvocation::without_startup(program.to_string());
+            assert_eq!(invocation.program, program);
+            assert_eq!(
+                invocation.args_before_command,
+                expected
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn no_startup_shell_selection_uses_the_native_platform_variable() {
+        assert_eq!(
+            select_user_shell_for_platform(
+                Some("/configured/zsh".to_string()),
+                Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                "/fallback/sh".to_string(),
+                false,
+            ),
+            "/configured/zsh"
+        );
+        assert_eq!(
+            select_user_shell_for_platform(
+                Some("/configured/zsh".to_string()),
+                Some(r"C:\Windows\System32\cmd.exe".to_string()),
+                "cmd.exe".to_string(),
+                true,
+            ),
+            r"C:\Windows\System32\cmd.exe"
+        );
+        assert_eq!(
+            select_user_shell_for_platform(
+                Some(String::new()),
+                Some(String::new()),
+                "cmd.exe".to_string(),
+                true,
+            ),
+            "cmd.exe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cwd_roots_compare_canonical_filesystem_identity() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = dir.path().join("canonical");
+        let alias_root = dir.path().join("alias");
+        std::fs::create_dir(&canonical_root).unwrap();
+        symlink(&canonical_root, &alias_root).unwrap();
+
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions.insert(ShellConfig {
+            cwd_roots: Some(vec![alias_root.clone()]),
+            ..ShellConfig::default()
+        });
+
+        let out = Arc::new(Shell::default())
+            .run(
+                ShellInput {
+                    command: "pwd".to_string(),
+                    cwd: Some(alias_root.display().to_string()),
+                    description: None,
+                    timeout_ms: None,
+                },
+                ctx,
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let value: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(
+            Path::new(value["stdout_tail"].as_str().unwrap().trim()),
+            canonical_root.canonicalize().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -917,6 +1096,7 @@ mod tests {
             invocation: ShellInvocation::new("sh", ["-c"]),
             default_timeout: Duration::from_secs(2),
             kill_grace: Duration::from_millis(100),
+            environment_policy: ShellEnvironmentPolicy::Inherit,
             capture: Some(ShellCaptureOptions {
                 tail_bytes: 1024,
                 tail_lines: 10,
@@ -950,6 +1130,60 @@ mod tests {
         assert_eq!(value["sandbox"]["platform"], platform_name());
         let output_path = value["output_path"].as_str().expect("eager transcript");
         assert!(Path::new(output_path).starts_with(transcript_dir.path()));
+    }
+
+    #[tokio::test]
+    async fn compatibility_default_inherits_the_host_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        let expected =
+            std::env::var("CARGO_MANIFEST_DIR").expect("cargo supplies its manifest directory");
+
+        let out = run("printf '%s' \"$CARGO_MANIFEST_DIR\"", ctx).await;
+        assert!(!out.is_error, "{}", out.content);
+        let value: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(value["stdout_tail"], expected);
+    }
+
+    #[tokio::test]
+    async fn clear_environment_installs_only_baseline_then_dynamic_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ToolCtx::new(Arc::new(
+            SubtreePolicy::new(dir.path()).unwrap(),
+        )));
+        ctx.extensions.insert(ShellConfig {
+            environment_policy: ShellEnvironmentPolicy::Clear {
+                baseline: vec![
+                    (
+                        OsString::from("PATH"),
+                        std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
+                    ),
+                    (
+                        OsString::from("AC_SHELL_BASELINE"),
+                        OsString::from("baseline"),
+                    ),
+                    (
+                        OsString::from("AC_SHELL_TEST_VALUE"),
+                        OsString::from("baseline-must-lose"),
+                    ),
+                ],
+            },
+            ..ShellConfig::default()
+        });
+        let environment: Arc<dyn ShellEnvironmentProvider> = Arc::new(TestEnvironment);
+        ctx.extensions.insert(environment);
+
+        let out = run(
+            "printf '%s|%s|%s' \"${CARGO_MANIFEST_DIR-unset}\" \
+             \"$AC_SHELL_BASELINE\" \"$AC_SHELL_TEST_VALUE\"",
+            ctx,
+        )
+        .await;
+        assert!(!out.is_error, "{}", out.content);
+        let value: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(value["stdout_tail"], "unset|baseline|configured");
     }
 
     #[tokio::test]

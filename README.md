@@ -6,7 +6,7 @@ store mechanisms, and serving projections. A host declares only what varies:
 its prompts, skills, domain tools, policy, persistence placement, and protocol
 mapping. No crate in this workspace may know who its host is.
 
-Read [CLAUDE.md](CLAUDE.md) for the architecture doctrine before touching code.
+Read [AGENTS.md](AGENTS.md) for the architecture doctrine before touching code.
 
 ## Goals, and non-goals
 
@@ -43,7 +43,7 @@ about them:
   backward-decodable schema.
 - **No app vocabulary, and no plugin registry for app kinds.** No crate here
   knows what its host makes. Behaviour is layered through the seams in
-  [CLAUDE.md](CLAUDE.md), never through an `if app == …`.
+  [AGENTS.md](AGENTS.md), never through an `if app == …`.
 - **No application framework or orchestration DSL.** AC is the agent backend
   framework; it does not own your process, product lifecycle, chains, graphs,
   or prompt language. `ac-host` wires the objects a host selected without

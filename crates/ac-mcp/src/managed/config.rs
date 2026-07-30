@@ -15,6 +15,12 @@ pub struct StdioConfig {
     pub args: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<BTreeMap<String, String>>,
+    /// Host-environment keys copied into the child at connection time.
+    #[serde(rename = "envVars", skip_serializing_if = "Option::is_none")]
+    pub env_vars: Option<Vec<String>>,
+    /// Optional working directory for the child process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl std::fmt::Debug for StdioConfig {
@@ -27,6 +33,8 @@ impl std::fmt::Debug for StdioConfig {
                 "env_keys",
                 &self.env.as_ref().map(|env| env.keys().collect::<Vec<_>>()),
             )
+            .field("environment_keys", &self.env_vars)
+            .field("cwd", &self.cwd)
             .finish()
     }
 }
@@ -118,6 +126,13 @@ pub struct RemoteConfig {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<BTreeMap<String, String>>,
+    /// Header name to host-environment key. Values are resolved at connection
+    /// time through the embedding's [`ConnectionPolicy`](super::ConnectionPolicy).
+    #[serde(rename = "envHeaders", skip_serializing_if = "Option::is_none")]
+    pub env_headers: Option<BTreeMap<String, String>>,
+    /// Host-environment key whose value becomes the HTTP bearer token.
+    #[serde(rename = "bearerTokenEnvVar", skip_serializing_if = "Option::is_none")]
+    pub bearer_token_env_var: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthMode>,
 }
@@ -133,6 +148,17 @@ impl std::fmt::Debug for RemoteConfig {
                     .headers
                     .as_ref()
                     .map(|headers| headers.keys().collect::<Vec<_>>()),
+            )
+            .field(
+                "environment_header_names",
+                &self
+                    .env_headers
+                    .as_ref()
+                    .map(|headers| headers.keys().collect::<Vec<_>>()),
+            )
+            .field(
+                "has_environment_bearer",
+                &self.bearer_token_env_var.is_some(),
             )
             .field("oauth", &self.oauth)
             .finish()
@@ -160,13 +186,73 @@ pub enum ServerConfig {
     Stdio(StdioConfig),
 }
 
+/// Stable validation errors for one portable MCP server definition.
+///
+/// Hosts often accept definitions over their own wire protocol. Keeping this
+/// shape validation in AC avoids each host reimplementing the stdio-XOR-remote
+/// contract or exposing serde's unstable untagged-enum diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ServerConfigError {
+    #[error("config must be an object")]
+    ObjectRequired,
+    #[error("config must have exactly one of `command` (stdio) or `url` (remote)")]
+    TransportSelection,
+    #[error("invalid MCP server config: {0}")]
+    InvalidShape(String),
+    #[error("invalid MCP server config: {0}")]
+    InvalidValue(String),
+}
+
 impl ServerConfig {
+    /// Parse and validate a JSON definition with stable host-facing errors.
+    pub fn parse_value(value: Value) -> Result<Self, ServerConfigError> {
+        let object = value.as_object().ok_or(ServerConfigError::ObjectRequired)?;
+        let config = match (object.contains_key("command"), object.contains_key("url")) {
+            (true, false) => serde_json::from_value::<StdioConfig>(value)
+                .map(Self::Stdio)
+                .map_err(|error| ServerConfigError::InvalidShape(error.to_string()))?,
+            (false, true) => serde_json::from_value::<RemoteConfig>(value)
+                .map(Self::Remote)
+                .map_err(|error| ServerConfigError::InvalidShape(error.to_string()))?,
+            _ => return Err(ServerConfigError::TransportSelection),
+        };
+        config.validate().map_err(ServerConfigError::InvalidValue)?;
+        Ok(config)
+    }
+
     /// Validate constraints that serde cannot express.
-    pub fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Stdio(config) if config.command.is_empty() => Err("command must be non-empty"),
-            Self::Remote(config) if config.url.is_empty() => Err("url must be non-empty"),
-            _ => Ok(()),
+            Self::Stdio(config) => {
+                if config.command.is_empty() {
+                    return Err("command must be non-empty".to_string());
+                }
+                if config.cwd.as_deref() == Some("") {
+                    return Err("cwd must be non-empty when present".to_string());
+                }
+                for name in config.env.iter().flatten().map(|(name, _)| name) {
+                    validate_environment_name(name)?;
+                }
+                for name in config.env_vars.iter().flatten() {
+                    validate_environment_name(name)?;
+                }
+                Ok(())
+            }
+            Self::Remote(config) => {
+                if config.url.is_empty() {
+                    return Err("url must be non-empty".to_string());
+                }
+                for name in config
+                    .env_headers
+                    .iter()
+                    .flatten()
+                    .map(|(_, environment_name)| environment_name)
+                    .chain(config.bearer_token_env_var.iter())
+                {
+                    validate_environment_name(name)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -186,6 +272,15 @@ impl ServerConfig {
         let encoded = serde_json::to_vec(self).expect("server config serializes");
         format!("sha256:{:x}", Sha256::digest(encoded))
     }
+}
+
+fn validate_environment_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.as_bytes().contains(&b'=') || name.as_bytes().contains(&b'\0') {
+        return Err(format!(
+            "invalid environment variable name {name:?}: names must be non-empty and contain neither '=' nor NUL"
+        ));
+    }
+    Ok(())
 }
 
 /// The portable `mcpServers` registry.
@@ -221,16 +316,10 @@ pub(crate) fn parse_server_entries(
 ) -> ParsedConfig {
     let mut parsed = ParsedConfig::default();
     for (name, value) in entries {
-        match serde_json::from_value::<ServerConfig>(value) {
-            Ok(config) => match config.validate() {
-                Ok(()) => {
-                    parsed.config.mcp_servers.insert(name, config);
-                }
-                Err(reason) => parsed.rejected.push(RejectedServer {
-                    server: name,
-                    reason: reason.to_string(),
-                }),
-            },
+        match ServerConfig::parse_value(value) {
+            Ok(config) => {
+                parsed.config.mcp_servers.insert(name, config);
+            }
             Err(error) => parsed.rejected.push(RejectedServer {
                 server: name,
                 reason: error.to_string(),
@@ -267,14 +356,40 @@ mod tests {
                 "remote": { "url": "https://example.test/mcp", "oauth": false },
                 "both": { "command": "npx", "url": "https://example.test/mcp" },
                 "empty": { "command": "" },
+                "empty_cwd": { "command": "npx", "cwd": "" },
+                "invalid_literal_env": { "command": "npx", "env": { "BAD=NAME": "value" } },
+                "invalid_env_ref": { "command": "npx", "envVars": [""] },
+                "invalid_header_env_ref": {
+                    "url": "https://example.test/mcp",
+                    "envHeaders": { "Authorization": "BAD=NAME" }
+                },
+                "invalid_bearer_env_ref": {
+                    "url": "https://example.test/mcp",
+                    "bearerTokenEnvVar": ""
+                },
                 "extra": { "command": "npx", "unknown": true }
             }
         }));
+        let mut server_names = parsed.config.mcp_servers.keys().collect::<Vec<_>>();
+        server_names.sort_unstable();
+        assert_eq!(server_names, ["remote", "stdio"]);
+        assert_eq!(parsed.rejected.len(), 8);
         assert_eq!(
-            parsed.config.mcp_servers.keys().collect::<Vec<_>>(),
-            ["remote", "stdio"]
+            parsed
+                .rejected
+                .iter()
+                .find(|entry| entry.server == "both")
+                .unwrap()
+                .reason,
+            "config must have exactly one of `command` (stdio) or `url` (remote)"
         );
-        assert_eq!(parsed.rejected.len(), 3);
+        assert!(
+            parsed
+                .rejected
+                .iter()
+                .filter(|entry| entry.server.contains("env"))
+                .all(|entry| entry.reason.contains("environment variable name"))
+        );
 
         let config = parsed.config.mcp_servers["remote"].clone();
         assert_eq!(config.fingerprint(), config.clone().fingerprint());

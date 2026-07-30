@@ -4,8 +4,9 @@
 //! integrations. This module supplies the repeated load-bearing pattern:
 //! portable ordered configuration, identity-bound offline catalog, lazy
 //! dialers, atomic credential persistence (mode `0600` on Unix), status,
-//! refresh/backfill, and mutation ordering. Hosts inject locations, process
-//! environment, OAuth presentation/identity, and any RPC or UI projection.
+//! refresh/backfill, derived-name migration, symbolic environment-backed
+//! remote headers, and mutation ordering. Hosts inject locations, environment
+//! values, OAuth presentation/identity, and any RPC or UI projection.
 
 mod catalog;
 mod config;
@@ -29,7 +30,7 @@ pub use catalog::{
 };
 pub use config::{
     Config, OAuthMode, OAuthSettings, ParsedConfig, RejectedServer, RemoteConfig, ServerConfig,
-    StdioConfig, parse_config,
+    ServerConfigError, StdioConfig, parse_config,
 };
 pub use connection::{
     ConnectError, ConnectionPolicy, StderrMode, connect, connection_name, dialer, enumerate,
@@ -42,7 +43,8 @@ pub use credentials::{
 pub use store::{FileStateStore, StateStore, StoreError};
 
 use crate::oauth::{
-    ClientMetadata, InteractiveOAuthConfig, OAuthCoordinator, OAuthEnumerateError, OAuthEnumerator,
+    ClientMetadata, InteractiveOAuthConfig, OAuthCoordinator, OAuthEndpointPolicy,
+    OAuthEnumerateError, OAuthEnumerator,
 };
 use crate::oauth_callback::PageCopy;
 use crate::{
@@ -206,6 +208,9 @@ pub struct OAuthHostPolicy {
     pub redirect_uri: String,
     pub discovery_metadata: ClientMetadata,
     pub registration_metadata: ClientMetadata,
+    /// Cross-origin authorization-server origins the host explicitly trusts.
+    /// Empty keeps OAuth discovery on the configured MCP origin.
+    pub endpoint_policy: OAuthEndpointPolicy,
     pub page_copy: PageCopy,
 }
 
@@ -350,9 +355,8 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
 
     /// Select the deterministic name mapping used for future enumerations.
     ///
-    /// Existing catalog rows remain verbatim; refresh/backfill and
-    /// authenticated enumeration use this policy through the single catalog
-    /// commit path.
+    /// Existing rows remain verbatim unless the host explicitly calls
+    /// [`requalify_catalog`](Self::requalify_catalog).
     pub fn with_catalog_name_policy(mut self, policy: CatalogNamePolicy) -> Self {
         self.name_policy = policy;
         self
@@ -360,6 +364,34 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
 
     pub fn catalog_name_policy(&self) -> &CatalogNamePolicy {
         &self.name_policy
+    }
+
+    /// Rewrite every current derived-catalog tool name through the selected
+    /// name policy, without dialing a server or changing its cached schema.
+    ///
+    /// This is an explicit migration seam for hosts changing a public tool
+    /// name contract. It is idempotent, prunes stale catalog identities using
+    /// the same config snapshot, and returns the number of renamed entries.
+    pub async fn requalify_catalog(&self) -> Result<usize, ManagedError> {
+        let _config_guard = self.config_lock.lock().await;
+        let config = require_clean_config(self.state.load_config().await?)?;
+        let _catalog_guard = self.catalog_lock.lock().await;
+        let mut catalog = self.state.load_catalog().await?;
+        let pruned = catalog.retain_current(&config);
+        let mut renamed = 0;
+        for entry in &mut catalog.entries {
+            let qualified = self
+                .name_policy
+                .qualified_name(&entry.server, &entry.tool_name);
+            if entry.qualified_name != qualified {
+                entry.qualified_name = qualified;
+                renamed += 1;
+            }
+        }
+        if pruned || renamed > 0 {
+            self.state.save_catalog(&catalog).await?;
+        }
+        Ok(renamed)
     }
 
     pub fn oauth_coordinator(&self) -> Arc<OAuthCoordinator> {
@@ -507,14 +539,18 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
     ) -> Result<ProbeResult, ManagedError> {
         let bearer = self.bearer_for(server, definition).await?;
         Ok(
-            match enumerate(server, definition, bearer, &self.policy).await {
+            match enumerate(server, definition, bearer.clone(), &self.policy).await {
                 Ok(tools) => ProbeResult::Reachable { tools },
                 Err(error) => ProbeResult::Failed {
                     needs_auth: definition
                         .remote()
                         .is_some_and(|remote| remote.oauth_enabled())
                         && error.needs_auth(),
-                    error: error.to_string(),
+                    error: connection::redact_error_message(
+                        definition,
+                        &bearer.iter().cloned().collect::<Vec<_>>(),
+                        &error.to_string(),
+                    ),
                 },
             },
         )
@@ -620,7 +656,7 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
         definition: &ServerConfig,
     ) -> Result<RefreshOutcome, ManagedError> {
         let bearer = self.bearer_for(server, definition).await?;
-        match enumerate(server, definition, bearer, &self.policy).await {
+        match enumerate(server, definition, bearer.clone(), &self.policy).await {
             Ok(specs) => {
                 let tool_count = specs.len();
                 if self.commit_enumeration(server, definition, specs).await? {
@@ -634,7 +670,11 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
                     .remote()
                     .is_some_and(|remote| remote.oauth_enabled())
                     && error.needs_auth();
-                let message = error.to_string();
+                let message = connection::redact_error_message(
+                    definition,
+                    &bearer.iter().cloned().collect::<Vec<_>>(),
+                    &error.to_string(),
+                );
                 if self
                     .mark_failure(server, definition, &message, needs_auth)
                     .await?
@@ -658,6 +698,7 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
         enumerated_definition: &ServerConfig,
         specs: Vec<CachedToolSpec>,
     ) -> Result<bool, ManagedError> {
+        crate::validate_cached_catalog(server, &specs)?;
         let entries = entries_from_specs_with(server, specs, |server, tool| {
             self.name_policy.qualified_name(server, tool)
         });
@@ -1028,6 +1069,7 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
         self.oauth
             .authenticate_interactive(server, flow, &store, enumerator, on_open_url, cancel)
             .await
+            .map_err(|message| connection::redact_error_message(&definition, &[], &message))
     }
 
     /// Interactive OAuth using this manager's one config-to-connection path.
@@ -1047,6 +1089,7 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
             redirect_uri: flow.redirect_uri.clone(),
             discovery_metadata: flow.discovery_metadata.clone(),
             registration_metadata: flow.registration_metadata.clone(),
+            endpoint_policy: flow.endpoint_policy.clone(),
             page_copy: flow.page_copy.clone(),
         };
         self.authenticate_registered(server, &host, on_open_url, cancel)
@@ -1145,6 +1188,7 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
             scope: settings.and_then(|settings| settings.scope.clone()),
             client_id: settings.and_then(|settings| settings.client_id.clone()),
             client_secret: settings.and_then(|settings| settings.client_secret.clone()),
+            endpoint_policy: host.endpoint_policy.clone(),
             discovery_metadata: host.discovery_metadata.clone(),
             registration_metadata: host.registration_metadata.clone(),
             page_copy: host.page_copy.clone(),
@@ -1158,7 +1202,13 @@ impl<S: StateStore, C: CredentialStore> ManagedMcp<S, C> {
             .oauth
             .authenticate_interactive(server, &flow, &store, &enumerator, on_open_url, cancel)
             .await
-            .map_err(AuthenticationError::Flow)?;
+            .map_err(|message| {
+                AuthenticationError::Flow(connection::redact_error_message(
+                    &definition,
+                    &[],
+                    &message,
+                ))
+            })?;
         let tool_count = specs.len();
         if !self.commit_enumeration(server, &definition, specs).await? {
             return Err(AuthenticationError::Changed(server.to_string()));
@@ -1179,11 +1229,15 @@ impl OAuthEnumerator<CachedToolSpec> for ConfiguredOAuthEnumerator {
         bearer: Option<String>,
     ) -> futures::future::BoxFuture<'_, Result<Vec<CachedToolSpec>, OAuthEnumerateError>> {
         Box::pin(async move {
-            enumerate(&self.server, &self.definition, bearer, &self.policy)
+            enumerate(&self.server, &self.definition, bearer.clone(), &self.policy)
                 .await
                 .map_err(|error| OAuthEnumerateError {
                     needs_auth: error.needs_auth(),
-                    message: error.to_string(),
+                    message: connection::redact_error_message(
+                        &self.definition,
+                        &bearer.iter().cloned().collect::<Vec<_>>(),
+                        &error.to_string(),
+                    ),
                 })
         })
     }
@@ -1283,6 +1337,8 @@ mod tests {
             command: "/definitely/not/an/mcp/server".into(),
             args: None,
             env: Some(BTreeMap::from([("KEY".into(), "value".into())])),
+            env_vars: None,
+            cwd: None,
         })
     }
 
@@ -1290,6 +1346,8 @@ mod tests {
         ServerConfig::Remote(RemoteConfig {
             url: "not-an-http-url".into(),
             headers: None,
+            env_headers: None,
+            bearer_token_env_var: None,
             oauth: Some(OAuthMode::Settings(OAuthSettings {
                 scope: Some(scope.into()),
                 ..Default::default()
@@ -1378,6 +1436,46 @@ mod tests {
         );
         assert!(managed.remove("broken").await.unwrap());
         assert!(managed.status().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_refresh_and_status_never_surface_the_configured_url() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = ManagedMcp::open(paths(&directory), ConnectionPolicy::default());
+        let configured_url = "not-http?token=url-secret";
+        let definition = ServerConfig::Remote(RemoteConfig {
+            url: configured_url.into(),
+            headers: Some(BTreeMap::from([(
+                "Authorization".into(),
+                "Bearer header-secret".into(),
+            )])),
+            env_headers: None,
+            bearer_token_env_var: None,
+            oauth: None,
+        });
+
+        let probe = managed.probe("private-remote", &definition).await.unwrap();
+        let ProbeResult::Failed {
+            error: probe_error, ..
+        } = probe
+        else {
+            panic!("invalid URL must fail probing");
+        };
+        assert!(!probe_error.contains(configured_url), "{probe_error}");
+        assert!(!probe_error.contains("url-secret"), "{probe_error}");
+        assert!(!probe_error.contains("header-secret"), "{probe_error}");
+
+        let added = managed.upsert("private-remote", definition).await.unwrap();
+        let RefreshOutcome::Failed {
+            error: refresh_error,
+            ..
+        } = added.refresh
+        else {
+            panic!("invalid URL must fail refresh");
+        };
+        assert!(!refresh_error.contains(configured_url), "{refresh_error}");
+        let status_error = managed.status().await.unwrap()[0].error.clone().unwrap();
+        assert_eq!(status_error, refresh_error);
     }
 
     #[tokio::test]
@@ -1488,6 +1586,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_requalification_migrates_existing_catalog_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = paths(&directory);
+        let state = FileStateStore::new(&paths.config, &paths.catalog);
+        let definition = missing_server();
+        state
+            .save_config_sync(&Config {
+                mcp_servers: indexmap::IndexMap::from([("server-name".into(), definition.clone())]),
+            })
+            .unwrap();
+        let mut catalog = CatalogCache::default();
+        catalog.replace_server(
+            "server-name",
+            &definition,
+            vec![CatalogEntry {
+                server: "server-name".into(),
+                tool_name: "search/tool".into(),
+                qualified_name: "legacy__server_name__search_tool".into(),
+                description: "search".into(),
+                input_schema: json!({ "type": "object" }),
+                read_only_hint: Some(true),
+            }],
+        );
+        state.save_catalog_sync(&catalog).unwrap();
+
+        let managed = ManagedMcp::open(paths, ConnectionPolicy::default());
+        assert_eq!(managed.requalify_catalog().await.unwrap(), 1);
+        let entry = managed
+            .catalog_snapshot()
+            .await
+            .unwrap()
+            .entries()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            entry.qualified_name,
+            qualified_tool_name("server-name", "search/tool")
+        );
+        assert_eq!(entry.description, "search");
+        assert_eq!(entry.read_only_hint, Some(true));
+        assert_eq!(managed.requalify_catalog().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn stale_enumeration_cannot_attach_to_an_overwrite() {
         let directory = tempfile::tempdir().unwrap();
         let paths = paths(&directory);
@@ -1496,11 +1639,15 @@ mod tests {
             command: "old".into(),
             args: None,
             env: None,
+            env_vars: None,
+            cwd: None,
         });
         let new = ServerConfig::Stdio(StdioConfig {
             command: "new".into(),
             args: None,
             env: None,
+            env_vars: None,
+            cwd: None,
         });
         state
             .save_config_sync(&Config {
@@ -1774,6 +1921,8 @@ mod tests {
                     ServerConfig::Remote(RemoteConfig {
                         url: "https://example.test/mcp".into(),
                         headers: None,
+                        env_headers: None,
+                        bearer_token_env_var: None,
                         oauth: Some(OAuthMode::Disabled),
                     }),
                 )]),
@@ -1784,6 +1933,7 @@ mod tests {
             redirect_uri: "http://127.0.0.1:12345/callback".into(),
             discovery_metadata: ClientMetadata::new("test", "1"),
             registration_metadata: ClientMetadata::new("test", "1"),
+            endpoint_policy: OAuthEndpointPolicy::default(),
             page_copy: PageCopy {
                 success_title: "done".into(),
                 success_body: "done".into(),
@@ -1805,6 +1955,8 @@ mod tests {
         let old = ServerConfig::Remote(RemoteConfig {
             url: "https://old.example.test/mcp".into(),
             headers: None,
+            env_headers: None,
+            bearer_token_env_var: None,
             oauth: Some(OAuthMode::Settings(OAuthSettings::default())),
         });
         state
@@ -1830,6 +1982,7 @@ mod tests {
                         redirect_uri: "http://127.0.0.1:12345/callback".into(),
                         discovery_metadata: ClientMetadata::new("test", "1"),
                         registration_metadata: ClientMetadata::new("test", "1"),
+                        endpoint_policy: OAuthEndpointPolicy::default(),
                         page_copy: PageCopy {
                             success_title: "done".into(),
                             success_body: "done".into(),

@@ -6,8 +6,9 @@
 use std::path::{Path, PathBuf};
 
 use ac_skills::{
-    MAX_BODY_BYTES, SkillLayer, SkillMention, SkillsResolver, build_skill_injections,
-    catalog_markdown, extract_skill_mentions, read_skill_text, select_skills_for_mentions,
+    MAX_BODY_BYTES, MAX_DIRECT_ENTRIES, MAX_DIRECT_SKIPPED, MAX_SKILL_MD_BYTES, SkillLayer,
+    SkillMention, SkillsResolver, build_skill_injections, catalog_markdown, extract_skill_mentions,
+    read_skill_text, select_skills_for_mentions,
 };
 
 fn write_skill_md(root: &Path, dir: &str, content: &str) {
@@ -313,6 +314,59 @@ fn direct_child_mode_is_non_recursive_and_requires_manifest_name() {
             .iter()
             .any(|skip| skip.dir.ends_with("unnamed") && skip.reason.contains("'name'"))
     );
+}
+
+#[test]
+fn direct_child_scan_and_diagnostics_have_independent_hard_bounds() {
+    let scan_root = tempfile::tempdir().unwrap();
+    for index in 0..=MAX_DIRECT_ENTRIES {
+        std::fs::create_dir(scan_root.path().join(format!("junk{index:04}"))).unwrap();
+    }
+    let listing = SkillsResolver::direct_children(vec![SkillLayer {
+        name: "bounded".into(),
+        root: scan_root.path().to_path_buf(),
+    }])
+    .list();
+    assert!(listing.skills.is_empty());
+    assert!(
+        listing
+            .skipped
+            .iter()
+            .any(|skip| skip.reason.contains("entry limit"))
+    );
+
+    let diagnostics_root = tempfile::tempdir().unwrap();
+    for index in 0..(MAX_DIRECT_SKIPPED + 32) {
+        std::fs::create_dir(diagnostics_root.path().join(format!("Bad{index:04}"))).unwrap();
+    }
+    let listing = SkillsResolver::direct_children(vec![SkillLayer {
+        name: "bounded".into(),
+        root: diagnostics_root.path().to_path_buf(),
+    }])
+    .list();
+    assert_eq!(listing.skipped.len(), MAX_DIRECT_SKIPPED);
+    assert!(
+        listing
+            .skipped
+            .last()
+            .unwrap()
+            .reason
+            .contains("additional diagnostics were omitted")
+    );
+}
+
+#[test]
+fn discovery_rejects_skill_md_above_the_manifest_byte_ceiling() {
+    let root = tempfile::tempdir().unwrap();
+    let skill_dir = root.path().join("oversized");
+    std::fs::create_dir(&skill_dir).unwrap();
+    let file = std::fs::File::create(skill_dir.join("SKILL.md")).unwrap();
+    file.set_len(MAX_SKILL_MD_BYTES as u64 + 1).unwrap();
+
+    let listing = resolver_over(root.path()).list();
+    assert!(listing.skills.is_empty());
+    assert_eq!(listing.skipped.len(), 1);
+    assert!(listing.skipped[0].reason.contains("exceeds byte limit"));
 }
 
 #[test]

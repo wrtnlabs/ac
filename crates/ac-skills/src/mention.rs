@@ -121,6 +121,22 @@ fn parse_linked(text: &str, at: usize) -> Option<(SkillMention, usize)> {
 /// ambiguous mentions are skipped. Deduped by path, listing order is not
 /// imposed — selection order follows mention order.
 pub fn select_skills_for_mentions(skills: &[Skill], mentions: &[SkillMention]) -> Vec<Skill> {
+    select_skills_for_mentions_with_path(skills, mentions, |skill| skill.skill_md.clone())
+}
+
+/// Resolve mentions while matching linked locators against a host-projected
+/// model-facing path.
+///
+/// This is the selection counterpart to
+/// [`crate::build_skill_injections_with_path`]: a locator advertised to the
+/// model can be linked back in a later prompt without exposing or requiring
+/// the source filesystem path. Plain-name ambiguity and path deduplication
+/// retain the standard semantics.
+pub fn select_skills_for_mentions_with_path(
+    skills: &[Skill],
+    mentions: &[SkillMention],
+    path_for: impl Fn(&Skill) -> PathBuf,
+) -> Vec<Skill> {
     let mut selected: Vec<Skill> = Vec::new();
     let mut push = |s: &Skill| {
         if !selected.iter().any(|p| p.skill_md == s.skill_md) {
@@ -131,7 +147,10 @@ pub fn select_skills_for_mentions(skills: &[Skill], mentions: &[SkillMention]) -
         match &mention.path {
             Some(path) => {
                 let target = canonical_or_owned(path);
-                if let Some(skill) = skills.iter().find(|s| s.skill_md == target) {
+                if let Some(skill) = skills
+                    .iter()
+                    .find(|skill| canonical_or_owned(&path_for(skill)) == target)
+                {
                     push(skill);
                 }
             }

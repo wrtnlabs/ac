@@ -1802,6 +1802,21 @@ impl TxOps<'_> {
         Ok(created)
     }
 
+    /// Rename a session inside the enclosing transaction.
+    pub fn rename_session(&self, id: &str, title: &str) -> Result<()> {
+        let changed = self.tx.execute(
+            "UPDATE sessions SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, title, now_ms()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::UnknownSession(id.to_string()));
+        }
+        self.mutations
+            .borrow_mut()
+            .push(StoreMutation::SessionRenamed { id: id.to_string() });
+        Ok(())
+    }
+
     /// Unconditional meta replace — atomicity comes from the enclosing
     /// transaction, so no compare-and-swap is needed inside it.
     pub fn set_meta_raw(&self, id: &str, meta: Option<&str>) -> Result<()> {
@@ -2784,10 +2799,20 @@ mod tests {
             .atomic(|tx| {
                 tx.create_session_with_id("branch", Some("b"))?;
                 tx.set_meta_raw("branch", Some(r#"{"lineage":"src"}"#))?;
+                tx.rename_session("branch", "renamed")?;
                 tx.append_messages_with_meta("branch", &[(&m2, Some("host"))], Some(0))?;
                 Ok(())
             })
             .unwrap();
+        assert_eq!(
+            store
+                .get_session("branch")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("renamed")
+        );
         assert_eq!(
             store
                 .load_messages_with_meta("branch")
@@ -2811,7 +2836,15 @@ mod tests {
                     .to_string()
             })
             .collect();
-        assert_eq!(kinds, ["SessionCreated", "MetaSet", "MessagesAppended"]);
+        assert_eq!(
+            kinds,
+            [
+                "SessionCreated",
+                "MetaSet",
+                "SessionRenamed",
+                "MessagesAppended"
+            ]
+        );
     }
 
     #[test]

@@ -269,6 +269,8 @@ mod tests {
             command: command.to_string(),
             args: None,
             env: None,
+            env_vars: None,
+            cwd: None,
         })
     }
 

@@ -257,32 +257,52 @@ pub(crate) fn write_private_atomic(path: &Path, contents: &[u8]) -> io::Result<(
         .open(&temp)?;
 
     file.write_all(contents)?;
-    file.sync_all()?;
-    drop(file);
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
+    // Persist both the contents and the final inode metadata before publishing
+    // the temporary file through rename.
+    file.sync_all()?;
+    drop(file);
 
     if let Err(error) = replace_file_atomic(&temp, path) {
         let _ = std::fs::remove_file(&temp);
         return Err(error);
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    sync_containing_directory(path)?;
+    Ok(())
+}
+
+fn containing_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn sync_containing_directory(path: &Path) -> io::Result<()> {
+    std::fs::File::open(containing_directory(path))?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_containing_directory(_path: &Path) -> io::Result<()> {
+    // `replace_file_atomic` uses `MOVEFILE_WRITE_THROUGH`, which is the
+    // Windows durability primitive for the replacement.
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn sync_containing_directory(_path: &Path) -> io::Result<()> {
+    // No portable directory-fsync primitive exists on other std targets.
     Ok(())
 }
 
 pub(super) fn private_temp_dir(path: &Path) -> PathBuf {
-    path.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".ac-mcp-tmp")
+    containing_directory(path).join(".ac-mcp-tmp")
 }
 
 #[cfg(not(windows))]
@@ -330,6 +350,21 @@ mod tests {
     use super::*;
     use crate::managed::config::{ServerConfig, StdioConfig};
     use indexmap::IndexMap;
+
+    #[test]
+    fn containing_directory_handles_bare_relative_and_absolute_paths() {
+        assert_eq!(containing_directory(Path::new("mcp.json")), Path::new("."));
+        assert_eq!(
+            containing_directory(Path::new("state/mcp.json")),
+            Path::new("state")
+        );
+
+        #[cfg(unix)]
+        assert_eq!(
+            containing_directory(Path::new("/state/mcp.json")),
+            Path::new("/state")
+        );
+    }
 
     #[test]
     fn files_are_tolerant_ordered_and_private_on_unix() {
@@ -386,6 +421,8 @@ mod tests {
                     command: "command".into(),
                     args: None,
                     env: None,
+                    env_vars: None,
+                    cwd: None,
                 }),
             )]),
         };

@@ -30,12 +30,27 @@ pub const ERR_INVALID_URL: &str = "Invalid server URL";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ERROR_BODY: usize = 300;
+const MAX_OAUTH_JSON_BODY: usize = 64 * 1024;
 
 /// Discovery requests carry no credentials and intentionally follow redirects:
 /// real deployments commonly normalize well-known URLs through redirects.
 static DISCOVERY_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
+        // OAuth discovery may normalize paths, but an untrusted metadata
+        // endpoint must not smuggle a fetch to a new origin through a redirect.
+        // Cross-origin discovery is a separate, explicit host policy decision.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let same_origin = attempt
+                .previous()
+                .last()
+                .is_none_or(|previous| previous.origin() == attempt.url().origin());
+            if same_origin {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .build()
         .expect("reqwest client builder (OAuth discovery)")
 });
@@ -94,6 +109,58 @@ impl Default for ClientMetadata {
     }
 }
 
+/// Host approval for OAuth endpoints outside the configured MCP server's
+/// origin. Same-origin discovery is always permitted; every other origin must
+/// be listed explicitly. This keeps the generic OAuth state machine useful for
+/// deployments with a separate authorization server without turning metadata
+/// into an SSRF/credential-forwarding primitive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OAuthEndpointPolicy {
+    pub allowed_cross_origins: Vec<String>,
+}
+
+impl OAuthEndpointPolicy {
+    pub fn with_allowed_origin(mut self, origin: &str) -> Result<Self, String> {
+        let parsed =
+            Url::parse(origin).map_err(|error| format!("Invalid allowed OAuth origin: {error}"))?;
+        if !is_http_url(parsed.as_str()) {
+            return Err(
+                "Allowed OAuth origins must use HTTPS (or HTTP on a literal loopback address) and \
+                 must not contain userinfo"
+                    .to_string(),
+            );
+        }
+        let origin = origin_of(&parsed);
+        if !self.allowed_cross_origins.contains(&origin) {
+            self.allowed_cross_origins.push(origin);
+        }
+        Ok(self)
+    }
+
+    fn authorize(&self, server_url: &Url, candidate: &str, purpose: &str) -> Result<Url, String> {
+        let candidate = Url::parse(candidate)
+            .map_err(|error| format!("Invalid OAuth {purpose} URL: {error}"))?;
+        if !is_http_url(candidate.as_str()) {
+            return Err(format!(
+                "OAuth {purpose} URL must use HTTPS (or HTTP on a literal loopback address) and \
+                 must not contain userinfo"
+            ));
+        }
+        let candidate_origin = origin_of(&candidate);
+        let server_origin = origin_of(server_url);
+        if candidate_origin == server_origin
+            || self.allowed_cross_origins.contains(&candidate_origin)
+        {
+            Ok(candidate)
+        } else {
+            Err(format!(
+                "Refused cross-origin OAuth {purpose} at {candidate_origin}; the host must \
+                 explicitly allow that origin"
+            ))
+        }
+    }
+}
+
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n + 16);
     while out.len() < n {
@@ -111,9 +178,20 @@ pub fn random_hex(bytes: usize) -> String {
         .collect()
 }
 
-/// True only for HTTP(S) URLs safe to hand to an HTTP client or browser.
+fn is_literal_loopback(url: &Url) -> bool {
+    url.host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
+}
+
+/// True only for credential-safe HTTP(S) endpoints: HTTPS, or plain HTTP on
+/// a literal loopback address for local development. Userinfo is rejected.
 pub fn is_http_url(raw: &str) -> bool {
-    Url::parse(raw).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+    Url::parse(raw).is_ok_and(|url| {
+        url.username().is_empty()
+            && url.password().is_none()
+            && (url.scheme() == "https" || (url.scheme() == "http" && is_literal_loopback(&url)))
+    })
 }
 
 /// A redirect URI must target the exact address the callback listener binds.
@@ -137,7 +215,7 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct OAuthTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -146,7 +224,22 @@ pub struct OAuthTokens {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl std::fmt::Debug for OAuthTokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthTokens")
+            .field("access_token", &"[REDACTED]")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct ClientCredentials {
     pub client_id: String,
     pub client_secret: Option<String>,
@@ -156,8 +249,31 @@ pub struct ClientCredentials {
     pub from_registration: bool,
 }
 
+impl std::fmt::Debug for ClientCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClientCredentials")
+            .field("client_id", &"[REDACTED]")
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("client_id_issued_at", &self.client_id_issued_at)
+            .field("client_secret_expires_at", &self.client_secret_expires_at)
+            .field("from_registration", &self.from_registration)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Endpoints {
+    /// Exact authorization-server issuer identifier validated from metadata.
+    ///
+    /// This string is deliberately not URL-normalized before RFC 9207
+    /// authorization-response comparison.
+    pub issuer: String,
+    /// Whether metadata requires an `iss` authorization-response parameter.
+    pub authorization_response_iss_parameter_supported: bool,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
@@ -177,11 +293,17 @@ struct ProtectedResourceMetadata {
 #[derive(Debug, Deserialize)]
 struct AuthServerMetadata {
     #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
     authorization_endpoint: Option<String>,
     #[serde(default)]
     token_endpoint: Option<String>,
     #[serde(default)]
     registration_endpoint: Option<String>,
+    #[serde(default)]
+    code_challenge_methods_supported: Option<Vec<String>>,
+    #[serde(default)]
+    authorization_response_iss_parameter_supported: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,32 +328,78 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
-fn truncate(mut text: String) -> String {
-    if text.len() > MAX_ERROR_BODY {
-        let mut end = MAX_ERROR_BODY;
-        while !text.is_char_boundary(end) {
-            end -= 1;
+struct LimitedBody {
+    text: String,
+    truncated: bool,
+}
+
+async fn read_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<LimitedBody, String> {
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    let mut truncated = false;
+    loop {
+        let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| format!("could not read response body: {error}"))?
+        else {
+            break;
+        };
+        let remaining = limit.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
         }
-        text.truncate(end);
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() == limit {
+            // Probe one more chunk so an exactly-at-limit body is not marked
+            // truncated merely because it filled the allowance.
+            if response
+                .chunk()
+                .await
+                .map_err(|error| format!("could not read response body: {error}"))?
+                .is_some()
+            {
+                truncated = true;
+            }
+            break;
+        }
+    }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
         text.push('…');
+    }
+    Ok(LimitedBody { text, truncated })
+}
+
+fn redact_exact(mut text: String, secrets: &[&str]) -> String {
+    let mut secrets = secrets
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    secrets.dedup();
+    for secret in secrets {
+        text = text.replace(secret, "[REDACTED]");
     }
     text
 }
 
 fn origin_of(url: &Url) -> String {
-    let mut base = url.clone();
-    base.set_path("");
-    base.set_query(None);
-    base.set_fragment(None);
-    base.as_str().trim_end_matches('/').to_string()
+    url.origin().ascii_serialization()
 }
 
-/// Canonical RFC 8707 resource URI: no query or fragment.
+/// Canonical RFC 8707 resource URI: preserve query identity, remove only the
+/// fragment (fragments are not sent in HTTP requests and are forbidden in the
+/// resource parameter).
 pub fn canonical_resource(url: &Url) -> String {
     let mut base = url.clone();
-    base.set_query(None);
     base.set_fragment(None);
-    base.as_str().trim_end_matches('/').to_string()
+    base.to_string()
 }
 
 /// RFC 8414 §3.1 / RFC 9728 well-known candidates for a possibly-pathful URL.
@@ -246,6 +414,26 @@ pub fn well_known_candidates(url: &Url, name: &str) -> Vec<String> {
     out
 }
 
+/// MCP's required priority order for authorization-server metadata.
+///
+/// RFC 8414 and OpenID Connect place their suffixes differently for a pathful
+/// issuer, so both OIDC forms are required for interoperability.
+pub fn authorization_server_metadata_candidates(issuer: &Url) -> Vec<String> {
+    let origin = origin_of(issuer);
+    let path = issuer.path().trim_end_matches('/');
+    if path.is_empty() {
+        return vec![
+            format!("{origin}/.well-known/oauth-authorization-server"),
+            format!("{origin}/.well-known/openid-configuration"),
+        ];
+    }
+    vec![
+        format!("{origin}/.well-known/oauth-authorization-server{path}"),
+        format!("{origin}/.well-known/openid-configuration{path}"),
+        format!("{origin}{path}/.well-known/openid-configuration"),
+    ]
+}
+
 async fn fetch_json(client: &reqwest::Client, url: &str) -> Option<Value> {
     let response = client
         .get(url)
@@ -257,7 +445,13 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Option<Value> {
     if !response.status().is_success() {
         return None;
     }
-    response.json::<Value>().await.ok()
+    let body = read_body_limited(response, MAX_OAUTH_JSON_BODY)
+        .await
+        .ok()?;
+    if body.truncated {
+        return None;
+    }
+    serde_json::from_str(&body.text).ok()
 }
 
 async fn resource_metadata_hint(
@@ -312,11 +506,38 @@ pub async fn discover_endpoints_with_metadata(
     server_url: &Url,
     client_metadata: &ClientMetadata,
 ) -> Result<Endpoints, String> {
+    discover_endpoints_with_metadata_and_policy(
+        client,
+        server_url,
+        client_metadata,
+        &OAuthEndpointPolicy::default(),
+    )
+    .await
+}
+
+/// Discover endpoints under an explicit cross-origin policy.
+pub async fn discover_endpoints_with_metadata_and_policy(
+    client: &reqwest::Client,
+    server_url: &Url,
+    client_metadata: &ClientMetadata,
+    endpoint_policy: &OAuthEndpointPolicy,
+) -> Result<Endpoints, String> {
+    if !is_http_url(server_url.as_str()) {
+        return Err(
+            "OAuth discovery requires an HTTPS MCP URL (or HTTP on literal loopback) without \
+             userinfo"
+                .to_string(),
+        );
+    }
     let mut protected_resource_urls = Vec::new();
     if let Some(hint) = resource_metadata_hint(client, server_url, client_metadata).await
         && is_http_url(&hint)
     {
-        protected_resource_urls.push(hint);
+        protected_resource_urls.push(
+            endpoint_policy
+                .authorize(server_url, &hint, "protected-resource metadata")?
+                .to_string(),
+        );
     }
     protected_resource_urls.extend(well_known_candidates(
         server_url,
@@ -332,47 +553,98 @@ pub async fn discover_endpoints_with_metadata(
             break;
         }
     }
-
-    let issuer = protected_resource
+    let protected_resource = protected_resource.ok_or_else(|| {
+        "MCP server did not publish valid OAuth protected-resource metadata".to_string()
+    })?;
+    let resource = protected_resource
+        .resource
+        .as_deref()
+        .ok_or_else(|| "OAuth protected-resource metadata is missing `resource`".to_string())?;
+    let resource_url = Url::parse(resource)
+        .map_err(|error| format!("OAuth protected-resource `resource` is invalid: {error}"))?;
+    if resource_url.fragment().is_some() {
+        return Err("OAuth protected-resource `resource` must not contain a fragment".to_string());
+    }
+    let expected_resource = Url::parse(&canonical_resource(server_url))
+        .expect("canonical resource is derived from an already parsed URL");
+    if resource_url != expected_resource {
+        return Err(format!(
+            "OAuth protected-resource identity mismatch: expected {}, received {}",
+            expected_resource, resource_url
+        ));
+    }
+    let authorization_servers = protected_resource
+        .authorization_servers
         .as_ref()
-        .and_then(|metadata| metadata.authorization_servers.as_ref())
-        .and_then(|servers| servers.first())
-        .filter(|server| is_http_url(server))
-        .and_then(|server| Url::parse(server).ok())
-        .unwrap_or_else(|| server_url.clone());
+        .filter(|servers| !servers.is_empty())
+        .ok_or_else(|| {
+            "OAuth protected-resource metadata must list at least one authorization server"
+                .to_string()
+        })?;
+    let issuer_identifier = authorization_servers[0].as_str();
+    let issuer_url =
+        endpoint_policy.authorize(server_url, issuer_identifier, "authorization server")?;
 
-    let mut metadata_urls = well_known_candidates(&issuer, "oauth-authorization-server");
-    metadata_urls.extend(well_known_candidates(&issuer, "openid-configuration"));
+    let metadata_urls = authorization_server_metadata_candidates(&issuer_url);
     let mut authorization_server: Option<AuthServerMetadata> = None;
     for url in &metadata_urls {
         if let Some(value) = fetch_json(client, url).await
             && let Ok(parsed) = serde_json::from_value::<AuthServerMetadata>(value)
-            && parsed.authorization_endpoint.is_some()
         {
             authorization_server = Some(parsed);
             break;
         }
     }
-
-    let issuer_origin = origin_of(&issuer);
-    let metadata = authorization_server.unwrap_or(AuthServerMetadata {
-        authorization_endpoint: None,
-        token_endpoint: None,
-        registration_endpoint: None,
-    });
-    let http_only = |value: Option<String>| value.filter(|endpoint| is_http_url(endpoint));
+    let metadata = authorization_server.ok_or_else(|| {
+        "Authorization server did not publish valid OAuth/OIDC metadata".to_string()
+    })?;
+    let published_issuer = metadata
+        .issuer
+        .as_deref()
+        .ok_or_else(|| "Authorization-server metadata is missing `issuer`".to_string())?;
+    endpoint_policy.authorize(server_url, published_issuer, "metadata issuer")?;
+    if published_issuer != issuer_identifier {
+        return Err(format!(
+            "Authorization-server issuer mismatch: expected {issuer_identifier}, received \
+             {published_issuer}"
+        ));
+    }
+    if !metadata
+        .code_challenge_methods_supported
+        .as_ref()
+        .is_some_and(|methods| methods.iter().any(|method| method == "S256"))
+    {
+        return Err("Authorization-server metadata does not declare PKCE S256 support".to_string());
+    }
+    let validate_required = |value: Option<String>, purpose: &str| -> Result<String, String> {
+        let endpoint =
+            value.ok_or_else(|| format!("Authorization-server metadata is missing `{purpose}`"))?;
+        endpoint_policy
+            .authorize(server_url, &endpoint, purpose)
+            .map(|url| url.to_string())
+    };
+    let registration_endpoint = metadata
+        .registration_endpoint
+        .map(|endpoint| {
+            endpoint_policy
+                .authorize(server_url, &endpoint, "registration endpoint")
+                .map(|url| url.to_string())
+        })
+        .transpose()?;
+    let issuer = published_issuer.to_string();
+    let issuer_required = metadata
+        .authorization_response_iss_parameter_supported
+        .unwrap_or(false);
     Ok(Endpoints {
-        authorization_endpoint: http_only(metadata.authorization_endpoint)
-            .unwrap_or_else(|| format!("{issuer_origin}/authorize")),
-        token_endpoint: http_only(metadata.token_endpoint)
-            .unwrap_or_else(|| format!("{issuer_origin}/token")),
-        registration_endpoint: http_only(metadata.registration_endpoint)
-            .or_else(|| Some(format!("{issuer_origin}/register"))),
-        resource: protected_resource.map(|metadata| {
-            metadata
-                .resource
-                .unwrap_or_else(|| canonical_resource(server_url))
-        }),
+        issuer,
+        authorization_response_iss_parameter_supported: issuer_required,
+        authorization_endpoint: validate_required(
+            metadata.authorization_endpoint,
+            "authorization endpoint",
+        )?,
+        token_endpoint: validate_required(metadata.token_endpoint, "token endpoint")?,
+        registration_endpoint,
+        resource: Some(resource_url.to_string()),
     })
 }
 
@@ -406,6 +678,13 @@ pub async fn register_client(
     registration_endpoint: &str,
     metadata: &Value,
 ) -> Result<ClientCredentials, String> {
+    if !is_http_url(registration_endpoint) {
+        return Err(
+            "Dynamic client registration endpoint must use HTTPS (or HTTP on literal loopback) \
+             and must not contain userinfo"
+                .to_string(),
+        );
+    }
     let response = client
         .post(registration_endpoint)
         .header("Content-Type", "application/json")
@@ -415,15 +694,27 @@ pub async fn register_client(
         .await
         .map_err(|error| format!("Dynamic client registration failed: {error}"))?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let limit = if status.is_success() {
+        MAX_OAUTH_JSON_BODY
+    } else {
+        MAX_ERROR_BODY
+    };
+    let body = read_body_limited(response, limit)
+        .await
+        .map_err(|error| format!("Dynamic client registration failed: {error}"))?;
     if !status.is_success() {
         return Err(format!(
             "Dynamic client registration failed ({}): {}",
             status.as_u16(),
-            truncate(body)
+            body.text
         ));
     }
-    let parsed: RegistrationResponse = serde_json::from_str(&body).map_err(|error| {
+    if body.truncated {
+        return Err(format!(
+            "Dynamic client registration returned more than {MAX_OAUTH_JSON_BODY} bytes"
+        ));
+    }
+    let parsed: RegistrationResponse = serde_json::from_str(&body.text).map_err(|error| {
         format!("Dynamic client registration returned an unreadable response: {error}")
     })?;
     Ok(ClientCredentials {
@@ -437,10 +728,20 @@ pub async fn register_client(
 
 /// A PKCE pair. The verifier is 43 base64url characters, within RFC 7636's
 /// required 43..128 range.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Pkce {
     pub verifier: String,
     pub challenge: String,
+}
+
+impl std::fmt::Debug for Pkce {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Pkce")
+            .field("verifier", &"[REDACTED]")
+            .field("challenge", &"[REDACTED]")
+            .finish()
+    }
 }
 
 pub fn new_pkce() -> Pkce {
@@ -462,9 +763,9 @@ pub fn build_authorization_url(
 ) -> Result<String, String> {
     let mut url = Url::parse(&endpoints.authorization_endpoint)
         .map_err(|error| format!("Invalid authorization endpoint: {error}"))?;
-    if !matches!(url.scheme(), "http" | "https") {
+    if !is_http_url(url.as_str()) {
         return Err(format!(
-            "Refused a non-http(s) authorization endpoint: {}",
+            "Refused an insecure authorization endpoint: {}",
             endpoints.authorization_endpoint
         ));
     }
@@ -498,6 +799,13 @@ pub async fn exchange_code(
     verifier: &str,
     redirect_uri: &str,
 ) -> Result<OAuthTokens, String> {
+    if !is_http_url(&endpoints.token_endpoint) {
+        return Err(
+            "Token endpoint must use HTTPS (or HTTP on literal loopback) and must not contain \
+             userinfo"
+                .to_string(),
+        );
+    }
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -519,15 +827,31 @@ pub async fn exchange_code(
         .await
         .map_err(|error| format!("Token exchange failed: {error}"))?;
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
+    let limit = if status.is_success() {
+        MAX_OAUTH_JSON_BODY
+    } else {
+        MAX_ERROR_BODY
+    };
+    let body = read_body_limited(response, limit)
+        .await
+        .map_err(|error| format!("Token exchange failed: {error}"))?;
     if !status.is_success() {
+        let mut submitted_secrets = vec![code, verifier, credentials.client_id.as_str()];
+        if let Some(secret) = credentials.client_secret.as_deref() {
+            submitted_secrets.push(secret);
+        }
         return Err(format!(
             "Token exchange failed ({}): {}",
             status.as_u16(),
-            truncate(body)
+            redact_exact(body.text, &submitted_secrets)
         ));
     }
-    let parsed: TokenResponse = serde_json::from_str(&body)
+    if body.truncated {
+        return Err(format!(
+            "Token endpoint returned more than {MAX_OAUTH_JSON_BODY} bytes"
+        ));
+    }
+    let parsed: TokenResponse = serde_json::from_str(&body.text)
         .map_err(|error| format!("Token endpoint returned an unreadable response: {error}"))?;
     Ok(OAuthTokens {
         expires_at: parsed.expires_in.map(|seconds| now_secs() + seconds),
@@ -544,7 +868,7 @@ pub async fn exchange_code(
 /// AC owns the state machine; an embedding application maps its config into
 /// this neutral shape and supplies persistence, enumeration, and browser
 /// hand-off through the traits below.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InteractiveOAuthConfig {
     pub enabled: bool,
     pub server_url: String,
@@ -552,9 +876,31 @@ pub struct InteractiveOAuthConfig {
     pub scope: Option<String>,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    pub endpoint_policy: OAuthEndpointPolicy,
     pub discovery_metadata: ClientMetadata,
     pub registration_metadata: ClientMetadata,
     pub page_copy: PageCopy,
+}
+
+impl std::fmt::Debug for InteractiveOAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InteractiveOAuthConfig")
+            .field("enabled", &self.enabled)
+            .field("server_url", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("scope", &self.scope)
+            .field("client_id", &self.client_id.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("endpoint_policy", &self.endpoint_policy)
+            .field("discovery_metadata", &self.discovery_metadata)
+            .field("registration_metadata", &self.registration_metadata)
+            .field("page_copy", &self.page_copy)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -954,10 +1300,11 @@ async fn authenticate_interactive_inner<T: Send>(
     }
 
     let discovery = match cancellable(
-        discover_endpoints_with_metadata(
+        discover_endpoints_with_metadata_and_policy(
             discovery_http_client(),
             &server_url,
             &config.discovery_metadata,
+            &config.endpoint_policy,
         ),
         caller_cancel,
         coordinator_cancel,
@@ -1046,7 +1393,12 @@ async fn authenticate_interactive_inner<T: Send>(
         Err(error) => return fail_flow(store, error).await,
     };
 
-    let pending = callback.begin(&state, name);
+    let pending = callback.begin_with_issuer(
+        &state,
+        name,
+        &endpoints.issuer,
+        endpoints.authorization_response_iss_parameter_supported,
+    );
     on_open_url(authorization_url);
     if is_cancelled(caller_cancel, coordinator_cancel) {
         drop(pending);
@@ -1147,6 +1499,55 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn secret_bearing_oauth_debug_output_is_redacted() {
+        let tokens = OAuthTokens {
+            access_token: "access-secret".to_string(),
+            refresh_token: Some("refresh-secret".to_string()),
+            expires_at: Some(1.0),
+            scope: Some("read".to_string()),
+        };
+        let credentials = ClientCredentials {
+            client_id: "client-identifier".to_string(),
+            client_secret: Some("client-secret".to_string()),
+            client_id_issued_at: None,
+            client_secret_expires_at: None,
+            from_registration: false,
+        };
+        let pkce = Pkce {
+            verifier: "pkce-verifier".to_string(),
+            challenge: "pkce-challenge".to_string(),
+        };
+        let flow = InteractiveOAuthConfig {
+            enabled: true,
+            server_url: "https://user:url-secret@example.test/mcp?token=secret".to_string(),
+            redirect_uri: "http://127.0.0.1:43123/oauth/callback".to_string(),
+            scope: Some("read".to_string()),
+            client_id: Some("flow-client-id".to_string()),
+            client_secret: Some("flow-client-secret".to_string()),
+            endpoint_policy: OAuthEndpointPolicy::default(),
+            discovery_metadata: ClientMetadata::default(),
+            registration_metadata: ClientMetadata::default(),
+            page_copy: PageCopy::default(),
+        };
+
+        let rendered = format!("{tokens:?} {credentials:?} {pkce:?} {flow:?}");
+        for secret in [
+            "access-secret",
+            "refresh-secret",
+            "client-identifier",
+            "client-secret",
+            "pkce-verifier",
+            "pkce-challenge",
+            "url-secret",
+            "token=secret",
+            "flow-client-id",
+            "flow-client-secret",
+        ] {
+            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        }
+    }
+
     const TEST_CALLBACK_PATH: &str = "/oauth/callback";
 
     #[test]
@@ -1175,6 +1576,8 @@ mod tests {
     #[test]
     fn authorization_url_carries_pkce_state_scope_and_resource() {
         let endpoints = Endpoints {
+            issuer: "https://as.test".to_string(),
+            authorization_response_iss_parameter_supported: false,
             authorization_endpoint: "https://as.test/authorize?tenant=acme".to_string(),
             token_endpoint: "https://as.test/token".to_string(),
             registration_endpoint: None,
@@ -1227,6 +1630,28 @@ mod tests {
     }
 
     #[test]
+    fn authorization_server_candidates_follow_mcp_pathful_oidc_order() {
+        let pathful = Url::parse("https://auth.test/tenant/one").unwrap();
+        assert_eq!(
+            authorization_server_metadata_candidates(&pathful),
+            [
+                "https://auth.test/.well-known/oauth-authorization-server/tenant/one",
+                "https://auth.test/.well-known/openid-configuration/tenant/one",
+                "https://auth.test/tenant/one/.well-known/openid-configuration",
+            ]
+        );
+
+        let root = Url::parse("https://auth.test/").unwrap();
+        assert_eq!(
+            authorization_server_metadata_candidates(&root),
+            [
+                "https://auth.test/.well-known/oauth-authorization-server",
+                "https://auth.test/.well-known/openid-configuration",
+            ]
+        );
+    }
+
+    #[test]
     fn dcr_metadata_uses_host_identity_without_core_branding() {
         let host = ClientMetadata::new("Host App", "1.2.3").with_uri("https://example.test/host");
         let metadata = client_metadata(&host, "http://127.0.0.1:43123/cb", Some("read"), false);
@@ -1249,6 +1674,8 @@ mod tests {
     fn only_http_schemes_and_http_loopback_redirects_are_accepted() {
         assert!(is_http_url("https://as.test/authorize"));
         assert!(is_http_url("http://127.0.0.1:9/authorize"));
+        assert!(!is_http_url("http://as.test/authorize"));
+        assert!(!is_http_url("https://user:secret@as.test/authorize"));
         assert!(!is_http_url("file:///tmp/token"));
         assert!(!is_http_url("javascript:alert(1)"));
 
@@ -1280,6 +1707,8 @@ mod tests {
             "smb://attacker.example/share",
         ] {
             let endpoints = Endpoints {
+                issuer: "https://as.test".to_string(),
+                authorization_response_iss_parameter_supported: false,
                 authorization_endpoint: endpoint.to_string(),
                 token_endpoint: "https://as.test/token".to_string(),
                 registration_endpoint: None,
@@ -1295,10 +1724,34 @@ mod tests {
             )
             .expect_err(endpoint);
             assert!(
-                error.starts_with("Refused a non-http(s) authorization endpoint"),
+                error.starts_with("Refused an insecure authorization endpoint"),
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn cross_origin_oauth_endpoints_require_explicit_host_approval() {
+        let server = Url::parse("https://mcp.example.test/rpc").unwrap();
+        let policy = OAuthEndpointPolicy::default();
+        assert!(
+            policy
+                .authorize(&server, "https://mcp.example.test/token", "token endpoint")
+                .is_ok()
+        );
+        let error = policy
+            .authorize(&server, "https://auth.example.test/token", "token endpoint")
+            .unwrap_err();
+        assert!(error.contains("explicitly allow"), "{error}");
+
+        let policy = policy
+            .with_allowed_origin("https://auth.example.test/path-is-ignored")
+            .unwrap();
+        assert!(
+            policy
+                .authorize(&server, "https://auth.example.test/token", "token endpoint",)
+                .is_ok()
+        );
     }
 
     struct StubAuthorizationServer {
@@ -1434,9 +1887,12 @@ mod tests {
                                 200,
                                 String::new(),
                                 json!({
+                                    "issuer": base.clone(),
                                     "authorization_endpoint": format!("{base}/authorize"),
                                     "token_endpoint": format!("{base}/token"),
                                     "registration_endpoint": format!("{base}/register"),
+                                    "code_challenge_methods_supported": ["S256"],
+                                    "authorization_response_iss_parameter_supported": true,
                                 })
                                 .to_string(),
                             )
@@ -1455,6 +1911,8 @@ mod tests {
                                 })
                                 .to_string(),
                             )
+                        } else if target.starts_with("/echo-token-error") {
+                            (400, String::new(), body.to_string())
                         } else if target.starts_with("/token") {
                             (
                                 200,
@@ -1700,6 +2158,7 @@ mod tests {
             scope: Some("read".to_string()),
             client_id: Some("configured-client".to_string()),
             client_secret: None,
+            endpoint_policy: OAuthEndpointPolicy::default(),
             discovery_metadata: metadata.clone(),
             registration_metadata: metadata,
             page_copy: PageCopy::default(),
@@ -1716,7 +2175,18 @@ mod tests {
             let state = query["state"].clone();
             let redirect = Url::parse(&query["redirect_uri"]).unwrap();
             let port = redirect.port().unwrap();
-            let target = format!("{}?code=authorization-code&state={state}", redirect.path());
+            let issuer = authorization_url.origin().ascii_serialization();
+            let mut callback = redirect.clone();
+            callback
+                .query_pairs_mut()
+                .append_pair("code", "authorization-code")
+                .append_pair("state", &state)
+                .append_pair("iss", &issuer);
+            let target = format!(
+                "{}?{}",
+                callback.path(),
+                callback.query().expect("callback query was just populated")
+            );
 
             let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             stream
@@ -1892,6 +2362,7 @@ mod tests {
             scope: None,
             client_id: Some("client".to_string()),
             client_secret: None,
+            endpoint_policy: OAuthEndpointPolicy::default(),
             discovery_metadata: metadata.clone(),
             registration_metadata: metadata,
             page_copy: PageCopy::default(),
@@ -1933,6 +2404,7 @@ mod tests {
             scope: None,
             client_id: Some("client".to_string()),
             client_secret: None,
+            endpoint_policy: OAuthEndpointPolicy::default(),
             discovery_metadata: ClientMetadata::default(),
             registration_metadata: ClientMetadata::default(),
             page_copy: PageCopy::default(),
@@ -2013,6 +2485,7 @@ mod tests {
             scope: None,
             client_id: Some("client".to_string()),
             client_secret: None,
+            endpoint_policy: OAuthEndpointPolicy::default(),
             discovery_metadata: ClientMetadata::default(),
             registration_metadata: ClientMetadata::default(),
             page_copy: PageCopy::default(),
@@ -2062,6 +2535,7 @@ mod tests {
             scope: None,
             client_id: Some("client".to_string()),
             client_secret: None,
+            endpoint_policy: OAuthEndpointPolicy::default(),
             discovery_metadata: ClientMetadata::default(),
             registration_metadata: ClientMetadata::default(),
             page_copy: PageCopy::default(),
@@ -2109,6 +2583,7 @@ mod tests {
             scope: None,
             client_id: Some("client".to_string()),
             client_secret: None,
+            endpoint_policy: OAuthEndpointPolicy::default(),
             discovery_metadata: ClientMetadata::default(),
             registration_metadata: ClientMetadata::default(),
             page_copy: PageCopy::default(),
@@ -2198,6 +2673,8 @@ mod tests {
             Some(format!("{}/register", stub.base).as_str())
         );
         assert_eq!(endpoints.resource.as_deref(), Some(server_url.as_str()));
+        assert_eq!(endpoints.issuer, stub.base);
+        assert!(endpoints.authorization_response_iss_parameter_supported);
 
         let discovery_request = stub.requests_to("/mcp");
         assert_eq!(discovery_request.len(), 1);
@@ -2286,5 +2763,44 @@ mod tests {
             .expect("the redirect-following discovery client is the negative control");
         assert_eq!(followed.client_id, "registered-client");
         assert_eq!(stub.requests_to("/collect").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn token_error_bodies_cannot_echo_submitted_secrets() {
+        let stub = StubAuthorizationServer::start().await;
+        let endpoints = Endpoints {
+            issuer: stub.base.clone(),
+            authorization_response_iss_parameter_supported: false,
+            authorization_endpoint: format!("{}/authorize", stub.base),
+            token_endpoint: format!("{}/echo-token-error", stub.base),
+            registration_endpoint: None,
+            resource: None,
+        };
+        let credentials = ClientCredentials {
+            client_id: "sensitive-client-id".to_string(),
+            client_secret: Some("sensitive-client-secret".to_string()),
+            client_id_issued_at: None,
+            client_secret_expires_at: None,
+            from_registration: false,
+        };
+        let error = exchange_code(
+            secret_http_client(),
+            &endpoints,
+            &credentials,
+            "sensitive-code",
+            "sensitive-verifier",
+            "http://127.0.0.1:43123/oauth/callback",
+        )
+        .await
+        .unwrap_err();
+        for secret in [
+            "sensitive-client-id",
+            "sensitive-client-secret",
+            "sensitive-code",
+            "sensitive-verifier",
+        ] {
+            assert!(!error.contains(secret), "{secret} leaked: {error}");
+        }
+        assert!(error.contains("[REDACTED]"));
     }
 }

@@ -51,9 +51,9 @@ pub use files::{
 pub use search::{Glob, GlobInput, Grep, GrepInput};
 pub use shell::{
     DEFAULT_SHELL_KILL_GRACE, DEFAULT_SHELL_TIMEOUT_MS, MAX_SHELL_TIMEOUT_MS, MIN_SHELL_TIMEOUT_MS,
-    Shell, ShellCaptureOptions, ShellConfig, ShellEnvironmentProvider, ShellExecRequest,
-    ShellExecResult, ShellInput, ShellInvocation, ShellKillReason, ShellSpillDir, execute_shell,
-    tail_output,
+    Shell, ShellCaptureOptions, ShellConfig, ShellEnvironmentPolicy, ShellEnvironmentProvider,
+    ShellExecRequest, ShellExecResult, ShellInput, ShellInvocation, ShellKillReason, ShellSpillDir,
+    execute_shell, tail_output,
 };
 pub use task::{Task, TaskInput};
 pub use tool_search::{TOOL_SEARCH_NAME, ToolSearch, ToolSearchEntry, ToolSearchInput};

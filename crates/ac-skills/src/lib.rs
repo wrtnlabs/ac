@@ -43,15 +43,23 @@
 mod catalog;
 mod frontmatter;
 mod inject;
+mod materialize;
 mod mention;
 mod resolver;
 
 pub use catalog::catalog_markdown;
 pub use frontmatter::{Frontmatter, FrontmatterError, parse as parse_frontmatter};
-pub use inject::{SkillInjection, build_skill_injections};
-pub use mention::{SkillMention, extract_skill_mentions, select_skills_for_mentions};
+pub use inject::{
+    SkillInjection, build_skill_injections, build_skill_injections_with_path, compose_skill_input,
+    compose_skill_input_with_path,
+};
+pub use materialize::{MaterializeLimits, materialize_skill_trees};
+pub use mention::{
+    SkillMention, extract_skill_mentions, select_skills_for_mentions,
+    select_skills_for_mentions_with_path,
+};
 pub use resolver::{
-    Listing, LoadError, MAX_BODY_BYTES, ParsedSkillMd, ResolverMode, Skill, SkillLayer,
-    SkillManifest, SkillsResolver, SkippedSkill, is_valid_direct_skill_name, parse_skill_md,
-    read_skill_text,
+    Listing, LoadError, MAX_BODY_BYTES, MAX_DIRECT_ENTRIES, MAX_DIRECT_SKILLS, MAX_DIRECT_SKIPPED,
+    MAX_SKILL_MD_BYTES, ParsedSkillMd, ResolverMode, Skill, SkillLayer, SkillManifest,
+    SkillsResolver, SkippedSkill, is_valid_direct_skill_name, parse_skill_md, read_skill_text,
 };

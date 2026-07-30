@@ -35,11 +35,25 @@ impl std::fmt::Debug for TokenRecord {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct CredentialEntry {
     pub tokens: Option<TokenRecord>,
     pub server_url: Option<String>,
     pub config_fingerprint: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialEntry")
+            .field("tokens", &self.tokens)
+            .field(
+                "server_url",
+                &self.server_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("config_fingerprint", &self.config_fingerprint)
+            .finish()
+    }
 }
 
 /// Exact durable server identity a credential may authorize.
@@ -668,6 +682,30 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn credential_entry_debug_redacts_server_urls_and_tokens() {
+        let entry = CredentialEntry {
+            tokens: Some(TokenRecord {
+                access_token: Some("access-secret".to_string()),
+                refresh_token: Some("refresh-secret".to_string()),
+                expires_at: None,
+                scope: None,
+            }),
+            server_url: Some("https://user:password@example.test/mcp?token=secret".to_string()),
+            config_fingerprint: Some("fingerprint".to_string()),
+        };
+        let rendered = format!("{entry:?}");
+        for secret in [
+            "access-secret",
+            "refresh-secret",
+            "password",
+            "token=secret",
+        ] {
+            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        }
+        assert!(rendered.contains("fingerprint"));
+    }
 
     #[tokio::test]
     async fn credentials_are_url_bound_generation_safe_and_private_on_unix() {

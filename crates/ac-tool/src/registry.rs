@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ac_types::ToolSpec;
@@ -8,6 +8,30 @@ use serde_json::Value;
 
 use crate::ctx::ToolCtx;
 use crate::tool::{Capability, RawTool, Tool, ToolOutput};
+
+/// Optional per-run barrier for tools that publish shared host state.
+///
+/// Ordinary calls take a shared lease and retain their existing concurrency.
+/// A host-declared exclusive tool takes the write lease for its complete tool
+/// future, so no sibling tool can observe a partially published transition.
+/// Names are host values: the mechanism has no application-specific tools.
+pub struct ToolDispatchGate {
+    lock: tokio::sync::RwLock<()>,
+    exclusive: BTreeSet<String>,
+}
+
+impl ToolDispatchGate {
+    pub fn new(exclusive: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            lock: tokio::sync::RwLock::new(()),
+            exclusive: exclusive.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    fn is_exclusive(&self, name: &str) -> bool {
+        self.exclusive.contains(name)
+    }
+}
 
 trait DynTool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
@@ -142,7 +166,22 @@ impl ToolRegistry {
         ctx: Arc<ToolCtx>,
     ) -> BoxFuture<'static, ToolOutput> {
         match self.tools.get(name) {
-            Some(tool) => tool.run_value(input, ctx),
+            Some(tool) => {
+                let tool = tool.clone();
+                let name = name.to_string();
+                Box::pin(async move {
+                    let Some(gate) = ctx.extensions.get::<ToolDispatchGate>() else {
+                        return tool.run_value(input, ctx).await;
+                    };
+                    if gate.is_exclusive(&name) {
+                        let _lease = gate.lock.write().await;
+                        tool.run_value(input, ctx).await
+                    } else {
+                        let _lease = gate.lock.read().await;
+                        tool.run_value(input, ctx).await
+                    }
+                })
+            }
             None => {
                 let message = format!("unknown tool: {name}");
                 Box::pin(std::future::ready(ToolOutput::error(message)))
@@ -169,6 +208,7 @@ mod tests {
     use crate::policy::SubtreePolicy;
     use schemars::JsonSchema;
     use serde::Deserialize;
+    use tokio::sync::Notify;
 
     #[derive(Deserialize, JsonSchema)]
     struct EchoInput {
@@ -331,5 +371,112 @@ mod tests {
         assert!(registry.contains("echo"));
         assert!(registry.contains("guarded_echo"));
         assert!(!registry.contains("raw_echo"));
+    }
+
+    struct DispatchProbe {
+        name: &'static str,
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl RawTool for DispatchProbe {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.into(),
+                description: "Dispatch-gate test probe.".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        fn capability(&self) -> Capability {
+            Capability::ReadOnly
+        }
+
+        fn run(
+            self: Arc<Self>,
+            _input: Value,
+            _ctx: Arc<ToolCtx>,
+        ) -> BoxFuture<'static, ToolOutput> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                ToolOutput::ok(self.name)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_tool_waits_for_siblings_and_blocks_new_siblings() {
+        let shared_entered = Arc::new(Notify::new());
+        let shared_release = Arc::new(Notify::new());
+        let exclusive_entered = Arc::new(Notify::new());
+        let exclusive_release = Arc::new(Notify::new());
+        let late_entered = Arc::new(Notify::new());
+        let late_release = Arc::new(Notify::new());
+
+        let mut registry = ToolRegistry::new();
+        registry.register_raw(DispatchProbe {
+            name: "shared",
+            entered: shared_entered.clone(),
+            release: shared_release.clone(),
+        });
+        registry.register_raw(DispatchProbe {
+            name: "publish",
+            entered: exclusive_entered.clone(),
+            release: exclusive_release.clone(),
+        });
+        registry.register_raw(DispatchProbe {
+            name: "late",
+            entered: late_entered.clone(),
+            release: late_release.clone(),
+        });
+        let registry = Arc::new(registry);
+        let ctx = ctx();
+        ctx.extensions.insert(ToolDispatchGate::new(["publish"]));
+
+        let shared = {
+            let registry = registry.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move { registry.run("shared", serde_json::json!({}), ctx).await })
+        };
+        shared_entered.notified().await;
+
+        let exclusive = {
+            let registry = registry.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move { registry.run("publish", serde_json::json!({}), ctx).await })
+        };
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                exclusive_entered.notified()
+            )
+            .await
+            .is_err(),
+            "exclusive publication entered while a sibling held a shared lease"
+        );
+        shared_release.notify_one();
+        assert!(!shared.await.unwrap().is_error);
+        exclusive_entered.notified().await;
+
+        let late = {
+            let registry = registry.clone();
+            let ctx = ctx.clone();
+            tokio::spawn(async move { registry.run("late", serde_json::json!({}), ctx).await })
+        };
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                late_entered.notified()
+            )
+            .await
+            .is_err(),
+            "a new sibling entered during exclusive publication"
+        );
+        exclusive_release.notify_one();
+        assert!(!exclusive.await.unwrap().is_error);
+        late_entered.notified().await;
+        late_release.notify_one();
+        assert!(!late.await.unwrap().is_error);
     }
 }

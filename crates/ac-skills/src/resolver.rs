@@ -10,6 +10,7 @@
 //!   directory name in lower-priority layers.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -19,9 +20,17 @@ use crate::frontmatter;
 /// Maximum bytes of a skill file [`read_skill_text`] returns; longer files
 /// are truncated on a char boundary with a marker.
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
+/// Maximum complete `SKILL.md` size accepted during discovery.
+pub const MAX_SKILL_MD_BYTES: usize = 1024 * 1024;
+pub const MAX_DIRECT_SKILLS: usize = 256;
+/// Maximum directory entries inspected across one direct-child listing.
+pub const MAX_DIRECT_ENTRIES: usize = 2048;
+/// Maximum diagnostics retained by one direct-child listing.
+pub const MAX_DIRECT_SKIPPED: usize = 256;
 
 const MAX_SCAN_DEPTH: usize = 6;
 const MAX_SCAN_DIRS: usize = 2000;
+const MAX_SCAN_ENTRIES: usize = 4096;
 
 /// Standard agentskills manifest fields, with nested metadata preserved.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,13 +151,10 @@ impl SkillsResolver {
         let mut seen_paths: BTreeSet<PathBuf> = BTreeSet::new();
         for layer in &self.layers {
             let (files, truncated) = discover_skill_files(&layer.root);
-            if truncated {
+            if let Some(limit) = truncated {
                 listing.skipped.push(SkippedSkill {
                     dir: layer.root.clone(),
-                    reason: format!(
-                        "skills scan reached its traversal limit ({MAX_SCAN_DIRS} directories); \
-                         remaining candidates under this root were not scanned"
-                    ),
+                    reason: limit.diagnostic(),
                 });
             }
             for skill_md in files {
@@ -173,20 +179,59 @@ impl SkillsResolver {
     fn list_direct_children(&self) -> Listing {
         let mut listing = Listing::default();
         let mut seen_directories: BTreeSet<String> = BTreeSet::new();
+        let mut inspected_entries = 0_usize;
+        let mut skipped_saturated = false;
 
-        for layer in &self.layers {
+        'layers: for layer in &self.layers {
             let Ok(entries) = std::fs::read_dir(&layer.root) else {
                 continue;
             };
-            let mut entries: Vec<_> = entries.flatten().collect();
-            entries.sort_by_key(|entry| entry.file_name());
+            let mut bounded_entries = Vec::new();
+            let mut scan_truncated = false;
+            for result in entries {
+                if inspected_entries >= MAX_DIRECT_ENTRIES {
+                    scan_truncated = true;
+                    break;
+                }
+                inspected_entries += 1;
+                match result {
+                    Ok(entry) => bounded_entries.push(entry),
+                    Err(error) => push_direct_skip(
+                        &mut listing,
+                        &mut skipped_saturated,
+                        SkippedSkill {
+                            dir: layer.root.clone(),
+                            reason: format!("cannot read directory entry: {error}"),
+                        },
+                    ),
+                }
+            }
+            bounded_entries.sort_by_key(|entry| entry.file_name());
 
-            for entry in entries {
+            for entry in bounded_entries {
+                if listing.skills.len() >= MAX_DIRECT_SKILLS {
+                    push_direct_skip(
+                        &mut listing,
+                        &mut skipped_saturated,
+                        SkippedSkill {
+                            dir: layer.root.clone(),
+                            reason: format!(
+                                "direct-child skill listing reached its limit \
+                                 ({MAX_DIRECT_SKILLS}); remaining candidates were not scanned"
+                            ),
+                        },
+                    );
+                    break 'layers;
+                }
                 let Ok(file_type) = entry.file_type() else {
-                    listing.skipped.push(SkippedSkill {
-                        dir: entry.path(),
-                        reason: "cannot determine directory entry type".to_string(),
-                    });
+                    push_direct_skip(
+                        &mut listing,
+                        &mut skipped_saturated,
+                        SkippedSkill {
+                            dir: entry.path(),
+                            reason: "cannot determine directory entry type".to_string(),
+                        },
+                    );
                     continue;
                 };
                 // Symlinked directories are not direct-child candidates.
@@ -194,19 +239,28 @@ impl SkillsResolver {
                     continue;
                 }
                 let Some(dir_name) = entry.file_name().to_str().map(str::to_string) else {
-                    listing.skipped.push(SkippedSkill {
-                        dir: entry.path(),
-                        reason: "skill directory name is not valid UTF-8".to_string(),
-                    });
+                    push_direct_skip(
+                        &mut listing,
+                        &mut skipped_saturated,
+                        SkippedSkill {
+                            dir: entry.path(),
+                            reason: "skill directory name is not valid UTF-8".to_string(),
+                        },
+                    );
                     continue;
                 };
                 if !is_valid_direct_skill_name(&dir_name) {
-                    listing.skipped.push(SkippedSkill {
-                        dir: entry.path(),
-                        reason: format!(
-                            "invalid direct-child skill directory {dir_name:?}: expected ^[a-z][a-z0-9-]*$"
-                        ),
-                    });
+                    push_direct_skip(
+                        &mut listing,
+                        &mut skipped_saturated,
+                        SkippedSkill {
+                            dir: entry.path(),
+                            reason: format!(
+                                "invalid direct-child skill directory {dir_name:?}: \
+                                 expected ^[a-z][a-z0-9-]*$"
+                            ),
+                        },
+                    );
                     continue;
                 }
                 let skill_md = entry.path().join("SKILL.md");
@@ -214,10 +268,16 @@ impl SkillsResolver {
                     continue;
                 }
                 if seen_directories.contains(&dir_name) {
-                    listing.skipped.push(SkippedSkill {
-                        dir: entry.path(),
-                        reason: format!("directory {dir_name:?} is shadowed by an earlier layer"),
-                    });
+                    push_direct_skip(
+                        &mut listing,
+                        &mut skipped_saturated,
+                        SkippedSkill {
+                            dir: entry.path(),
+                            reason: format!(
+                                "directory {dir_name:?} is shadowed by an earlier layer"
+                            ),
+                        },
+                    );
                     continue;
                 }
 
@@ -226,11 +286,29 @@ impl SkillsResolver {
                         seen_directories.insert(dir_name);
                         listing.skills.push(skill);
                     }
-                    Err(reason) => listing.skipped.push(SkippedSkill {
-                        dir: entry.path(),
-                        reason,
-                    }),
+                    Err(reason) => push_direct_skip(
+                        &mut listing,
+                        &mut skipped_saturated,
+                        SkippedSkill {
+                            dir: entry.path(),
+                            reason,
+                        },
+                    ),
                 }
+            }
+            if scan_truncated {
+                push_direct_skip(
+                    &mut listing,
+                    &mut skipped_saturated,
+                    SkippedSkill {
+                        dir: layer.root.clone(),
+                        reason: format!(
+                            "direct-child skill scan reached its entry limit \
+                             ({MAX_DIRECT_ENTRIES}); remaining entries and layers were not scanned"
+                        ),
+                    },
+                );
+                break;
             }
         }
 
@@ -256,49 +334,115 @@ impl SkillsResolver {
 }
 
 pub fn read_skill_text(skill: &Skill) -> Result<String, LoadError> {
-    let bytes = std::fs::read(&skill.skill_md).map_err(|source| LoadError::Io {
+    let metadata = std::fs::metadata(&skill.skill_md).map_err(|source| LoadError::Io {
         path: skill.skill_md.clone(),
         source,
     })?;
-    let mut text = String::from_utf8(bytes).map_err(|_| LoadError::Invalid {
+    let mut file = std::fs::File::open(&skill.skill_md).map_err(|source| LoadError::Io {
         path: skill.skill_md.clone(),
-        reason: "not valid UTF-8".to_string(),
+        source,
     })?;
-    if text.len() > MAX_BODY_BYTES {
-        let mut end = MAX_BODY_BYTES;
-        while !text.is_char_boundary(end) {
-            end -= 1;
+    let mut bytes = Vec::with_capacity(MAX_BODY_BYTES.saturating_add(4));
+    file.by_ref()
+        .take(MAX_BODY_BYTES as u64 + 4)
+        .read_to_end(&mut bytes)
+        .map_err(|source| LoadError::Io {
+            path: skill.skill_md.clone(),
+            source,
+        })?;
+    let truncated = metadata.len() > MAX_BODY_BYTES as u64 || bytes.len() > MAX_BODY_BYTES;
+    let prefix = &bytes[..bytes.len().min(MAX_BODY_BYTES)];
+    let valid_prefix = match std::str::from_utf8(prefix) {
+        Ok(text) => text,
+        Err(error) if truncated && error.error_len().is_none() => {
+            std::str::from_utf8(&prefix[..error.valid_up_to()]).map_err(|_| LoadError::Invalid {
+                path: skill.skill_md.clone(),
+                reason: "not valid UTF-8".to_string(),
+            })?
         }
-        text.truncate(end);
+        Err(_) => {
+            return Err(LoadError::Invalid {
+                path: skill.skill_md.clone(),
+                reason: "not valid UTF-8".to_string(),
+            });
+        }
+    };
+    let mut text = valid_prefix.to_string();
+    if truncated {
         text.push_str("\n[truncated: the skill file exceeded 256 KiB]");
     }
     Ok(text)
 }
 
-fn discover_skill_files(root: &Path) -> (Vec<PathBuf>, bool) {
+fn push_direct_skip(listing: &mut Listing, saturated: &mut bool, skipped: SkippedSkill) {
+    if *saturated {
+        return;
+    }
+    if listing.skipped.len() < MAX_DIRECT_SKIPPED.saturating_sub(1) {
+        listing.skipped.push(skipped);
+        return;
+    }
+    listing.skipped.push(SkippedSkill {
+        dir: skipped.dir,
+        reason: format!(
+            "direct-child skill diagnostics reached their limit \
+             ({MAX_DIRECT_SKIPPED}); additional diagnostics were omitted"
+        ),
+    });
+    *saturated = true;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecursiveScanLimit {
+    Directories,
+    Entries,
+}
+
+impl RecursiveScanLimit {
+    fn diagnostic(self) -> String {
+        match self {
+            Self::Directories => format!(
+                "skills scan reached its traversal limit ({MAX_SCAN_DIRS} queued or visited \
+                 directories); remaining candidates under this root were not scanned"
+            ),
+            Self::Entries => format!(
+                "skills scan reached its entry inspection limit ({MAX_SCAN_ENTRIES}); \
+                 remaining candidates under this root were not scanned"
+            ),
+        }
+    }
+}
+
+fn discover_skill_files(root: &Path) -> (Vec<PathBuf>, Option<RecursiveScanLimit>) {
     let mut found = Vec::new();
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut truncated = false;
+    let mut inspected_entries = 0_usize;
+    let mut truncated = None;
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    while let Some((dir, depth)) = stack.pop() {
+    'walk: while let Some((dir, depth)) = stack.pop() {
         let Ok(physical) = dir.canonicalize() else {
             continue;
         };
         if !visited.insert(physical) {
             continue;
         }
-        if visited.len() > MAX_SCAN_DIRS {
-            truncated = true;
-            break;
-        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
+            if inspected_entries >= MAX_SCAN_ENTRIES {
+                truncated = Some(RecursiveScanLimit::Entries);
+                break 'walk;
+            }
+            inspected_entries += 1;
             let name = entry.file_name();
             let path = entry.path();
             if path.is_dir() {
                 if depth < MAX_SCAN_DEPTH && !name.to_string_lossy().starts_with('.') {
+                    if visited.len() + stack.len() >= MAX_SCAN_DIRS {
+                        truncated = Some(RecursiveScanLimit::Directories);
+                        break 'walk;
+                    }
                     stack.push((path, depth + 1));
                 }
             } else if name == "SKILL.md"
@@ -354,8 +498,28 @@ impl ManifestPolicy {
 }
 
 fn read_skill(skill_md: &Path, layer: &str, policy: ManifestPolicy) -> Result<Skill, String> {
-    let bytes =
-        std::fs::read(skill_md).map_err(|error| format!("cannot read SKILL.md: {error}"))?;
+    let metadata =
+        std::fs::metadata(skill_md).map_err(|error| format!("cannot inspect SKILL.md: {error}"))?;
+    if metadata.len() > MAX_SKILL_MD_BYTES as u64 {
+        return Err(format!(
+            "SKILL.md exceeds byte limit of {MAX_SKILL_MD_BYTES}"
+        ));
+    }
+    let file =
+        std::fs::File::open(skill_md).map_err(|error| format!("cannot read SKILL.md: {error}"))?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len())
+            .unwrap_or(MAX_SKILL_MD_BYTES)
+            .min(MAX_SKILL_MD_BYTES),
+    );
+    file.take(MAX_SKILL_MD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read SKILL.md: {error}"))?;
+    if bytes.len() > MAX_SKILL_MD_BYTES {
+        return Err(format!(
+            "SKILL.md exceeds byte limit of {MAX_SKILL_MD_BYTES}"
+        ));
+    }
     let text = String::from_utf8(bytes).map_err(|_| "SKILL.md is not valid UTF-8".to_string())?;
     let source_dir = skill_md
         .parent()
@@ -527,5 +691,36 @@ mod tests {
         assert!(!is_valid_direct_skill_name("2-start"));
         assert!(!is_valid_direct_skill_name("Upper"));
         assert!(!is_valid_direct_skill_name("../evil"));
+    }
+
+    #[test]
+    fn recursive_scan_bounds_a_single_wide_directory_before_enqueuing_every_child() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_SCAN_DIRS {
+            std::fs::create_dir(root.path().join(format!("wide-{index:04}"))).unwrap();
+        }
+
+        let (found, truncated) = discover_skill_files(root.path());
+        assert!(found.is_empty());
+        assert_eq!(truncated, Some(RecursiveScanLimit::Directories));
+        assert_eq!(
+            truncated.unwrap().diagnostic(),
+            format!(
+                "skills scan reached its traversal limit ({MAX_SCAN_DIRS} queued or visited \
+                 directories); remaining candidates under this root were not scanned"
+            )
+        );
+    }
+
+    #[test]
+    fn recursive_scan_bounds_non_directory_entries_too() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..=MAX_SCAN_ENTRIES {
+            std::fs::write(root.path().join(format!("wide-{index:04}.txt")), "").unwrap();
+        }
+
+        let (found, truncated) = discover_skill_files(root.path());
+        assert!(found.is_empty());
+        assert_eq!(truncated, Some(RecursiveScanLimit::Entries));
     }
 }

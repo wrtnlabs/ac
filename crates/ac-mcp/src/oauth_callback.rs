@@ -47,6 +47,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const ERR_TIMEOUT: &str = "OAuth callback timeout — authorization took too long";
 pub const ERR_CANCELLED: &str = "Authorization cancelled";
 pub const ERR_STOPPED: &str = "OAuth callback server stopped";
+pub const ERR_ISSUER_MISSING: &str = "OAuth authorization response is missing its required issuer";
+pub const ERR_ISSUER_MISMATCH: &str =
+    "OAuth authorization response issuer mismatch — potential mix-up attack";
 
 // Stable rejection copies.
 pub const PAGE_MISSING_STATE: &str = "Missing required state parameter — potential CSRF attack.";
@@ -135,11 +138,22 @@ struct Registry {
     /// Pending callbacks are not registered until after discovery/DCR, so the
     /// lease itself must keep the listener alive during that gap.
     binding_leases: usize,
-    /// CSRF state → the waiter's one-shot.
-    pending: HashMap<String, oneshot::Sender<Result<String, String>>>,
+    /// CSRF state → the waiter and its RFC 9207 issuer expectation.
+    pending: HashMap<String, PendingAuthorization>,
     /// Host-visible server name → CSRF state, so `cancel_pending(name)` finds
     /// the entry.
     name_to_state: HashMap<String, String>,
+}
+
+struct PendingAuthorization {
+    tx: oneshot::Sender<Result<String, String>>,
+    issuer: Option<IssuerExpectation>,
+}
+
+#[derive(Clone)]
+struct IssuerExpectation {
+    exact: String,
+    required: bool,
 }
 
 struct ServerInner {
@@ -259,12 +273,14 @@ fn route(server: &OAuthCallbackServer, request_target: &str) -> Reply {
     let mut state: Option<String> = None;
     let mut error: Option<String> = None;
     let mut error_description: Option<String> = None;
+    let mut issuer: Option<String> = None;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "code" => code = Some(value.into_owned()),
             "state" => state = Some(value.into_owned()),
             "error" => error = Some(value.into_owned()),
             "error_description" => error_description = Some(value.into_owned()),
+            "iss" => issuer = Some(value.into_owned()),
             _ => {}
         }
     }
@@ -279,29 +295,8 @@ fn route(server: &OAuthCallbackServer, request_target: &str) -> Reply {
         );
     };
 
-    if let Some(error) = error {
-        let message = error_description.unwrap_or(error);
-        let mut registry = server.reg();
-        if let Some(tx) = registry.pending.remove(&state) {
-            cleanup_state_index(&mut registry, &state);
-            let _ = tx.send(Err(message.clone()));
-        }
-        stop_if_idle(&mut registry);
-        drop(registry);
-        return Reply::Http(200, "OK", HTML, error_page(&page_copy, &message));
-    }
-
-    let Some(code) = code else {
-        return Reply::Http(
-            400,
-            "Bad Request",
-            HTML,
-            error_page(&page_copy, PAGE_NO_CODE),
-        );
-    };
-
     let mut registry = server.reg();
-    let Some(tx) = registry.pending.remove(&state) else {
+    let Some(pending) = registry.pending.get(&state) else {
         // A state we never minted (or one already consumed / expired).
         return Reply::Http(
             400,
@@ -310,8 +305,57 @@ fn route(server: &OAuthCallbackServer, request_target: &str) -> Reply {
             error_page(&page_copy, PAGE_UNKNOWN_STATE),
         );
     };
+    let issuer_error = pending
+        .issuer
+        .as_ref()
+        .and_then(|expected| match issuer.as_deref() {
+            Some(actual) if actual != expected.exact => Some(ERR_ISSUER_MISMATCH),
+            None if expected.required => Some(ERR_ISSUER_MISSING),
+            Some(_) | None => None,
+        });
+    if let Some(message) = issuer_error {
+        let pending = registry
+            .pending
+            .remove(&state)
+            .expect("pending issuer expectation was just observed");
+        cleanup_state_index(&mut registry, &state);
+        let _ = pending.tx.send(Err(message.to_string()));
+        stop_if_idle(&mut registry);
+        drop(registry);
+        // Do not display attacker-controlled authorization error fields when
+        // the response issuer is invalid (RFC 9207 section 2.4).
+        return Reply::Http(400, "Bad Request", HTML, error_page(&page_copy, message));
+    }
+
+    if let Some(error) = error {
+        let message = error_description.unwrap_or(error);
+        let pending = registry
+            .pending
+            .remove(&state)
+            .expect("pending authorization was just observed");
+        cleanup_state_index(&mut registry, &state);
+        let _ = pending.tx.send(Err(message.clone()));
+        stop_if_idle(&mut registry);
+        drop(registry);
+        return Reply::Http(200, "OK", HTML, error_page(&page_copy, &message));
+    }
+
+    let Some(code) = code else {
+        drop(registry);
+        return Reply::Http(
+            400,
+            "Bad Request",
+            HTML,
+            error_page(&page_copy, PAGE_NO_CODE),
+        );
+    };
+
+    let pending = registry
+        .pending
+        .remove(&state)
+        .expect("pending authorization was just observed");
     cleanup_state_index(&mut registry, &state);
-    let _ = tx.send(Ok(code));
+    let _ = pending.tx.send(Ok(code));
     stop_if_idle(&mut registry);
     drop(registry);
     Reply::Http(200, "OK", HTML, success_page(&page_copy))
@@ -645,10 +689,43 @@ impl OAuthCallbackServer {
         server_name: &str,
         timeout: Duration,
     ) -> PendingCallback {
+        self.begin_inner(oauth_state, server_name, timeout, None)
+    }
+
+    /// Register a pending authorization response with RFC 9207 issuer
+    /// validation. Any returned `iss` must exactly match `expected_issuer`;
+    /// when `issuer_required` is true, an absent `iss` is rejected too.
+    pub fn begin_with_issuer(
+        &self,
+        oauth_state: &str,
+        server_name: &str,
+        expected_issuer: &str,
+        issuer_required: bool,
+    ) -> PendingCallback {
+        self.begin_inner(
+            oauth_state,
+            server_name,
+            CALLBACK_TIMEOUT,
+            Some(IssuerExpectation {
+                exact: expected_issuer.to_string(),
+                required: issuer_required,
+            }),
+        )
+    }
+
+    fn begin_inner(
+        &self,
+        oauth_state: &str,
+        server_name: &str,
+        timeout: Duration,
+        issuer: Option<IssuerExpectation>,
+    ) -> PendingCallback {
         let (tx, rx) = oneshot::channel();
         {
             let mut registry = self.reg();
-            registry.pending.insert(oauth_state.to_string(), tx);
+            registry
+                .pending
+                .insert(oauth_state.to_string(), PendingAuthorization { tx, issuer });
             registry
                 .name_to_state
                 .insert(server_name.to_string(), oauth_state.to_string());
@@ -723,7 +800,7 @@ impl OAuthCallbackServer {
             .unwrap_or_else(|| server_name.to_string());
         if let Some(tx) = registry.pending.remove(&key) {
             registry.name_to_state.remove(server_name);
-            let _ = tx.send(Err(ERR_CANCELLED.to_string()));
+            let _ = tx.tx.send(Err(ERR_CANCELLED.to_string()));
         }
         // Unconditional, not inside the `if let`: a cancel that arrives during
         // the discovery / registration window has nothing pending to remove.
@@ -739,8 +816,8 @@ impl OAuthCallbackServer {
             let binding = registry.binding.take();
             let pending: Vec<_> = registry.pending.drain().collect();
             registry.name_to_state.clear();
-            for (_, tx) in pending {
-                let _ = tx.send(Err(ERR_STOPPED.to_string()));
+            for (_, pending) in pending {
+                let _ = pending.tx.send(Err(ERR_STOPPED.to_string()));
             }
             binding
         };
@@ -842,6 +919,84 @@ mod tests {
         // Nothing pending means the server shuts itself down.
         assert!(!server.is_running());
         server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn exact_authorization_response_issuer_is_accepted_when_required() {
+        let _g = serial().await;
+        let server = OAuthCallbackServer::new();
+        let port = free_port().await;
+        server.ensure_running(&redirect(port)).await.unwrap();
+
+        let pending =
+            server.begin_with_issuer("st4te", "tracker", "https://auth.test/tenant", true);
+        let waiter = tokio::spawn(pending.wait());
+        let target = format!(
+            "{TEST_CALLBACK_PATH}?code=abc&state=st4te&iss=https%3A%2F%2Fauth.test%2Ftenant"
+        );
+        let (head, body) = get(port, &target).await;
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(body.contains("Authentication complete"), "{body}");
+        assert_eq!(waiter.await.unwrap().unwrap(), "abc");
+        assert!(!server.is_running());
+    }
+
+    #[tokio::test]
+    async fn missing_required_or_mismatched_present_issuer_is_rejected() {
+        let _g = serial().await;
+
+        let missing_server = OAuthCallbackServer::new();
+        let missing_port = free_port().await;
+        missing_server
+            .ensure_running(&redirect(missing_port))
+            .await
+            .unwrap();
+        let missing = missing_server.begin_with_issuer(
+            "missing",
+            "missing-tracker",
+            "https://auth.test",
+            true,
+        );
+        let missing_waiter = tokio::spawn(missing.wait());
+        let (head, body) = get(
+            missing_port,
+            &format!("{TEST_CALLBACK_PATH}?code=abc&state=missing"),
+        )
+        .await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+        assert!(body.contains(ERR_ISSUER_MISSING), "{body}");
+        assert_eq!(
+            missing_waiter.await.unwrap().unwrap_err(),
+            ERR_ISSUER_MISSING
+        );
+
+        let mismatch_server = OAuthCallbackServer::new();
+        let mismatch_port = free_port().await;
+        mismatch_server
+            .ensure_running(&redirect(mismatch_port))
+            .await
+            .unwrap();
+        // Even when metadata did not require `iss`, a response that includes
+        // one must match the recorded issuer exactly.
+        let mismatch = mismatch_server.begin_with_issuer(
+            "mismatch",
+            "mismatch-tracker",
+            "https://auth.test",
+            false,
+        );
+        let mismatch_waiter = tokio::spawn(mismatch.wait());
+        let target = format!(
+            "{TEST_CALLBACK_PATH}?state=mismatch&error=denied&error_description=\
+             must-not-be-displayed&iss=https%3A%2F%2Fattacker.test"
+        );
+        let (head, body) = get(mismatch_port, &target).await;
+        assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+        assert!(body.contains(ERR_ISSUER_MISMATCH), "{body}");
+        assert!(!body.contains("must-not-be-displayed"), "{body}");
+        assert_eq!(
+            mismatch_waiter.await.unwrap().unwrap_err(),
+            ERR_ISSUER_MISMATCH
+        );
     }
 
     #[tokio::test]

@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ac_mcp::{
-    MAX_TOOL_NAME_LEN, McpConnection, McpDialer, McpError, RegisterOptions, ToolPrefix,
-    register_cached,
+    MAX_CATALOG_BYTES, MAX_CATALOG_TOOLS, MAX_TOOL_NAME_LEN, McpConnection, McpDialer, McpError,
+    RegisterOptions, ToolPrefix, register_cached,
 };
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
 use ac_runtime::{AgentConfig, AgentEvent, Session};
@@ -18,8 +18,8 @@ use ac_types::StopReason;
 use futures::future::BoxFuture;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, CancelledNotificationParam, ContentBlock, ErrorData,
-    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
-    ToolAnnotations,
+    Icon, JsonObject, ListToolsResult, Meta, PaginatedRequestParams, ServerCapabilities,
+    ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{RoleServer, ServerHandler, ServiceExt};
@@ -162,6 +162,103 @@ impl ServerHandler for TestServer {
     }
 }
 
+#[derive(Clone, Default)]
+struct PaginatedServer {
+    calls: Arc<AtomicUsize>,
+    fill_first_page_to_limit: bool,
+    oversized_field: Option<OversizedToolField>,
+}
+
+#[derive(Clone, Copy)]
+enum OversizedToolField {
+    Title,
+    OutputSchema,
+    Icons,
+    Meta,
+}
+
+impl ServerHandler for PaginatedServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let cursor = request.and_then(|request| request.cursor);
+        if let Some(field) = self.oversized_field {
+            if cursor.is_none() {
+                return Ok(ListToolsResult {
+                    meta: None,
+                    next_cursor: Some("oversized".to_string()),
+                    tools: vec![Tool::new(
+                        "first",
+                        "bounded first page",
+                        schema(json!({ "type": "object" })),
+                    )],
+                });
+            }
+            if cursor.as_deref() == Some("oversized") {
+                let oversized = "x".repeat(MAX_CATALOG_BYTES + 1);
+                let mut tool = Tool::new(
+                    "oversized",
+                    "field outside the projection is still bounded",
+                    schema(json!({ "type": "object" })),
+                );
+                match field {
+                    OversizedToolField::Title => tool.title = Some(oversized),
+                    OversizedToolField::OutputSchema => {
+                        tool.output_schema =
+                            Some(Arc::new(schema(json!({ "payload": oversized }))));
+                    }
+                    OversizedToolField::Icons => {
+                        tool.icons = Some(vec![Icon::new(oversized)]);
+                    }
+                    OversizedToolField::Meta => {
+                        tool.meta = Some(Meta(schema(json!({ "payload": oversized }))));
+                    }
+                }
+                return Ok(ListToolsResult::with_all_items(vec![tool]));
+            }
+        }
+        if self.fill_first_page_to_limit && cursor.is_none() {
+            return Ok(ListToolsResult {
+                meta: None,
+                next_cursor: Some("must-not-fetch".to_string()),
+                tools: (0..MAX_CATALOG_TOOLS)
+                    .map(|index| {
+                        Tool::new(
+                            format!("tool_{index}"),
+                            "bounded",
+                            schema(json!({ "type": "object" })),
+                        )
+                    })
+                    .collect(),
+            });
+        }
+        match cursor.as_deref() {
+            None => Ok(ListToolsResult {
+                meta: None,
+                next_cursor: Some("page-2".to_string()),
+                tools: vec![Tool::new(
+                    "first",
+                    "first page",
+                    schema(json!({ "type": "object" })),
+                )],
+            }),
+            Some("page-2") => Ok(ListToolsResult::with_all_items(vec![Tool::new(
+                "second",
+                "second page",
+                schema(json!({ "type": "object" })),
+            )])),
+            _ => Err(ErrorData::invalid_params("unexpected cursor", None)),
+        }
+    }
+}
+
 /// A real client↔server MCP session over an in-memory duplex pipe.
 async fn connect() -> (McpConnection, ServerState) {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -175,6 +272,17 @@ async fn connect() -> (McpConnection, ServerState) {
         .await
         .expect("client handshake");
     (conn, state)
+}
+
+async fn connect_paginated(server: PaginatedServer) -> McpConnection {
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    tokio::spawn(async move {
+        let service = server.serve(server_io).await.expect("server handshake");
+        let _ = service.waiting().await;
+    });
+    McpConnection::connect("paginated", client_io)
+        .await
+        .expect("client handshake")
 }
 
 fn make_ctx() -> (Arc<ToolCtx>, tempfile::TempDir) {
@@ -271,6 +379,78 @@ async fn discovers_and_registers_with_server_prefix() {
         registry.capability("mcp__test__echo"),
         Some(Capability::Mutating)
     );
+}
+
+#[tokio::test]
+async fn discovery_follows_pages_and_preserves_server_order() {
+    let server = PaginatedServer::default();
+    let calls = server.calls.clone();
+    let connection = connect_paginated(server).await;
+
+    let tools = connection.tools().await.unwrap();
+
+    assert_eq!(
+        tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn discovery_stops_before_fetching_beyond_the_tool_limit() {
+    let server = PaginatedServer {
+        fill_first_page_to_limit: true,
+        ..PaginatedServer::default()
+    };
+    let calls = server.calls.clone();
+    let connection = connect_paginated(server).await;
+
+    let error = connection
+        .tools()
+        .await
+        .expect_err("a continuation after the hard cap must fail closed");
+
+    assert!(error.to_string().contains("catalog limit"), "{error}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the client must not request another untrusted page after reaching the cap"
+    );
+}
+
+#[tokio::test]
+async fn paged_discovery_bounds_every_retained_tool_field() {
+    for field in [
+        OversizedToolField::Title,
+        OversizedToolField::OutputSchema,
+        OversizedToolField::Icons,
+        OversizedToolField::Meta,
+    ] {
+        let server = PaginatedServer {
+            oversized_field: Some(field),
+            ..PaginatedServer::default()
+        };
+        let calls = server.calls.clone();
+        let connection = connect_paginated(server).await;
+
+        let error = connection
+            .tools()
+            .await
+            .expect_err("ignored protocol fields must not bypass the full catalog budget");
+
+        assert!(
+            error.to_string().contains("full tool definition"),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the adversarial field must be checked on the second page"
+        );
+    }
 }
 
 #[tokio::test]

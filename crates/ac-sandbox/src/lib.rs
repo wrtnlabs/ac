@@ -121,7 +121,6 @@ impl SandboxLauncher for OffSandbox {
 
 /// Build the plain (unsandboxed) command from a spec — the common starting
 /// point every backend wraps or augments.
-#[allow(dead_code)] // used by OffSandbox always; by the fallback only off macOS/Linux
 fn build_bare_command(spec: &CommandSpec) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args).current_dir(&spec.cwd);

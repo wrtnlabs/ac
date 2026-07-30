@@ -159,10 +159,9 @@ struct ReadStamp {
 
 /// Why an overwrite failed the shared read-before-write gate.
 ///
-/// The display strings intentionally match the established opencode behavior.
-/// They are useful agent-facing guidance rather than host policy, and keeping
-/// them here prevents every host from rebuilding a second freshness ledger
-/// merely to preserve actionable errors.
+/// The display strings are stable, actionable agent guidance rather than host
+/// policy. Keeping them here prevents every host from rebuilding a second
+/// freshness ledger merely to preserve useful errors.
 #[derive(Debug, Clone)]
 pub enum FileTimeError {
     NeverRead {

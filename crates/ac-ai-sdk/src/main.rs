@@ -325,7 +325,7 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
         {
             // A lost-update race (concurrent turns on one chat id) surfaces
             // here after the stream already closed — visible in logs, not to
-            // the client. See CLAUDE.md "detected, not prevented".
+            // the client. See AGENTS.md "detected, not prevented".
             eprintln!("ac-ai-sdk: persist failed for session {session_id}: {e}");
         }
     });

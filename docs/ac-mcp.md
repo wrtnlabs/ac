@@ -33,9 +33,25 @@ endpoint, observes caller and host cancellation throughout the flow, and guarant
 cleanup. The managed layer supplies a stock semantic credential store and a configured
 enumerator; hosts supply client metadata, callback/browser presentation, storage paths or custom
 stores, and policy (§7).
+**Amended 2026-07-30:** portable stdio definitions also carry `envVars` and `cwd`; remote
+definitions carry `envHeaders` and `bearerTokenEnvVar`. The symbolic fields persist environment
+*names* and resolve their values through host policy at each dial; literal `env` and `headers`
+remain literal durable configuration. AC never reads ambient process state by itself. An explicit
+`requalify_catalog` migration may rewrite already-cached provider-visible names without dialing;
+absent that call, existing names remain verbatim (§5, §8).
+**Amended 2026-07-30 (hardening):** remote MCP requires HTTPS except for HTTP on a literal
+loopback IP, before a transport or credential-bearing request is constructed. Discovery is
+manually paged with page, cursor, tool-count, per-entry, schema-depth/size, and aggregate
+catalog limits. OAuth discovery follows the protected-resource order for pathful issuers,
+requires an exact metadata issuer, and validates an authorization response's RFC 9207 `iss`
+when present or advertised. OAuth bodies, rendered tool results, and surfaced errors are
+bounded; configured secret values are redacted. Stock file writes set final private
+permissions before file sync and sync the containing directory after atomic replacement on
+Unix. The remaining pre-deserialization transport allocation gap is recorded in §9.
 **Requires:** [ac-tools.md](ac-tools.md) (the tool registry, the raw (runtime-described) registration
 path, errors-as-data), [ac-provider.md](ac-provider.md) (tool specs ride every sampling request —
-the exposure that motivates the name floor defined in §2). **Required by:** nothing yet. **Interacts with:**
+the exposure that motivates the name floor defined in §2). **Required by:** hosts that expose
+managed MCP tools. **Interacts with:**
 [ac-approvals.md](ac-approvals.md) (capability classification is the input to permission
 decisions), [ac-security.md](ac-security.md) (the untrusted-counterparty posture).
 
@@ -61,16 +77,18 @@ Five requirements shape the design:
   the serving tool validates its own inputs.
 - **R3 (distrust by default).** Nothing a server *declares* may weaken the host's permission
   posture. A permission mode keyed on tool capability MUST NOT be bypassable by a lying server.
-- **R4 (session survival).** No server behavior — crash, hang, garbage, oversized output —
-  may cost more than one failed tool result. Failures are data the model sees, never a poisoned
-  session or a terminated turn.
+- **R4 (session survival).** Once a message reaches AC's decoded-message boundary, no server
+  behavior — crash, hang, garbage, oversized output — may cost more than one failed tool result.
+  Failures are data the model sees, never a poisoned session or a terminated turn. The stock
+  SDK transports' pre-deserialization allocation gap is explicit in §9.
 - **R5 (total accounting).** Discovery-to-registration MUST be fully reported: every discovered
   tool is either registered or skipped with a stated reason. Nothing is dropped silently.
 
 ## 2. Model
 
 A **connection** binds one client to one MCP server over a host-chosen transport (the covered
-common case is a child process on stdio) under a host-chosen **server name** `s`. Discovery
+transports are a child process on stdio and, with `http`, Streamable HTTP) under a host-chosen
+**server name** `s`. Discovery
 takes the server's full paginated tool list at a point in time — a **snapshot**
 `D = ⟨d₁, …, dₙ⟩` of declared tools, each `dᵢ` carrying a remote name `tᵢ`, an optional
 description, an input schema, and optional **annotations** (the server's self-description:
@@ -140,7 +158,9 @@ arguments. The model sees a failed tool; the session continues.
   time-bounded (a transport wedged mid-write MUST NOT hang the very cancellation that exists to
   escape it) — and returns an error result. A possibly-mutating call is told to stop, not
   silently abandoned.
-- **Result rendering.** A result is flattened to the single text block a tool result is: text
+- **Result rendering.** Before projection, the complete serialized `CallToolResult` envelope
+  (including structured content, media payloads, and `_meta`) is capped. An accepted result is
+  then flattened to the single text block a tool result is: text
   content passes through; text resources contribute their text tagged with their URI; binary,
   image, and audio content is *noted as omitted*, never dropped silently; an empty result falls
   back to the server's structured content, then to an explicit "no content" note. The rendered
@@ -149,6 +169,9 @@ arguments. The model sees a failed tool; the session continues.
   character boundary with a visible truncation note. Results live in the message
   history and are resent every remaining iteration; an unbounded response taxes the whole
   session, not one call.
+- **Secret-safe diagnostics.** Connection, transport, server, and rendering failures are
+  bounded before projection. Literal or resolved bearer/header values supplied for the
+  connection are replaced with a fixed marker, including secrets split by truncation.
 
 ## 5. Lifecycle
 
@@ -191,9 +214,12 @@ available with the `managed` feature (`managed` currently includes `http`) and e
 - `ManagedMcp<S: StateStore, C: CredentialStore>`, with a synchronous `open` for the stock file
   stores and an async constructor for injected stores;
 - ordered `mcpServers` config, definition fingerprints, and a config-bound version-2 catalog;
-- one `ConnectionPolicy` supplying a materialized stdio environment, separate connect and tool-
-  discovery timeouts, and stderr policy to probes, refresh, OAuth enumeration, and lazy dialers
-  alike; timed-out or cancelled discovery always shuts down its connection;
+- one `ConnectionPolicy` supplying a baseline stdio environment, an optional host-provided
+  environment-value resolver, separate connect and tool-discovery timeouts, and stderr policy to
+  probes, refresh, OAuth enumeration, and lazy dialers alike. The resolver supplies values for
+  configured `envVars`, `envHeaders`, and `bearerTokenEnvVar` names at connection time; AC never
+  consults ambient process state itself. Timed-out or cancelled discovery always shuts down its
+  connection;
 - config mutation, credential removal, catalog invalidation, refresh and offline-first backfill
   under a single mutation order;
 - `pending`, `cached`, `failed`, and `needs-auth` server snapshots plus credential status;
@@ -201,8 +227,18 @@ available with the `managed` feature (`managed` currently includes `http`) and e
   stock `tool_search`, an exact gated-name set for `ConditionalToolsHook`, search-install
   accounting, and an optional host presentation transform; convenience methods load once and
   delegate to the snapshot API;
+- explicit catalog requalification through the configured `CatalogNamePolicy`, rewriting current
+  derived names without a server dial for hosts intentionally migrating a public name contract;
 - a generation-bound `OAuthFlowStore` and high-level authentication that derives endpoint,
   enabled state, scope, and client credentials from one locked durable-definition snapshot.
+
+Live enumeration is bounded independently of result rendering: at most 512 tools and 512 pages;
+pagination cursors, names, descriptions, schemas, schema depth, each complete serialized tool
+definition (including optional title, output schema, icons, execution/annotation data, and
+`_meta`), and aggregate retained catalog bytes each have explicit ceilings. Repeated cursors and
+a continuation after the tool ceiling are protocol failures. These checks apply as pages are
+decoded and prevent unbounded retained catalog state; they do not repair the SDK transport
+caveat in §9.
 
 The stock `FileStateStore` and `FileCredentialStore` keep read-only boot/status reads tolerant,
 but mutations use strict read-for-update and refuse to replace unreadable, malformed, or
@@ -224,7 +260,8 @@ changes an input (or catalog truncation is required), the managed layer appends 
 digest suffix. Distinct portable config keys or remote tool names therefore do not silently
 collapse merely because punctuation or delimiter repair produced the same readable prefix.
 `CatalogNamePolicy` lets an embedding preserve an established deterministic public-name contract
-for future enumerations; existing catalog names always remain verbatim.
+for future enumerations. Existing catalog names remain verbatim by default; the only exception is
+an embedding's explicit `requalify_catalog` migration.
 
 `ManagedMcp` deliberately has no application defaults. It does not choose a home directory,
 inherit ambient environment variables, discover another application's files, pick an OAuth
@@ -247,8 +284,11 @@ catalog description appears in a search UI.
   remote name and reason.
 - **I6a (non-destructive dynamic tools).** A wire-discovered tool never replaces an existing
   registry entry; the first entry wins and every later collision is reported as skipped.
-- **I7 (bounded results).** No rendered result exceeds the cap plus a bounded truncation note,
-  cut on a character boundary.
+- **I7 (bounded results).** No accepted decoded result has a complete serialized envelope above
+  its protocol cap; no rendered result exceeds its text cap plus a bounded truncation note, cut
+  on a character boundary.
+- **I7a (bounded catalogs).** No decoded discovery snapshot retained by AC exceeds the
+  configured page/tool/entry/schema/depth/aggregate ceilings.
 - **I8 (prompt failure after death).** A call on a shut-down or dead connection fails promptly
   — it never hangs the turn.
 
@@ -262,7 +302,8 @@ catalog description appears in a search UI.
 | Cached registration, stock `tool_search`, gated-name accounting | managed kit |
 | Config/catalog/credential persistence mechanism | injected stores; stock file stores ship in kit |
 | Storage locations and sandbox deny-read wiring | host |
-| Materialized stdio environment, timeouts, stderr mode, trust opt-in | host policy consumed by kit |
+| Baseline stdio environment, symbolic value resolver, timeouts, stderr mode, trust opt-in | host policy consumed by managed kit |
+| Applying `envVars`, `cwd`, `envHeaders`, and `bearerTokenEnvVar` on every connection path | managed kit |
 | Argument validation against the advertised schema | server |
 | Result flattening, size cap, cancellation notification | kit |
 | Permission decisions over capability ([ac-approvals.md](ac-approvals.md)) | host |
@@ -283,11 +324,23 @@ following the ecosystem's converged shape rather than inventing an application t
 
 - **The de-facto shape.** `managed::Config` reads and writes the `mcpServers` JSON object: a map
   from server name to either a stdio definition
-  `{ "command": string, "args"?: string[], "env"?: { [k]: string } }` or a remote definition
-  `{ "url": string, "headers"?: { [k]: string }, "oauth"?: false | object }`. Strict per-entry
+  `{ "command": string, "args"?: string[], "env"?: { [k]: string }, "envVars"?: string[], "cwd"?: string }`
+  or a remote definition
+  `{ "url": string, "headers"?: { [k]: string }, "envHeaders"?: { [header]: string }, "bearerTokenEnvVar"?: string, "oauth"?: false | object }`.
+  Strict per-entry
   parsing reports malformed definitions while valid siblings remain readable; tolerant reads
   never prevent boot, while mutations refuse any rejected registry rather than wiping it.
-  Authored map order survives read/mutate/write.
+  `ServerConfig::parse_value` is the shared host-ingress parser: it enforces the
+  `command`-XOR-`url` transport choice before decoding the selected concrete
+  shape and returns stable typed errors instead of serde's untagged-enum
+  fallback. Authored map order survives read/mutate/write.
+- **Literal versus symbolic values.** `env` and `headers` contain literal durable values; an
+  embedding must treat its config store accordingly. `envVars` contains host-environment names
+  copied into a stdio child at dial time. `envHeaders` maps each HTTP header name to a
+  host-environment name, and `bearerTokenEnvVar` names the source of the HTTP bearer token. Only
+  the names are serialized for those symbolic fields. Their values come from
+  `ConnectionPolicy::with_environment_value_resolver`; a missing resolver or unresolved name
+  contributes no value. AC never calls `std::env` on its own.
 - **Not a bespoke application table.** Embedding the same fields inside a host's own application
   config (a TOML `[mcp_servers.…]` table, say) is a valid host choice but a worse default: it
   couples the definition to one tool's config syntax, home directory, and surrounding keys, and
@@ -298,17 +351,31 @@ following the ecosystem's converged shape rather than inventing an application t
   — and fold definitions into its own store as a one-way convenience. Import locations and
   enabled sources are host policy over untrusted input; unmodeled keys are dropped. The managed
   runtime sees only validated `ServerConfig` values.
-- **Transport reach.** The stdio definition maps onto the child-process connect path; the remote
-  `url` definition maps onto the streamable-HTTP connect path (opt-in `http` feature; `headers`
-  carry bearer auth). A host built without that feature MUST still report a remote definition as
-  skipped with a stated reason (R5) — never silently.
+- **Transport reach.** The stdio definition maps onto the child-process connect path. AC clears
+  the child's inherited environment, applies the policy's baseline, then configured symbolic
+  `envVars`, then literal `env` (last writer wins), and applies `cwd` when present. A remote `url`
+  maps onto the Streamable HTTP connect path (opt-in `http` feature). Literal `headers` are
+  extended or overridden by resolved `envHeaders`; a resolved `bearerTokenEnvVar` takes precedence
+  over a stored OAuth bearer. A host built without the feature MUST still report a remote
+  definition as skipped with a stated reason (R5) — never silently.
+- **Remote URL floor.** A remote definition must use HTTPS, except that HTTP is permitted for
+  a literal loopback IP. Userinfo is rejected. Validation occurs before constructing the
+  transport or handing a bearer/header value to it; DNS names such as `localhost` do not count
+  as literal loopback.
 - **One translation path.** `managed::ConnectionPolicy` and `managed::connect` are reused for
   connectivity tests, live catalog export, authentication re-enumeration, and cached lazy dialers.
-  Hosts using the managed layer MUST inject the intended environment and deadline once rather
-  than reconstructing transports per operation.
+  Hosts using the managed layer MUST inject the intended baseline environment, symbolic-value
+  resolver, and deadlines once rather than reconstructing transports per operation.
 
 ## 9. Deferred
 
+- **Pre-deserialization transport byte ceilings.** `rmcp` 2.2.0's stock stdio transport reads
+  a newline-delimited frame into an unbounded `Vec`, and its stock Streamable HTTP client lets
+  reqwest/SSE assemble an unbounded response or event before yielding a decoded JSON-RPC
+  message. AC's catalog, result, error, and OAuth-body caps run after or outside that framing
+  boundary, so a malicious peer can still force a large transient allocation first. Closing
+  this requires an upstream bounded-transport seam or AC-owned stdio and HTTP transports; it
+  must not be misrepresented as solved by the retained-state caps.
 - **Resources, prompts, sampling** — the non-tool MCP primitives. Tools are the seam the run
   loop needs; the rest is host surface until evidence says otherwise.
 - **List-changed notifications** — snapshot-plus-host-driven-refresh is the contract today;

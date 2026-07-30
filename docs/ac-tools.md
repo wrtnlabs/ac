@@ -5,7 +5,8 @@ gains the *prefix-remap* and *deny* combinators and single-file grants; the comp
 restated to cover them. **Amended 2026-07-28:** §4.3 adds the host-injected URL policy for
 `fetch`; §4.2 and §4.4 make file and shell execution reusable by host adapters with
 different schemas or presentation; §4.2 also specifies the stock list/write bounds; §2.3
-specifies durable and transient tool output. **Requires:** nothing. **Required by:** [ac-mcp.md](ac-mcp.md) (wire tools enter through the raw form), [ac-sandbox.md](ac-sandbox.md)
+specifies durable and transient tool output; §2.4 adds an optional dispatch gate for atomic
+host-state transitions. **Requires:** nothing. **Required by:** [ac-mcp.md](ac-mcp.md) (wire tools enter through the raw form), [ac-sandbox.md](ac-sandbox.md)
 (implements the launcher seam carried here). **Interacts with:** [ac-skills.md](ac-skills.md) (hosts admit skill roots as read grants), [ac-loop.md](ac-loop.md) (every
 call dispatches through the registry), [ac-approvals.md](ac-approvals.md) (capability is the hook a
 read-only permission mode gates on).
@@ -31,6 +32,9 @@ self-description believed). Each is eliminated structurally:
   unclassified tool cannot exist — and a class claimed over a wire MUST NOT be believed by default.
 - **R5 (symlink honesty).** Containment MUST be judged against what a name actually reaches on disk,
   not its lexical spelling — a link pointing outside the permitted tree is outside.
+- **R6 (atomic host transitions).** When one tool changes authority or shared host state that
+  sibling tools consume, the host MUST be able to exclude sibling dispatch for the complete
+  transition without serializing unrelated tools by default.
 
 ## 2. Model
 
@@ -99,6 +103,19 @@ durable fallback MUST preserve the same control facts. Otherwise the producing t
 resume/fork make different policy decisions from the same call. Ordinary control-plane results
 such as `tool_search` should normally omit the override entirely; durable divergence is for
 stripping transient representation, not changing the result's meaning.
+
+### 2.4 Optional exclusive dispatch
+
+Tool calls are concurrent by default. A host whose tool publishes shared state MAY install a
+`ToolDispatchGate` in `ToolCtx` and declare the names that require exclusive dispatch. Ordinary
+tools take a shared lease; a declared tool takes an exclusive lease for its complete future. This
+preserves ordinary parallelism while ensuring that no sibling tool enters during the transition
+(R6).
+
+The gate is intentionally name- and host-defined. AC does not know what state changes, which tools
+perform them, or how the host commits it. The host remains responsible for validating all fallible
+work before publication and for making the final authoritative update cancellation-safe. The gate
+only establishes dispatch ordering; direct reads outside the registry are outside its contract.
 
 ## 3. The path-policy algebra
 
@@ -297,6 +314,9 @@ as an invitation to declare a second shell tool.
 - **I10 (one mutation and process plane).** Host-specific file presentation may wrap AC's
   execution primitives; shell customization configures AC's stock declaration. Neither replaces
   ledgers, locks, observer ordering, sandbox, approval, cancellation, or cleanup mechanics.
+- **I11 (exclusive dispatch is complete).** When a host installs a dispatch gate, an exclusive
+  tool holds its lease for the complete tool future; ordinary sibling tools cannot enter until it
+  returns.
 
 ## 6. Division of responsibility
 
@@ -312,6 +332,7 @@ as an invitation to declare a second shell tool.
 | Fetch cancellation and total timeout | AC; host may configure the deadline |
 | File read/write transaction, freshness, locking, fuzzy replacement | AC; host supplies path policy, copy/result mapping, and optional observer |
 | Command execution, approval, capture, cancellation, process cleanup | AC `execute_shell`; host supplies command/cwd/env/transcript policy |
+| Optional shared/exclusive tool dispatch ordering | AC gate; host declares exclusive tool names and owns the transition |
 | Kernel containment of spawned processes | the launcher ([ac-sandbox.md](ac-sandbox.md)) |
 
 ## 7. Deferred

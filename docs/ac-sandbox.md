@@ -33,9 +33,9 @@ only the `actual` ones. Where we cannot be actual (native Windows), we are loudl
 so — we never emit an advisory approximation and call it a sandbox.
 
 This is not a stylistic preference. The reference implementations we studied all draw the same
-line, and the one place a major sandbox blurred it — Anthropic's `sandbox-runtime` degrading
-*fail-open* when its seccomp helper is missing, and a string-matching egress allowlist that
-shipped a real SOCKS5 null-byte bypass in Claude Code v2.0.24–2.1.89 — is exactly the class of
+line, and the one place a major sandbox blurred it — a runtime degrading
+*fail-open* when its seccomp helper is missing, plus a string-matching egress
+allowlist vulnerable to a SOCKS5 null-byte bypass — is exactly the class of
 bug this rule prevents.
 
 ## What we build (v1) and what we defer
@@ -164,6 +164,14 @@ crate is the only place that translates intent into Seatbelt SBPL or landlock+se
 calls. `ac-sandbox` depends on `ac-tool` (for the trait + `PathPolicy` types) and nothing else
 in the workspace; it never imports `ac-runtime` or `ac-agent`. Wiring parallels the shell tool:
 built-in registration stays app-agnostic, the host injects the launcher.
+
+The child process environment is an independent authority boundary. `ShellConfig` therefore
+selects `ShellEnvironmentPolicy::Inherit` (the compatibility default) or
+`Clear { baseline }`. Clear mode calls `env_clear` on the final prepared command, installs only
+the host's explicit baseline, then overlays per-invocation values from
+`ShellEnvironmentProvider`. Hosts using clear mode should pair it with
+`ShellInvocation::from_user_shell_without_startup`; clearing `HOME` alone is insufficient
+because shells such as zsh can reconstruct it before loading user startup files.
 
 ## Fail-closed contract (the rule that separates us from the one trap we found)
 

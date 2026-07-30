@@ -289,10 +289,7 @@ coordinated sub-agents. Three guarantees keep that composable later without reop
   today). None blocks the seam; all are quality-of-implementation.
 
 ---
-*Provenance: this design distills the sub-agent architectures of two production agent runtimes,
-studied 2026-07-23. openai/codex (Apache-2.0) contributes the hard sub-agent subsystem — first-class
+*Reference: this design was checked against openai/codex (Apache-2.0): first-class
 child threads spawned through an injected service, per-child model and reasoning-effort overrides,
 and the effort/orchestration split of [ac-ultra.md](ac-ultra.md) (its top tier collapsing to "max"
-at the wire). sst/opencode (MIT) contributes the "one agent type, a `task` tool as the surface"
-synthesis and the derived-permission recursion guard, which this spec sharpens into recursion by
-capability-absence. The distillation is behavioral — no code was carried over.*
+at the wire). AC keeps the public mechanism host-neutral.*

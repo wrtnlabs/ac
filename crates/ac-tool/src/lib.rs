@@ -26,7 +26,7 @@ pub use policy::{
     AuthorizedPath, DenyPolicy, GrantedReadPolicy, PathPolicy, PolicyError, PrefixRemapPolicy,
     ReadGrants, ReadOnlyPolicy, SplitPolicy, SubtreePolicy, SwapPolicy,
 };
-pub use registry::ToolRegistry;
+pub use registry::{ToolDispatchGate, ToolRegistry};
 pub use sandbox::{
     CommandSpec, NetworkMode, Prepared, ResourceLimits, SandboxError, SandboxLauncher, SandboxMode,
     SandboxPolicy, WriteDenyRule, default_deny_paths,

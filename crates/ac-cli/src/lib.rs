@@ -14,10 +14,7 @@ use ac_context::{Cadence, FragmentClass, ReactiveSection};
 use ac_host::AgentHostBuilder;
 use ac_provider::{Provider, ServerTool};
 use ac_runtime::{AgentConfig, ReferenceSpawner, Session};
-use ac_skills::{
-    Skill, SkillLayer, SkillsResolver, build_skill_injections, catalog_markdown,
-    extract_skill_mentions, select_skills_for_mentions,
-};
+use ac_skills::{Skill, SkillLayer, SkillsResolver, catalog_markdown, compose_skill_input};
 use ac_tool::{
     AgentDefinition, Effort, GrantedReadPolicy, NetworkMode, PathPolicy, ReadGrants,
     ReadOnlyPolicy, SandboxPolicy, SpawnRequest, SubtreePolicy, ToolCtx, ToolRegistry, ToolScope,
@@ -270,24 +267,9 @@ pub fn compose_turn_input(host: &GenericHost, prompt: &str) -> String {
         return prompt.to_string();
     };
     let listing = skills.resolver.list();
-    let mentions = extract_skill_mentions(prompt);
-    let mut selected = skills.selected.clone();
-    for skill in select_skills_for_mentions(&listing.skills, &mentions) {
-        if !selected.iter().any(|s| s.skill_md == skill.skill_md) {
-            selected.push(skill);
-        }
-    }
-    let (injections, warnings) = build_skill_injections(&selected);
+    let (input, warnings) = compose_skill_input(&listing.skills, &skills.selected, prompt);
     for warning in warnings {
         eprintln!("warning: {warning}");
-    }
-    if injections.is_empty() {
-        return prompt.to_string();
-    }
-    let mut input = prompt.to_string();
-    for injection in injections {
-        input.push_str("\n\n");
-        input.push_str(&injection.render());
     }
     input
 }
