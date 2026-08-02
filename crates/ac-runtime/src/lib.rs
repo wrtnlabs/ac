@@ -74,6 +74,19 @@ struct TransientToolOutput {
     parts: Vec<ToolOutputPart>,
 }
 
+/// One complete provider tool call awaiting the record/dispatch phase.
+/// Invalid JSON remains aligned with its call instead of being keyed by an id,
+/// so even a broken provider that repeats ids cannot cross-wire errors.
+struct SampledToolUse {
+    call: ToolUse,
+    invalid_input: Option<InvalidToolInput>,
+}
+
+struct InvalidToolInput {
+    raw_input: String,
+    error: String,
+}
+
 impl TransientToolOutput {
     fn retained_bytes(&self) -> usize {
         self.content.len()
@@ -325,10 +338,19 @@ pub enum AgentEvent {
         name: String,
         input: serde_json::Value,
     },
+    /// A complete tool call whose streamed argument bytes were not valid JSON.
+    /// It is never dispatched; a paired errored [`AgentEvent::ToolResult`]
+    /// follows so the model can repair the call on the next step.
+    ToolInputError {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+        error: String,
+    },
     /// A raw fragment of a tool call's arguments, streamed as the provider
     /// emits them. Stream-only (like `Thinking`, the stream carries strictly
     /// more than history): it never enters the rollout, and the assembled
-    /// `ToolCall` that follows remains the single authoritative call.
+    /// `ToolCall` or `ToolInputError` that follows remains authoritative.
     ToolInputDelta {
         id: String,
         name: String,
@@ -754,7 +776,7 @@ impl Session {
             };
 
             let mut text = String::new();
-            let mut tool_uses: Vec<ToolUse> = Vec::new();
+            let mut tool_uses: Vec<SampledToolUse> = Vec::new();
             let mut stop_reason = StopReason::EndTurn;
 
             loop {
@@ -794,7 +816,25 @@ impl Session {
                         let _ = sink.send(AgentEvent::Thinking(t));
                     }
                     CompletionEvent::ToolUse(tu) => {
-                        tool_uses.push(tu);
+                        tool_uses.push(SampledToolUse {
+                            call: tu,
+                            invalid_input: None,
+                        });
+                    }
+                    CompletionEvent::InvalidToolUse {
+                        id,
+                        name,
+                        raw_input,
+                        error,
+                    } => {
+                        tool_uses.push(SampledToolUse {
+                            call: ToolUse {
+                                id,
+                                name,
+                                input: serde_json::json!({}),
+                            },
+                            invalid_input: Some(InvalidToolInput { raw_input, error }),
+                        });
                     }
                     CompletionEvent::ToolCallDelta {
                         id,
@@ -828,8 +868,8 @@ impl Session {
             if !text.trim().is_empty() {
                 assistant_content.push(ContentPart::Text { text });
             }
-            for tu in &tool_uses {
-                assistant_content.push(ContentPart::ToolUse(tu.clone()));
+            for sampled in &tool_uses {
+                assistant_content.push(ContentPart::ToolUse(sampled.call.clone()));
             }
             if assistant_content.is_empty() {
                 // Thinking, citations, and usage are observational stream data;
@@ -884,12 +924,22 @@ impl Session {
             // gets exactly one tool_result — the invariant that keeps the
             // message history valid for the next request.
             let mut handles = Vec::with_capacity(tool_uses.len());
-            for tu in &tool_uses {
-                let _ = sink.send(AgentEvent::ToolCall {
-                    id: tu.id.clone(),
-                    name: tu.name.clone(),
-                    input: tu.input.clone(),
-                });
+            for sampled in &tool_uses {
+                let tu = &sampled.call;
+                if let Some(invalid) = &sampled.invalid_input {
+                    let _ = sink.send(AgentEvent::ToolInputError {
+                        id: tu.id.clone(),
+                        name: tu.name.clone(),
+                        input: invalid.raw_input.clone().into(),
+                        error: invalid.error.clone(),
+                    });
+                } else {
+                    let _ = sink.send(AgentEvent::ToolCall {
+                        id: tu.id.clone(),
+                        name: tu.name.clone(),
+                        input: tu.input.clone(),
+                    });
+                }
                 self.hooks.observe(&Observation::ToolStart {
                     id: tu.id.clone(),
                     name: tu.name.clone(),
@@ -902,9 +952,15 @@ impl Session {
                 let ctx = Arc::new(self.ctx.for_invocation(tu.id.clone()));
                 let name = tu.name.clone();
                 let input = tu.input.clone();
+                let invalid_error = sampled
+                    .invalid_input
+                    .as_ref()
+                    .map(|invalid| invalid.error.clone());
                 let offered_tools = offered_tools.clone();
                 let handle = tokio::spawn(async move {
-                    if !offered_tools.contains(&name) {
+                    if let Some(error) = invalid_error {
+                        ToolOutput::error(error)
+                    } else if !offered_tools.contains(&name) {
                         ToolOutput::error(format!(
                             "tool '{name}' was not available on this step; use an offered discovery tool first"
                         ))
@@ -995,8 +1051,12 @@ impl Session {
                     is_error,
                 }));
             }
+            let durable_tool_uses = tool_uses
+                .iter()
+                .map(|sampled| sampled.call.clone())
+                .collect::<Vec<_>>();
             let replay_after_compaction = compacted_transient_replay(
-                &tool_uses,
+                &durable_tool_uses,
                 &user_content,
                 &transient_tool_outputs.entries,
             );
@@ -1242,6 +1302,12 @@ mod tests {
                 id: "c1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({ "path": "a.txt" }),
+            },
+            AgentEvent::ToolInputError {
+                id: "c2".into(),
+                name: "read_file".into(),
+                input: serde_json::json!(r#"{"path": }"#),
+                error: "expected value".into(),
             },
             AgentEvent::ToolInputDelta {
                 id: "c1".into(),

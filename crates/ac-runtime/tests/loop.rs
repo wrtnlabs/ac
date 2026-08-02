@@ -1,11 +1,15 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ac_provider::{CompletionRequest, EventStream, Provider};
 use ac_provider_mock::{MockProvider, stop_end, stop_tool_use, text, tool_use};
 use ac_runtime::{
     AgentConfig, AgentEvent, Observation, ObservationHook, RuntimeError, Session, StepPrepareHook,
 };
 use ac_tool::{Capability, SubtreePolicy, Tool, ToolCtx, ToolOutput, ToolRegistry};
-use ac_types::{CompletionEvent, StopReason, TokenUsage};
+use ac_types::{CompletionError, CompletionEvent, ContentPart, Role, StopReason, TokenUsage};
+use futures::StreamExt;
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use tokio::sync::{Notify, mpsc};
 
@@ -36,6 +40,44 @@ impl Tool for Echo {
     }
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ListFilesInput {
+    #[allow(dead_code)]
+    #[serde(default)]
+    path: Option<String>,
+}
+
+struct ListFilesProbe {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Tool for ListFilesProbe {
+    type Input = ListFilesInput;
+
+    fn name(&self) -> &'static str {
+        "list_files"
+    }
+
+    fn description(&self) -> String {
+        "must not run for malformed JSON input".into()
+    }
+
+    fn capability(&self) -> Capability {
+        Capability::ReadOnly
+    }
+
+    fn run(
+        self: Arc<Self>,
+        _input: Self::Input,
+        _ctx: Arc<ToolCtx>,
+    ) -> futures::future::BoxFuture<'static, ToolOutput> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ToolOutput::ok("unexpected execution")
+        })
+    }
+}
+
 fn make_ctx() -> (Arc<ToolCtx>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let policy = SubtreePolicy::new(dir.path()).unwrap();
@@ -49,6 +91,60 @@ fn drain(mut rx: mpsc::UnboundedReceiver<AgentEvent>) -> Vec<AgentEvent> {
         out.push(ev);
     }
     out
+}
+
+#[derive(Clone, Default)]
+struct MalformedToolInputProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+impl MalformedToolInputProvider {
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Provider for MalformedToolInputProvider {
+    fn name(&self) -> &str {
+        "malformed-tool-input"
+    }
+
+    fn stream_completion(
+        &self,
+        _request: CompletionRequest,
+    ) -> BoxFuture<'static, Result<EventStream, CompletionError>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if call == 0 {
+                return Ok(futures::stream::iter([
+                    Ok(CompletionEvent::ToolCallDelta {
+                        id: "c_bad".to_string(),
+                        name: "list_files".to_string(),
+                        args_delta: r#"{"path": }"#.to_string(),
+                    }),
+                    Ok(CompletionEvent::InvalidToolUse {
+                        id: "c_bad".to_string(),
+                        name: "list_files".to_string(),
+                        raw_input: r#"{"path": }"#.to_string(),
+                        error: "tool input for list_files: expected value at line 1 column 10"
+                            .to_string(),
+                    }),
+                    Ok(CompletionEvent::ToolUse(ac_types::ToolUse {
+                        id: "c_good".to_string(),
+                        name: "echo".to_string(),
+                        input: serde_json::json!({ "text": "valid executed" }),
+                    })),
+                    Ok(CompletionEvent::Stop(StopReason::ToolUse)),
+                ])
+                .boxed());
+            }
+            Ok(futures::stream::iter([
+                Ok(CompletionEvent::Text("recovered".to_string())),
+                Ok(CompletionEvent::Stop(StopReason::EndTurn)),
+            ])
+            .boxed())
+        })
+    }
 }
 
 #[tokio::test]
@@ -130,6 +226,167 @@ async fn contentless_assistant_step_is_a_turn_error() {
             .all(|event| !matches!(event, AgentEvent::TurnComplete { .. })),
         "an empty provider response must not publish successful completion"
     );
+}
+
+#[tokio::test]
+async fn malformed_tool_arguments_become_a_non_executed_error_then_recover() {
+    let provider = MalformedToolInputProvider::default();
+    let (ctx, _dir) = make_ctx();
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(ListFilesProbe {
+        calls: tool_calls.clone(),
+    });
+    registry.register(Echo);
+    let mut session = Session::new(
+        Arc::new(provider.clone()),
+        Arc::new(registry),
+        ctx,
+        AgentConfig::default(),
+    );
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    assert_eq!(
+        session
+            .run_turn("first attempt".to_string(), tx)
+            .await
+            .expect("the model gets a corrective step"),
+        StopReason::EndTurn
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "the error result must be followed by a corrective sampling step"
+    );
+    assert_eq!(
+        tool_calls.load(Ordering::SeqCst),
+        0,
+        "malformed JSON must never reach tool execution"
+    );
+
+    let events = drain(rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolInputDelta { id, name, delta }
+            if id == "c_bad" && name == "list_files" && delta == r#"{"path": }"#
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolInputError {
+            id,
+            name,
+            input,
+            error,
+        }
+            if id == "c_bad"
+                && name == "list_files"
+                && input == &serde_json::json!(r#"{"path": }"#)
+                && error.contains("expected value at line 1 column 10")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCall { id, name, input }
+            if id == "c_good"
+                && name == "echo"
+                && input == &serde_json::json!({ "text": "valid executed" })
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult { id, name, output, is_error }
+            if id == "c_bad"
+                && name == "list_files"
+                && *is_error
+                && output.contains("expected value at line 1 column 10")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult { id, name, output, is_error }
+            if id == "c_good"
+                && name == "echo"
+                && !*is_error
+                && output == "valid executed"
+    )));
+    let call_positions = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            AgentEvent::ToolInputError { id, .. } | AgentEvent::ToolCall { id, .. } => {
+                Some((id.as_str(), index))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let result_positions = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            AgentEvent::ToolResult { id, .. } => Some((id.as_str(), index)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        call_positions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        ["c_bad", "c_good"]
+    );
+    assert_eq!(
+        result_positions
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>(),
+        ["c_bad", "c_good"]
+    );
+    assert!(
+        call_positions.last().unwrap().1 < result_positions.first().unwrap().1,
+        "all calls must precede all results"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Text(text) if text == "recovered"))
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TurnComplete {
+            stop_reason: StopReason::EndTurn
+        }
+    )));
+
+    let recovered = session.messages();
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>(),
+        [Role::User, Role::Assistant, Role::User, Role::Assistant]
+    );
+    assert!(matches!(
+        recovered[0].content.as_slice(),
+        [ContentPart::Text { text }] if text == "first attempt"
+    ));
+    assert!(matches!(
+        recovered[1].content.as_slice(),
+        [ContentPart::ToolUse(invalid), ContentPart::ToolUse(valid)]
+            if invalid.id == "c_bad"
+                && invalid.name == "list_files"
+                && invalid.input == serde_json::json!({})
+                && valid.id == "c_good"
+                && valid.name == "echo"
+                && valid.input == serde_json::json!({ "text": "valid executed" })
+    ));
+    assert!(matches!(
+        recovered[2].content.as_slice(),
+        [ContentPart::ToolResult(invalid), ContentPart::ToolResult(valid)]
+            if invalid.tool_use_id == "c_bad"
+                && invalid.is_error
+                && invalid.content.contains("expected value at line 1 column 10")
+                && valid.tool_use_id == "c_good"
+                && !valid.is_error
+                && valid.content == "valid executed"
+    ));
+    assert!(matches!(
+        recovered[3].content.as_slice(),
+        [ContentPart::Text { text }] if text == "recovered"
+    ));
 }
 
 #[tokio::test]

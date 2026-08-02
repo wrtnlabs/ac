@@ -33,16 +33,17 @@ the kit's central serving contract. Five requirements shape it:
 ## 2. Model
 
 A turn's emission is a finite sequence `E = ⟨e₁, …, eₙ⟩` over the alphabet
-`Σ = { text, thinking, input_committed, citation, usage, tool_call, tool_result,
-turn_complete, error }`.
-Let `Δ = {text, thinking, citation, usage}` — the **delta events**, produced while a sampling
+`Σ = { text, thinking, input_committed, citation, usage, tool_input_delta, tool_call,
+tool_input_error, tool_result, turn_complete, error }`.
+Let `Δ = {text, thinking, citation, usage, tool_input_delta}` — the **delta events**, produced while a sampling
 response streams. A **step** is as defined in [ac-loop.md](ac-loop.md) §2: one
 sampling request, the model's response, and the complete execution of every tool call that
 response issued. The producer's grammar on the success path:
 
 ```
 turn       ::= (step input_committed*)* turn_complete
-step       ::= Δ* (tool_call⁺ tool_result⁺)?  (equal call/result counts, same ids and order)
+step       ::= Δ* (call⁺ tool_result⁺)?  (equal call/result counts, same ids and order)
+call       ::= tool_call | tool_input_error
 ```
 
 A checkpoint between steps precedes every event from the next sampling request. A terminal
@@ -64,7 +65,9 @@ cancellation — a turn nobody watches stops spending tokens and running tools.
 | `text` | string delta | Assistant-visible prose, incremental. |
 | `thinking` | string delta | Reasoning, for display. Provider thinking signatures are stripped here — they belong to the provider layer's replay path (itself deferred, per [ac-provider.md](ac-provider.md)), never to observation. |
 | `input_committed` | message | An accepted mid-turn input was appended to durable history as this exact plain user `Message`. Emitted after the append and before the next step, or before a non-cancel terminal outcome when terminal flush commits it. Initial input and runtime-authored user rows do not emit this checkpoint. |
-| `tool_call` | id, name, input | The model issued a tool call, input complete. No partial-input streaming: a call is announced once, whole. |
+| `tool_input_delta` | id, name, delta | Exact streamed argument bytes for a provisional tool part. Stream-only; the same id later resolves as `tool_call` or `tool_input_error`. |
+| `tool_call` | id, name, input | The model issued a tool call with parsed input. The authoritative call is announced once, whole. |
+| `tool_input_error` | id, name, raw input, error | A complete call had malformed JSON input. It is not executed; this authoritative event resolves any provisional input stream, and an errored `tool_result` follows. |
 | `tool_result` | id, name, output, is_error | The resolution of exactly one announced id. A tool failure — including a panic inside the tool — is a result with `is_error`, never a stream failure. |
 | `citation` | url, optional title | A source surfaced by a provider-executed server tool (e.g. web search). Citations are annotations — no local execution, nothing to feed back — so they ride their own variant, not the tool path. |
 | `usage` | token counts | Server-reported accounting, a complete snapshot per sampling request — never a delta. Semantics (totals, cache subsets, occupancy, replace-never-sum) are specified in [ac-provider.md](ac-provider.md) §6. |
@@ -75,10 +78,10 @@ cancellation — a turn nobody watches stops spending tokens and running tools.
 
 Within a step, ordering is layered, not interleaved:
 
-- **Deltas first, in provider order.** All `Δ` events of a step precede its `tool_call`s:
+- **Deltas first, in provider order.** All `Δ` events of a step precede its call announcements:
   calls are announced only after the sampling response has fully streamed, so the issued set
   is complete and ordered before execution begins.
-- **Announce all, then resolve all.** Every `tool_call` of the step is emitted before any
+- **Announce all, then resolve all.** Every `tool_call` or `tool_input_error` of the step is emitted before any
   `tool_result`. Execution is concurrent; **emission is ordered**: results are emitted in
   issue order regardless of completion order, so calls pair to results positionally, not
   only by id.
@@ -149,8 +152,9 @@ message chunks) demonstrate:
 > **I1 (total order).** A turn's events form one sequence; every consumer observes them in
 > emission order. There is no concurrent emission — tool concurrency ends before the sink.
 >
-> **I2 (call/result discipline).** Per step: calls follow all deltas, results follow all
-> calls, result order equals call order, ids biject between the two sets.
+> **I2 (call/result discipline).** Per step: valid-call and input-error announcements follow
+> all deltas, results follow all announcements, result order equals call order, ids biject
+> between the two sets.
 >
 > **I3 (terminality).** `turn_complete` appears at most once, only as the final event, and
 > iff the turn resolved successfully. The loop never emits `error`.

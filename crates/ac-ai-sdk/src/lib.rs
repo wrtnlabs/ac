@@ -246,6 +246,30 @@ impl ChunkEncoder {
                 }
                 out.push(chunk);
             }
+            AgentEvent::ToolInputError {
+                id,
+                name,
+                input,
+                error,
+            } => {
+                if let Some(end) = self.close_open() {
+                    out.push(end);
+                }
+                // `tool-input-error` is authoritative on its own. If deltas
+                // announced a provisional part, MessageStateTracker resolves
+                // that same id as errored; if not, the chunk creates it.
+                let mut chunk = json!({
+                    "type": "tool-input-error",
+                    "toolCallId": id,
+                    "toolName": name,
+                    "input": input,
+                    "errorText": error,
+                });
+                if self.dynamic_tools() {
+                    chunk["dynamic"] = json!(true);
+                }
+                out.push(chunk);
+            }
             AgentEvent::ToolResult {
                 id,
                 output,
@@ -615,6 +639,76 @@ mod tests {
             .find(|c| c["type"] == "tool-input-available")
             .unwrap();
         assert_eq!(available["input"], json!({ "path": "a.txt" }));
+    }
+
+    #[test]
+    fn malformed_streamed_tool_input_resolves_as_input_error_then_output_error() {
+        let mut enc = ChunkEncoder::new("m1");
+        let mut all = enc.start();
+        all.extend(enc.encode(AgentEvent::ToolInputDelta {
+            id: "c_bad".into(),
+            name: "list_files".into(),
+            delta: r#"{"path": }"#.into(),
+        }));
+        all.extend(enc.encode(AgentEvent::ToolInputError {
+            id: "c_bad".into(),
+            name: "list_files".into(),
+            input: json!(r#"{"path": }"#),
+            error: "expected value at line 1 column 10".into(),
+        }));
+        all.extend(enc.encode(AgentEvent::ToolResult {
+            id: "c_bad".into(),
+            name: "list_files".into(),
+            output: "expected value at line 1 column 10".into(),
+            is_error: true,
+        }));
+        all.extend(enc.finish());
+
+        assert_eq!(
+            types(&all),
+            vec![
+                "start",
+                "start-step",
+                "tool-input-start",
+                "tool-input-delta",
+                "tool-input-error",
+                "tool-output-error",
+                "finish-step",
+                "finish",
+            ]
+        );
+        let input_error = all
+            .iter()
+            .find(|chunk| chunk["type"] == "tool-input-error")
+            .unwrap();
+        assert_eq!(input_error["toolCallId"], "c_bad");
+        assert_eq!(input_error["toolName"], "list_files");
+        assert_eq!(input_error["input"], json!(r#"{"path": }"#));
+        assert_eq!(
+            input_error["errorText"],
+            "expected value at line 1 column 10"
+        );
+        assert_eq!(
+            all.iter()
+                .filter(|chunk| chunk["type"] == "tool-input-start")
+                .count(),
+            1,
+            "the invalid terminal chunk must resolve the provisional part"
+        );
+
+        let mut tracker = MessageStateTracker::new("m1");
+        for chunk in &all {
+            tracker.apply(chunk);
+        }
+        let snapshot = tracker.snapshot();
+        let tool_part = snapshot["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|part| part["toolCallId"] == "c_bad")
+            .unwrap();
+        assert_eq!(tool_part["state"], "output-error");
+        assert_eq!(tool_part["rawInput"], json!(r#"{"path": }"#));
     }
 
     #[test]

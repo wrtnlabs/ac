@@ -554,6 +554,18 @@ fn event_update(event: AgentEvent, context_window: u64) -> Option<SessionUpdate>
                 .status(ToolCallStatus::InProgress)
                 .raw_input(input),
         )),
+        AgentEvent::ToolInputError {
+            id,
+            name,
+            input,
+            error,
+        } => Some(SessionUpdate::ToolCall(
+            ToolCall::new(id, name.clone())
+                .kind(tool_kind(&name))
+                .status(ToolCallStatus::Failed)
+                .raw_input(input)
+                .raw_output(serde_json::Value::String(error)),
+        )),
         AgentEvent::ToolResult {
             id,
             output,

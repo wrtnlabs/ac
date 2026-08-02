@@ -192,6 +192,14 @@ fn render(event: AgentEvent, usage: &mut Option<TokenUsage>) {
         AgentEvent::ToolCall { name, input, .. } => {
             eprintln!("\x1b[2m· {name}({})\x1b[0m", compact(&input));
         }
+        AgentEvent::ToolInputError {
+            name, input, error, ..
+        } => {
+            eprintln!(
+                "\x1b[2m· {name}({}) [invalid input: {error}]\x1b[0m",
+                compact(&input)
+            );
+        }
         AgentEvent::ToolResult {
             output, is_error, ..
         } => {

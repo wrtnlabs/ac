@@ -71,8 +71,11 @@ persistent effect re-applies it each step. The ordinal exists precisely so step-
 policies (force tool A at step 0, tool B at step 1, then release) are one stateless function;
 forced opening chains ([ac-hooks.md](ac-hooks.md)) ride this seam, opaque to the loop.
 
-**Sample.** Deltas forward to the sink as they arrive; tool-call requests accumulate. When the
-stream ends, the assistant message — final text plus every tool call — enters `H` as one record.
+**Sample.** Deltas forward to the sink as they arrive; tool-call requests accumulate. A fully
+identified call with malformed argument JSON accumulates as an invalid call with its exact raw
+input and parse error. When the stream ends, the assistant message — final text plus every tool
+call — enters `H` as one record. Invalid calls use an empty object in that durable provider
+history so the paired error can be replayed through providers that require valid tool-call JSON.
 At least one of those durable parts MUST exist. A provider that stops after emitting only
 thinking, citations, usage, whitespace, or no events has not completed an assistant response;
 stream-only observations cannot make an otherwise empty step successful. A contentless
@@ -81,12 +84,14 @@ counting against the ordinary iteration bound. Exhausting that budget, or receiv
 contentless stop reason, terminates with a typed host error and emits no turn-complete event.
 
 **Execute.** If the response carried no tool calls the turn is over: a completion event with
-the model's stop reason is emitted and the turn returns it. Otherwise every tool call is
-dispatched **concurrently**, each on its own isolated task. Dispatch goes through the registry
-by name: it resolves the name and, for compile-time-typed tools, validates arguments by
-decoding them into the declared input — a failed decode becomes an error result. Runtime-
-described tools receive the model's JSON verbatim and MUST report invalid input as error data
-themselves; [ac-tools.md](ac-tools.md) specifies the two forms.
+the model's stop reason is emitted and the turn returns it. Otherwise valid calls are dispatched
+**concurrently**, each on its own isolated task. Dispatch goes through the registry by name: it
+resolves the name and, for compile-time-typed tools, validates arguments by decoding them into
+the declared input — a failed decode becomes an error result. Runtime-described tools receive
+the model's JSON verbatim and MUST report invalid input as error data themselves;
+[ac-tools.md](ac-tools.md) specifies the two forms. A provider-marked invalid call is never
+dispatched: the loop announces its raw input as an input error and precomputes the paired tool
+error result. Valid and invalid calls retain one issue order for result emission.
 
 **Record.** Results are appended to `H` as a single message, **in the order the model issued
 the calls** — never completion order — so `H` is deterministic under concurrency. Result
@@ -97,10 +102,12 @@ the next step before request hooks. The loop then re-checks its bounds and begin
 
 ## 4. Errors as data
 
-The dividing line of R2 is **the moment of dispatch**: once the model has issued a tool call,
-nothing on the tool side of that call may terminate the turn. Every outcome is serialized into
-the one result the model reads:
+The dividing line of R2 is whether the model can repair the failure. Once the provider has
+identified a complete tool call, nothing about that call may terminate the turn. Every outcome
+is serialized into the one result the model reads:
 
+- malformed argument JSON on a fully identified call → a non-executed error result carrying
+  the parse failure, followed by a corrective sampling step;
 - an unknown tool name → an error result naming it;
 - arguments that fail validation (registry-side for typed tools, tool-side for
   raw ones) → an error result carrying the failure;
@@ -148,8 +155,9 @@ session. The initiating input, appended at turn start, persists in `H` however t
 
 - **I1 (append-only).** A turn only ever appends to `H`. No termination path edits or removes
   a recorded item; work recorded before the failure survives it.
-- **I2 (one result per call).** Every tool call the model issues receives exactly one result —
-  success, tool-authored error, validation error, unknown-name error, or panic notice —
+- **I2 (one result per call).** Every complete, identified tool call the model issues receives
+  exactly one result — success, malformed-input error, tool-authored error, validation error,
+  unknown-name error, or panic notice —
   before the next sampling request. There is no path on which a call goes unanswered.
 - **I3 (boundary atomicity).** Beyond the initiating input appended at turn start, `H`
   changes only in a step's record phases. A turn terminated mid-sampling leaves `H` exactly

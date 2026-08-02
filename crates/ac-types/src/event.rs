@@ -19,11 +19,21 @@ pub enum CompletionEvent {
         signature: Option<String>,
     },
     ToolUse(ToolUse),
+    /// A complete, provider-identified tool call whose assembled arguments
+    /// are not valid JSON. This is model-authored, repairable input rather
+    /// than a broken stream: the runtime pairs it with an error result and
+    /// samples the next step without dispatching the tool.
+    InvalidToolUse {
+        id: String,
+        name: String,
+        raw_input: String,
+        error: String,
+    },
     /// A raw fragment of a tool call's arguments as the provider streams them.
-    /// Stream-only progress: the assembled [`ToolUse`] that follows is still
-    /// the single authoritative call — consumers that ignore deltas lose
-    /// nothing. Concatenating every `args_delta` for an `id` yields exactly
-    /// the final assembled arguments string.
+    /// Stream-only progress: the assembled [`ToolUse`] or `InvalidToolUse`
+    /// that follows is still the single authoritative call — consumers that
+    /// ignore deltas lose nothing. Concatenating every `args_delta` for an
+    /// `id` yields exactly the final assembled arguments string.
     ToolCallDelta {
         id: String,
         name: String,
@@ -96,6 +106,12 @@ mod tests {
                 name: "read_file".into(),
                 input: serde_json::json!({ "path": "a.txt" }),
             }),
+            CompletionEvent::InvalidToolUse {
+                id: "c2".into(),
+                name: "read_file".into(),
+                raw_input: r#"{"path": }"#.into(),
+                error: "tool input for read_file: expected value".into(),
+            },
             CompletionEvent::ToolCallDelta {
                 id: "c1".into(),
                 name: "read_file".into(),

@@ -144,21 +144,41 @@ fn build_body(request: &CompletionRequest, provider_order: Option<&[String]>) ->
     if let Some(order) = provider_order {
         body["provider"] = json!({ "order": order });
     }
-    if !request.tools.is_empty() {
-        body["tools"] = request
-            .tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.input_schema,
-                    },
-                })
+    let mut tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
             })
-            .collect();
+        })
+        .collect();
+
+    // OpenRouter server tools share the top-level `tools` array with local
+    // function declarations. OpenRouter executes their model-driven calls and
+    // streams the final answer plus url_citation annotations back to us, so no
+    // client-side tool continuation is needed.
+    for tool in &request.server_tools {
+        match tool {
+            ServerTool::WebSearch { max_results } => {
+                let mut parameters = json!({});
+                if let Some(n) = max_results {
+                    parameters["max_results"] = json!(n);
+                }
+                tools.push(json!({
+                    "type": "openrouter:web_search",
+                    "parameters": parameters,
+                }));
+            }
+        }
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
     }
     if !request.tools.is_empty() {
         body["tool_choice"] = match &request.tool_choice {
@@ -167,25 +187,6 @@ fn build_body(request: &CompletionRequest, provider_order: Option<&[String]>) ->
             ToolChoice::Required => json!("required"),
             ToolChoice::Force(name) => json!({ "type": "function", "function": { "name": name } }),
         };
-    }
-    // Server-side web search rides OpenRouter's `web` plugin. The model decides
-    // 0..N searches; results come back as url_citation annotations (see
-    // map_events). ServerTool variants OpenRouter can't do fall through ignored.
-    // Accumulate across all requested server tools so none clobbers another.
-    let mut plugins: Vec<Value> = Vec::new();
-    for tool in &request.server_tools {
-        match tool {
-            ServerTool::WebSearch { max_results } => {
-                let mut plugin = json!({ "id": "web" });
-                if let Some(n) = max_results {
-                    plugin["max_results"] = json!(n);
-                }
-                plugins.push(plugin);
-            }
-        }
-    }
-    if !plugins.is_empty() {
-        body["plugins"] = json!(plugins);
     }
     if let Some(max_tokens) = request.max_tokens {
         body["max_tokens"] = json!(max_tokens);
@@ -426,14 +427,29 @@ where
                     }
                 )))?;
             }
-            let input = if call.arguments.trim().is_empty() {
-                json!({})
+            if call.arguments.trim().is_empty() {
+                yield CompletionEvent::ToolUse(ToolUse {
+                    id: call.id,
+                    name: call.name,
+                    input: json!({}),
+                });
             } else {
-                serde_json::from_str(&call.arguments).map_err(|e| {
-                    CompletionError::Parse(format!("tool input for {}: {e}", call.name))
-                })?
-            };
-            yield CompletionEvent::ToolUse(ToolUse { id: call.id, name: call.name, input });
+                match serde_json::from_str(&call.arguments) {
+                    Ok(input) => yield CompletionEvent::ToolUse(ToolUse {
+                        id: call.id,
+                        name: call.name,
+                        input,
+                    }),
+                    Err(error) => {
+                        yield CompletionEvent::InvalidToolUse {
+                            id: call.id,
+                            name: call.name.clone(),
+                            raw_input: call.arguments,
+                            error: format!("tool input for {}: {error}", call.name),
+                        };
+                    }
+                }
+            }
         }
         yield CompletionEvent::Stop(stop);
     })
@@ -863,19 +879,51 @@ mod tests {
     }
 
     // --- provider-server-tools seam (web search) ---
-    // Encode side: requesting the WebSearch server tool must add OpenRouter's
-    // `web` plugin, and nothing when it isn't requested.
+    // Encode side: requesting WebSearch must add OpenRouter's model-callable
+    // server tool, and nothing when it isn't requested.
     #[test]
-    fn web_search_server_tool_encodes_web_plugin() {
+    fn web_search_server_tool_encodes_model_callable_tool() {
         let mut request = CompletionRequest::new("test/model");
-        assert!(build_body(&request, None).get("plugins").is_none());
+        assert!(build_body(&request, None).get("tools").is_none());
 
         request.server_tools.push(ServerTool::WebSearch {
             max_results: Some(3),
         });
         let body = build_body(&request, None);
-        assert_eq!(body["plugins"][0]["id"], json!("web"));
-        assert_eq!(body["plugins"][0]["max_results"], json!(3));
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "openrouter:web_search",
+                "parameters": { "max_results": 3 },
+            }])
+        );
+        assert!(body.get("plugins").is_none());
+    }
+
+    #[test]
+    fn web_search_server_tool_accumulates_with_function_tools() {
+        let mut request = CompletionRequest::new("test/model");
+        request.tools.push(ac_types::ToolSpec {
+            name: "lookup".into(),
+            description: "d".into(),
+            input_schema: json!({ "type": "object" }),
+        });
+        request
+            .server_tools
+            .push(ServerTool::WebSearch { max_results: None });
+
+        let body = build_body(&request, None);
+        assert_eq!(body["tools"][0]["type"], json!("function"));
+        assert_eq!(body["tools"][0]["function"]["name"], json!("lookup"));
+        assert_eq!(
+            body["tools"][1],
+            json!({
+                "type": "openrouter:web_search",
+                "parameters": {},
+            })
+        );
+        assert_eq!(body["tool_choice"], json!("auto"));
+        assert!(body.get("plugins").is_none());
     }
 
     // --- reasoning effort ([docs/ac-ultra.md] §3) ---
@@ -1275,6 +1323,66 @@ mod tests {
         assert_eq!(tu.id, "c1");
         assert_eq!(tu.name, "read_file");
         assert_eq!(tu.input, json!({ "path": "a.txt" }));
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_arguments_emit_exact_deltas_then_an_invalid_call_and_stop() {
+        let frames = vec![
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c_bad","function":{"name":"list_files","arguments":"{\"path\": "}}]}}]}"#,
+            ),
+            frame(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ),
+        ];
+
+        let mut stream = map_events(futures::stream::iter(frames));
+        let mut arguments = String::new();
+        let mut delta_count = 0usize;
+        let mut invalid_call = None;
+        let mut stop = None;
+        while let Some(item) = stream.next().await {
+            match item.expect("malformed model input must not fail the provider stream") {
+                CompletionEvent::ToolCallDelta {
+                    id,
+                    name,
+                    args_delta,
+                } => {
+                    assert_eq!(id, "c_bad");
+                    assert_eq!(name, "list_files");
+                    arguments.push_str(&args_delta);
+                    delta_count += 1;
+                }
+                CompletionEvent::ToolUse(call) => {
+                    panic!("malformed arguments escaped as a tool call: {call:?}")
+                }
+                CompletionEvent::InvalidToolUse {
+                    id,
+                    name,
+                    raw_input,
+                    error,
+                } => {
+                    assert!(invalid_call.replace((id, name, raw_input, error)).is_none());
+                }
+                CompletionEvent::Stop(reason) => {
+                    stop = Some(reason);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            delta_count, 2,
+            "each provider fragment streams exactly once"
+        );
+        assert_eq!(arguments, r#"{"path": }"#);
+        let (id, name, raw_input, error) = invalid_call.expect("one invalid call");
+        assert_eq!(id, "c_bad");
+        assert_eq!(name, "list_files");
+        assert_eq!(raw_input, r#"{"path": }"#);
+        assert!(error.contains("tool input for list_files"));
+        assert!(error.contains("expected value at line 1 column 10"));
+        assert_eq!(stop, Some(StopReason::ToolUse));
     }
 
     // Fragments that arrive before the call's id/name are known must buffer and

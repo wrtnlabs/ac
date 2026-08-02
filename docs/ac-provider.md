@@ -43,7 +43,7 @@ mid-stream failures without inspecting events. A well-formed stream obeys the gr
 
 ```
 S        ::=  body* terminal
-body     ::=  Text | Thinking | ToolUse | Citation | UsageUpdate
+body     ::=  Text | Thinking | ToolCallDelta | ToolUse | InvalidToolUse | Citation | UsageUpdate
 terminal ::=  Stop(r) | Error(ε)          r ∈ {end_turn, max_tokens, tool_use, refusal}
 ```
 
@@ -78,19 +78,23 @@ The wire crate maps its native stream into the closed vocabulary, with these nor
 
 - **Text and reasoning** stream as deltas, in arrival order. Reasoning carries an optional
   provider signature slot; empty deltas are dropped.
-- **Tool calls are emitted whole.** Native streams fragment a call across frames; reassembly
-  is the wire crate's job. A tool-call event MUST carry a complete id, name, and *parsed*
-  input — absent arguments normalize to the empty object, unparseable arguments are a stream
-  failure, not a truncated event. Native call indexes are ordering keys and MAY be sparse; a
-  wire MUST preserve their relative order without manufacturing empty calls for missing
-  indexes. An unfinished call with no non-empty id or name is a stream failure. Calls MAY be
-  emitted late but MUST precede the terminal.
+- **Tool calls finish whole.** Native streams fragment a call across frames; a wire MAY expose
+  the exact argument fragments as progress deltas, but reassembly is still its job. A valid
+  call MUST finish with a complete id, name, and parsed input; absent arguments normalize to
+  the empty object. When a fully identified call's assembled arguments are not valid JSON,
+  the wire emits `InvalidToolUse` with that id, name, exact raw input, and parse error. This is
+  repairable model output, not a stream failure. Native call indexes are ordering keys and MAY
+  be sparse; a wire MUST preserve their relative order without manufacturing empty calls for
+  missing indexes. An unfinished call with no non-empty id or name remains a stream failure.
+  Calls MAY be emitted late but MUST precede the terminal.
 - **Stop reasons are normalized**: tool-call finishes map to *tool_use*, length cutoffs to
   *max_tokens*, content filtering to *refusal*, everything else to *end_turn*. The wire MUST
   emit a terminal even when the native stream ends without a finish signal (defaulting
   *end_turn*); consumers SHOULD tolerate bare end-of-stream as *end_turn* — both sides defend.
-- **In-band failure** terminates the stream: an unparseable frame or mid-stream transport
-  error surfaces as an error item in the taxonomy (§7), and nothing follows it.
+- **In-band machinery failure** terminates the stream: an unparseable provider frame,
+  incomplete call identity, or mid-stream transport error surfaces as an error item in the
+  taxonomy (§7), and nothing follows it. Malformed argument JSON on a fully identified call is
+  the `InvalidToolUse` case above and does not terminate the stream.
 
 ## 5. Server tools
 
@@ -108,6 +112,13 @@ tool registry, and produces nothing to feed back. Three rules keep the seam hone
 - **Results surface as citations.** Provider-side execution announces itself inline as
   citation events (URL plus optional title), never as tool results. Citations are decorative
   metadata: one without a URL MUST be skipped, never allowed to fail a load-bearing turn.
+
+The OpenRouter wire maps `WebSearch` to its model-callable server-tool declaration
+`{"type":"openrouter:web_search","parameters":{"max_results":N}}` in the same `tools`
+array as local function declarations. OpenRouter owns the internal search calls and returns
+the synthesized answer with `url_citation` annotations, so the runtime does not execute or
+continue those calls. The older `plugins: [{"id":"web"}]` request form is deprecated and
+MUST NOT be emitted.
 
 ## 6. Usage accounting
 
@@ -151,8 +162,9 @@ against this impersonation.
 - **I1 (closed vocabulary).** No event above the seam carries provider wire format; the event
   set of §2 is exhaustive, extended only by amending this contract.
 - **I2 (single terminal).** A well-formed stream has exactly one terminal event, in final position.
-- **I3 (whole calls).** Every tool-call event carries a complete id, name, and parsed input;
-  no fragment ever crosses the seam.
+- **I3 (complete calls).** Every terminal tool-call event carries a complete id and name plus
+  either parsed input or the exact malformed input and its parse error. Progress fragments
+  are optional and never substitute for that terminal call event.
 - **I4 (advertised ⇒ encoded).** For every requested server tool `t`: `caps(t)` implies the
   wire encodes `t`; `¬caps(t)` implies silent omission. No third behavior exists.
 - **I5 (server-truth usage).** Every usage figure originates from the provider's server, under
