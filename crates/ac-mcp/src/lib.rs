@@ -1393,6 +1393,61 @@ fn redact_truncated_secret_suffix(mut content: String, secrets: &[String], limit
     content
 }
 
+fn safe_image_media_type(media_type: &str) -> bool {
+    fn token(bytes: &[u8]) -> bool {
+        !bytes.is_empty()
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+    }
+
+    let Some((kind, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+    kind.eq_ignore_ascii_case("image") && token(kind.as_bytes()) && token(subtype.as_bytes())
+}
+
+fn valid_standard_base64(data: &str) -> bool {
+    if data.is_empty() || data.len() % 4 == 1 {
+        return false;
+    }
+    let bytes = data.as_bytes();
+    let padding = bytes.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2 || (padding > 0 && !bytes.len().is_multiple_of(4)) {
+        return false;
+    }
+    let body_end = bytes.len().saturating_sub(padding);
+    bytes[..body_end]
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+        && bytes[body_end..].iter().all(|byte| *byte == b'=')
+}
+
+fn image_is_safe_to_forward(media_type: &str, data: &str, redaction_secrets: &[String]) -> bool {
+    safe_image_media_type(media_type)
+        && valid_standard_base64(data)
+        && !redaction_secrets.iter().any(|secret| {
+            !secret.is_empty() && (media_type.contains(secret) || data.contains(secret))
+        })
+}
+
 fn render_result(result: CallToolResult, redaction_secrets: &[String]) -> ToolOutput {
     // Check the complete protocol object before rendering. Looking only at
     // textual content misses structuredContent, media data, and `_meta`.
@@ -1406,6 +1461,7 @@ fn render_result(result: CallToolResult, redaction_secrets: &[String]) -> ToolOu
     }
     let is_error = result.is_error.unwrap_or(false);
     let mut output = BoundedResultText::new();
+    let mut transient_images: Vec<(String, Arc<str>)> = Vec::new();
     for block in &result.content {
         output.start_part();
         match block {
@@ -1428,6 +1484,14 @@ fn render_result(result: CallToolResult, redaction_secrets: &[String]) -> ToolOu
                 output.push("[image ");
                 output.push(&image.mime_type);
                 output.push(" omitted]");
+                if !is_error
+                    && image_is_safe_to_forward(&image.mime_type, &image.data, redaction_secrets)
+                {
+                    transient_images.push((
+                        image.mime_type.clone(),
+                        Arc::<str>::from(image.data.as_str()),
+                    ));
+                }
             }
             ContentBlock::Audio(audio) => {
                 output.push("[audio ");
@@ -1463,7 +1527,11 @@ fn render_result(result: CallToolResult, redaction_secrets: &[String]) -> ToolOu
     if is_error {
         ToolOutput::error(content)
     } else {
-        ToolOutput::ok(content)
+        transient_images
+            .into_iter()
+            .fold(ToolOutput::ok(content), |output, (media_type, data)| {
+                output.with_image(media_type, data)
+            })
     }
 }
 
@@ -1535,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn render_flattens_text_and_notes_non_text() {
+    fn render_flattens_text_and_bridges_success_images_transiently() {
         let result = CallToolResult::success(vec![
             ContentBlock::text("hello"),
             ContentBlock::image("aGk=", "image/png"),
@@ -1544,13 +1612,30 @@ mod tests {
         let out = render_result(result, &[]);
         assert!(!out.is_error);
         assert_eq!(out.content, "hello\n\n[image image/png omitted]\n\nworld");
+        assert_eq!(out.durable_content(), out.content);
+        assert!(!out.durable_content().contains("aGk="));
+        assert_eq!(
+            out.transient_parts,
+            vec![ac_tool::ToolOutputPart::Image {
+                media_type: "image/png".to_string(),
+                data: Arc::from("aGk="),
+            }]
+        );
     }
 
     #[test]
     fn render_maps_is_error_and_empty_content() {
-        let out = render_result(CallToolResult::error(vec![ContentBlock::text("boom")]), &[]);
+        let out = render_result(
+            CallToolResult::error(vec![
+                ContentBlock::text("boom"),
+                ContentBlock::image("aGk=", "image/png"),
+            ]),
+            &[],
+        );
         assert!(out.is_error);
-        assert_eq!(out.content, "boom");
+        assert_eq!(out.content, "boom\n\n[image image/png omitted]");
+        assert!(out.transient_parts.is_empty());
+        assert!(!out.durable_content().contains("aGk="));
 
         let out = render_result(CallToolResult::success(vec![]), &[]);
         assert!(!out.is_error);
@@ -1588,6 +1673,41 @@ mod tests {
                 out.content
             );
             assert!(out.content.len() < 256);
+        }
+    }
+
+    #[test]
+    fn oversized_image_result_fails_before_any_transient_payload_is_created() {
+        let data = "x".repeat(MAX_RESULT_SERIALIZED_BYTES + 1);
+        let out = render_result(
+            CallToolResult::success(vec![ContentBlock::image(data, "image/png")]),
+            &[],
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("serialized byte limit"));
+        assert!(out.content.len() < 256);
+        assert!(out.transient_parts.is_empty());
+    }
+
+    #[test]
+    fn malformed_or_secret_bearing_images_remain_durable_omissions() {
+        for (data, media_type, secrets) in [
+            ("not base64", "image/png", Vec::new()),
+            ("aGk=", "image/png;name=bad", Vec::new()),
+            (
+                "header-secret",
+                "image/png",
+                vec!["header-secret".to_string()],
+            ),
+        ] {
+            let out = render_result(
+                CallToolResult::success(vec![ContentBlock::image(data, media_type)]),
+                &secrets,
+            );
+            assert!(!out.is_error);
+            assert!(out.transient_parts.is_empty());
+            assert!(!out.durable_content().contains(data));
+            assert!(!out.durable_content().contains("header-secret"));
         }
     }
 
